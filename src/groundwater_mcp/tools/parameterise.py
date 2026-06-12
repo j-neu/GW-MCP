@@ -404,7 +404,7 @@ def _impl_import_river_from_shapefile(
     existing = gwf.get_package(pkg_name.lower())
     if existing is not None:
         gwf.remove_package(existing)
-    pkg_cls(gwf, stress_period_data=spd)
+    pkg_cls(gwf, stress_period_data=spd, save_flows=True)
 
     save_sim(model, gwf.simulation)
     return {

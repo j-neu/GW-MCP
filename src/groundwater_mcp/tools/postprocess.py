@@ -233,13 +233,16 @@ def _impl_compute_water_balance(
 
         total = 0.0
         for rec in records:
-            arr = np.asarray(rec, dtype=float)
+            arr = np.asarray(rec)
             if arr.dtype.names and "q" in arr.dtype.names:
                 total += float(arr["q"].sum())
             elif arr.dtype.names and "FLOW-JA-FACE" in arr.dtype.names:
-                pass  # skip internal flow face
+                pass  # skip internal cell-to-cell flow
+            elif arr.dtype.names:
+                # Structured record without a recognised flow field — skip
+                pass
             else:
-                vals = arr.ravel()
+                vals = arr.astype(float).ravel()
                 vals = vals[vals != 1e30]
                 total += float(vals.sum()) if vals.size > 0 else 0.0
 

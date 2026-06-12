@@ -238,7 +238,8 @@ def test_assign_k_invalid_field_raises(dis_model, zone_shapefile):
 
     with pytest.raises(ValueError, match="not found"):
         _impl_assign_k_from_zones(
-            dis_model, str(zone_shapefile), k_field="nonexistent_field", layer=0
+            dis_model, str(zone_shapefile), k_field="nonexistent_field", layer=0,
+            k33_field=None, icelltype_field=None,
         )
 
 
@@ -309,7 +310,9 @@ def test_import_obs_site_cellid_map_has_all_sites(dis_model, obs_csv):
     from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
 
     result = _impl_import_obs_from_csv(
-        dis_model, str(obs_csv), x_col="x", y_col="y", layer=0
+        dis_model, str(obs_csv),
+        obs_type="HEAD", site_col="site", date_col="date", value_col="value",
+        x_col="x", y_col="y", layer=0,
     )
     assert set(result["site_cellid_map"].keys()) == {"BH01", "BH02", "BH03"}
 
@@ -319,5 +322,7 @@ def test_import_obs_missing_column_raises(dis_model, obs_csv):
 
     with pytest.raises(ValueError, match="not found"):
         _impl_import_obs_from_csv(
-            dis_model, str(obs_csv), value_col="nonexistent"
+            dis_model, str(obs_csv),
+            obs_type="HEAD", site_col="site", date_col="date", value_col="nonexistent",
+            x_col=None, y_col=None, layer=0,
         )

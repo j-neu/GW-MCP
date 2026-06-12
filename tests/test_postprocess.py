@@ -60,7 +60,7 @@ def runnable_model(tmp_path, model_name):
     _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
     _impl_add_ic_package(model_name, strt=5.5)
     chd = [[[0, row, 0], 8.0] for row in range(5)] + [[[0, row, 4], 3.0] for row in range(5)]
-    _impl_add_boundary_package(model_name, "CHD", {"0": chd}, None)
+    _impl_add_boundary_package(model_name, "CHD", {"0": chd}, {"save_flows": True})
     _impl_add_oc_package(model_name, None, None, None, None)
     return model_name
 
