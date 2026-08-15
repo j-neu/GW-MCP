@@ -211,11 +211,25 @@ Broad audience:
 - [ ] Log user feedback: common workflows, usability friction, missing features
 - [ ] Update tool descriptions based on real usage patterns
 
-**v0.2.0 improvements (if demand warrants):**
+**v0.2.0 build order (from capability matrix + discovery catalog, 2026-08-15):**
+Ordered by user priority (DISU first) then demonstrated demand = capability
+frequency in the catalog. Each item validates against the corresponding
+held-out example (promoted to dev/test data AFTER the v0.1.0 release).
+Refs point at `research/discovery/catalog.md` rows.
+- [ ] DISU (fully unstructured grid) support — `add_disu_package`; refs: test009_3lay-disu, ex-gwf-radial
+- [ ] MAW / UZF / LAK packages — extend boundary dispatch or new tools; refs: test020, test051_uzfp2, test045_lake1ss, ex-gwf-sagehen, mf6-training
+- [ ] GNC (ghost-node) + MVR (water mover); refs: test006_gwf3_gnc, test001g_MVR, ex-gwf-lak-p02
+- [ ] GWT (transport) + GWF-GWT coupling — new model types; refs: ex-gwt-keating, ex-gwt-mt3dms-p01, test201_gwtbuy-henryCHD
+- [ ] STO (storage) exposure — `add_sto_package`; refs: test003_gwfs_tr, ex-gwf-advtidal
+- [ ] pestpp-sen sensitivity analysis (+ pareto/sweep modes); refs: usgs/pestpp mf6_freyberg, neversink_workflow
+- [ ] OBS package tool — `add_obs_package` to complete the partial OBS row; refs: test005_advgw_tidal, ex-gwf-radial
+- [ ] Note: SWT has no MF6 SWT6 package — variable density is the GWT hydraulic-head formulation (henry/saltlake/BUY); no SWT-specific tool planned unless demand emerges (verify `MODFLOW-USGS/swtv4` first)
+- [ ] GWE (energy transport) + PRT (particle tracking) + CSUB — catalogued as extra scope (not matrix rows)
+
+**Other v0.2.0 candidates (pre-existing):**
 - [ ] MT3D-USGS solute transport post-processing (read transport output, plot plumes)
 - [ ] MODPATH particle tracking tools (backward/forward tracking, pathlines)
 - [ ] MODFLOW-2005 + MODFLOW-NWT support (legacy compatibility)
-- [ ] PEST++ sensitivity analysis tools (pestpp-sen)
 - [ ] Cloud execution backend (submit jobs to AWS/GCP Compute, stream results)
 - [ ] Web-based model visualiser (optional companion app for 3D inspection)
 
