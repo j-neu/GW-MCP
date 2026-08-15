@@ -257,10 +257,15 @@ def test_setup_pest_control_parameter_values(pst_model):
 
 
 def test_setup_pest_control_pestpp_options_written(pst_model):
-    """PEST++ options dict should be written to the PST."""
+    """noptmax is native PEST control data, not a pestpp '++' arg.
+
+    pestpp rejects unknown ++ args and exits before producing output, so
+    noptmax must land in the control data block.
+    """
     model, pst_file = pst_model
     pst = pyemu.Pst(pst_file)
-    assert "noptmax" in pst.pestpp_options
+    assert "noptmax" not in pst.pestpp_options
+    assert pst.control_data.noptmax == 5
 
 
 def test_setup_pest_control_unknown_model_raises():
@@ -579,7 +584,7 @@ def integration_model(tmp_path, model_name):
     _impl_create_model(model_name, ws_str, "METERS", "DAYS")
     _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
     _impl_add_dis_package(model_name, 1, 5, 5, 100.0, 100.0, 10.0, [0.0])
-    _impl_add_npf_package(model_name, icelltype=0, k=10.0, save_flows=True)
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
     _impl_add_ic_package(model_name, strt=5.5)
     chd = [[[0, row, 0], 8.0] for row in range(5)] + [[[0, row, 4], 3.0] for row in range(5)]
     _impl_add_boundary_package(model_name, "CHD", {"0": chd}, None)

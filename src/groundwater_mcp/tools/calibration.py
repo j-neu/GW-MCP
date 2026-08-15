@@ -265,9 +265,14 @@ def _impl_setup_pest_control(
             if "partrans" in attrs:
                 par_df.loc[par_name, "partrans"] = str(attrs["partrans"])
 
-    # Apply remaining PEST++ options
+    # Apply remaining PEST++ options. noptmax is native PEST control data,
+    # not a pestpp '++' argument (pestpp rejects unknown ++ args and exits
+    # before producing output).
     for key, val in pestpp_options.items():
-        pst.pestpp_options[key] = val
+        if key == "noptmax":
+            pst.control_data.noptmax = int(val)
+        else:
+            pst.pestpp_options[key] = val
 
     pst_path = ws / f"{model}.pst"
     pst.write(str(pst_path))
