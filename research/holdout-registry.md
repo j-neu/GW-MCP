@@ -36,7 +36,7 @@ Schema: `name | source url | license | local path (inside holdout root) | capabi
 
 | Name | Source | License | Local path | Capabilities | Validation status | Notes |
 |---|---|---|---|---|---|---|
-| Tutorials Modelmuse 01–05 | USGS ModelMuse tutorials (local copy, was repo-tracked) | USGS public domain (verify) | `initial-local/Tutorials Modelmuse/` | DIS, SFR/CHD/WEL, OBS (tutorials 04/05) | pending v0.1.0 freeze | 02/05 hold data; 01/03 PDF-only; 04 = source of `tests/fixtures/tutorial_04` (fixtures self-contained) |
+| Tutorials Modelmuse 01–05 | USGS ModelMuse tutorials (local copy, was repo-tracked) | USGS public domain (verify) | `initial-local/Tutorials Modelmuse/` | DIS, SFR/CHD/WEL, OBS (tutorials 04/05) | Mode B dry-run 1 (2026-08-15): journey completed, 0 reprompts, build/run/postprocess pass, calibration partial — see `sessions/2026-08-15-modeB-tutorial05.md`; closed-book rerun pending | 02/05 hold data; 01/03 PDF-only; 04 = source of `tests/fixtures/tutorial_04` (fixtures self-contained) |
 | GMS Tutorials (MODFLOW / MODFLOW-USG / MODFLOW6) | Aquaveo GMS tutorials (local copy, was repo-tracked) | Aquaveo ToS (verify) | `initial-local/GMS Tutorials/` | DIS, DISV, DISU, MAW, UZF (per tutorial zips) | pending v0.1.0 freeze | MODFLOW-USG zips = natural legacy-content pool; PDFs + zips |
 | Getting started (GMS exercises, PS1A/PS1B, Exercise8) | Aquaveo GMS getting-started (local copy, was repo-tracked) | Aquaveo ToS (verify) | `initial-local/Getting started/` | DIS, calibration exercises | pending v0.1.0 freeze | `.gpt` GMS project files + data/solution folders |
 

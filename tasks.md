@@ -233,6 +233,14 @@ Refs point at `research/discovery/catalog.md` rows.
 - [ ] Cloud execution backend (submit jobs to AWS/GCP Compute, stream results)
 - [ ] Web-based model visualiser (optional companion app for 3D inspection)
 
+**Validation backlog (Mode B dry-run 1, 2026-08-15; see research/discovery/sessions/2026-08-15-modeB-tutorial05.md):**
+- [ ] fix `setup_pest_control` model command: `model_command_line` in pestpp_options is silently dropped by pyemu 1.4.0 (attribute is `model_command`, a list) → PST written with default `model.bat` which doesn't exist → every PEST++ forward run fails
+- [ ] write relative tpl/ins paths into the PST (absolute paths with spaces are rejected by pestpp-glm "wrong number of tokens")
+- [ ] make `run_pestpp_glm` resilient to the 60 s MCP client timeout (async/streaming or documented direct-invocation fallback)
+- [ ] write `phi.actual.csv` (or return phi progress) when GLM aborts at parameter bounds — currently `summarise_calibration` gets empty progress
+- [ ] CHD/WEL shapefile importers (cell mapping currently needs server-internal helpers); document `stress_period_data` record format in tool descriptions
+- [ ] document `import_river_from_shapefile` polygon handling (stage 0, conductance = overlap perimeter — acts as a strong drain)
+
 **Companion tool (separate repo, planned dependency):**
 - [ ] `geodata-mcp`: CRS reprojection, DEM hydrological conditioning, borehole kriging, climate data processing, land use ET zones
   - Fills the gap between "raw GIS data" and "processed inputs ready for groundwater-mcp"

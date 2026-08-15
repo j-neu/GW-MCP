@@ -22,35 +22,43 @@ tool names; it must discover them from the tool descriptions.
    `groundwater-mcp_*` auto-allowed). Any Kilo session in any folder can now
    use the 36 groundwater-mcp tools.
 2. Restart Kilo so the server loads.
-3. Data folder (sealed material, no copying needed):
-   `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\initial-local\Tutorials Modelmuse\05\data1a\Data`
-   — `river.shp`, `chd_high.shp`, `chd_lower.shp`, `wells.shp`.
-   Grid boundary + DEM come from the dev set (absolute paths, referenced in the
-   prompt): `tests/fixtures/tutorial_04\activeZone.shp` and `dem_clipped.tif`.
+3. **Closed-book data folder** (self-contained, no answers inside):
+   `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\modeB\tutorial05\data\`
+   — `river.shp`, `chd_high.shp`, `chd_lower.shp`, `wells.shp`,
+   `wells_obs.csv` (heads 30–46 m — reachable with the CHD 40/70 boundaries),
+   `activeZone.shp` + `dem_clipped.tif`.
 
-## Prep: observation CSV (tutorial 05 has no real CSV)
+## Closed-book rules (added after dry-run 1, 2026-08-15)
 
-The HOB tutorial ships PDFs only. Generate the observations CSV from the well
-locations before the session (keeps calibration in the journey):
+Dry-run 1 proved the agent will read every answer in reach: the tutorial PDFs
+(05 root), the reference solved model (`05\Model2a\Model\Model1_b.*`), the
+repo's reference test (`tests/test_tutorial_05.py`), and the server source.
+All of those are now moved/staged out of reach:
 
-```powershell
-uv run python -c "
-import csv, geopandas as gpd
-gdf = gpd.read_file(r'<DATA_DIR>\wells.shp')
-with open(r'<DATA_DIR>\wells_obs.csv', 'w', newline='') as f:
-    w = csv.writer(f); w.writerow(['site', 'date', 'head_m', 'x', 'y'])
-    for i, row in enumerate(gdf.itertuples(), 1):
-        w.writerow([f'w{i}', '2000-01-01', round(55.0 + (i % 5), 2), row.geometry.x, row.geometry.y])
-print('written')
-"
-```
+- Tutorial PDFs + reference models live in
+  `initial-local\Tutorials Modelmuse\05\docs\` — never in the session folder.
+- The session must run in the closed-book `modeB\tutorial05\data\` folder,
+  NOT inside `Tutorials Modelmuse\` and NOT in the repo.
+- The prompt forbids reading answers (constraint below). A violation is
+  recorded as a protocol deviation and the run is invalid.
+- Data prep is complete in the staging folder; no PDFs, no repo references,
+  no reference models are reachable from it.
+
+## Prep: observation CSV (already staged)
+
+The staged `wells_obs.csv` has reachable synthetic heads (30–46 m). If it
+needs regenerating from `wells.shp`, use heads in the 30–46 m band (dry-run 1
+proved heads ≥ ~49 m are structurally unattainable with the CHD=40 side
+boundaries, which makes calibration impossible and wastes the run):
 
 ## The session
 
-1. Start a new Kilo session **in** `<DATA_DIR>` (any folder works now that the
-   server is global, but the data folder keeps relative paths natural).
-2. Paste the Mode B prompt below, verbatim. Do NOT name tools or file formats
-   — the point is that the assistant figures them out.
+1. Start a new Kilo session **in**
+   `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\modeB\tutorial05\data\`
+   (never in `Tutorials Modelmuse\` or the repo — see closed-book rules above).
+2. Paste the Mode B prompt below, verbatim, including the closed-book
+   constraint line. Do NOT name tools or file formats — the point is that the
+   assistant figures them out.
 3. Do not correct the assistant unless it derails (>1 reprompt is the
    measurement; record it).
 4. Afterwards, fill the session log (template below).
@@ -67,8 +75,7 @@ wells.shp (pumping wells), and wells_obs.csv (head observations with columns
 site, date, head_m, x, y).
 
 The catchment boundary polygon is activeZone.shp and the ground-surface
-elevation raster is dem_clipped.tif — both are in
-C:\Users\jakob\Documents\Cursor projects\GW-MCP\tests\fixtures\tutorial_04\
+elevation raster is dem_clipped.tif — both are in this folder.
 
 Please:
 1. Build the model — one layer, grid cells of about 200 m, the DEM as the
@@ -80,6 +87,10 @@ Please:
    parameter estimation, then summarise the calibration results.
 
 Work step by step and explain what you are doing at each step.
+
+You must work CLOSED-BOOK: do not read the groundwater-mcp source code, its
+tests, the tutorial PDFs, or any reference model files. Build everything from
+the data files in this folder and the available MCP tools only.
 ```
 
 ## Session log template
