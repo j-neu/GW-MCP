@@ -111,14 +111,21 @@ Three layers, each catching different failure modes:
 
 | Layer | What it tests | When to run |
 |---|---|---|
-| **Pytest integration tests** (`tests/test_tutorial_*.py`) | Tool logic with real spatial data from `Tutorials Modelmuse/04` and `05` | Every commit (CI) |
+| **Pytest integration tests** (`tests/test_tutorial_*.py`) | Tool logic with real spatial data from the sealed dev set `tests/fixtures/tutorial_04` and `tutorial_05` | Every commit (CI) |
 | **MCP protocol tests** (`tests/test_mcp_protocol.py`) | JSON-RPC message handling, tool registration, error envelope schema | Every commit (CI) |
 | **Manual Claude Desktop walkthrough** | Natural-language usability, tool description quality, full user journey | Before each release |
+| **Holdout validation** (Mode A replay + Mode B manual, at v0.1.0 freeze) | Independent validation of the frozen tool set against sealed projects never seen in development | At the v0.1.0 freeze |
 
 The tutorial datasets used are:
 
 - **Tutorial 04:** `activeZone.shp` (catchment boundary), `ASTGTM2_S14W077_dem_WGS84_18S_cut_grd` (DEM), zone shapefiles — exercises the full parameterisation pipeline
 - **Tutorial 05:** `chd_high.shp`, `chd_lower.shp`, `river.shp`, `wells.shp` — exercises boundary conditions, runner, and post-processing
+
+The original tutorial material (including further ModelMuse tutorials, GMS tutorials
+and getting-started exercises) is sealed in the sibling holdout folder
+`GW-MCP-holdout/` outside this repo; see `research/holdout-registry.md` for the
+pre-registered validation protocol (Mode A replay via `GW_MCP_HOLDOUT` env var,
+Mode B manual sessions). Holdout data never enters `tests/fixtures/`.
 
 See `TASKS.md` Phase 6 for the full test checklist.
 

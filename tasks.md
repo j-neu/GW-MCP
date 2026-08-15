@@ -2,7 +2,7 @@
 
 **End goal:** A usable, publicly accessible MCP server that GW professionals and AI tools can reliably use to create, calibrate, and visualize groundwater flow models.
 
-**Status:** Core implementation 100% complete. Testing 70% complete. Release 0% complete.
+**Status:** Core implementation 100% complete. Testing: Layers 1–2 complete (pytest green, 157 passing), Layer 3 (manual E2E) pending. Release 0% complete.
 
 ---
 
@@ -159,10 +159,10 @@ Highest-fidelity test of actual user experience:
 - [ ] Document any tool calls requiring reprompting → feed back into descriptions
 
 ### Concrete next steps for Phase 6:
-1. Write `tests/test_tutorial_05.py` (copy template from tutorial_04, adapt for 05 data) — **1–2 hours**
-2. Copy Tutorial 05 fixture files to `tests/fixtures/tutorial_05/` — **0.5 hours**
-3. Implement MCP protocol test harness + full workflow replay — **3–4 hours**
-4. Manual Claude Desktop walkthrough (best after #3 is passing) — **2–3 hours per run**
+1. ✅ Write `tests/test_tutorial_05.py` — 26 tests, all passing
+2. ✅ Copy Tutorial 05 fixture files to `tests/fixtures/tutorial_05/`
+3. ✅ Implement MCP protocol test harness + full workflow replay — 24 tests, all passing
+4. Manual Claude Desktop walkthrough (Layer 3, best after #3 is passing) — **2–3 hours per run**
 
 ---
 
@@ -232,8 +232,8 @@ Broad audience:
 **Minimum viable product (v0.1.0):**
 - [x] All 36 tools implemented and unit-tested
 - [x] Tutorial 04 integration test passing (grid → dem → npf/ic/oc → run → read_heads)
-- [ ] Tutorial 05 integration test passing (river → obs → chd → run → water_balance → plot)
-- [ ] MCP protocol test passing (tool listing, error handling, round-trip message flow)
+- [x] Tutorial 05 integration test passing (river → obs → chd → run → water_balance → plot)
+- [x] MCP protocol test passing (tool listing, error handling, round-trip message flow)
 - [ ] Manual Claude Desktop walkthrough completed (both tutorials + calibration)
 - [ ] README + CONTRIBUTING + CHANGELOG documentation in place
 - [ ] PyPI package published and installable
@@ -252,8 +252,8 @@ Broad audience:
 | Phase | Scope | Effort | Status |
 |---|---|---|---|
 | **0–5** | Core implementation (36 tools, unit tests) | ~40 days actual | ✅ Complete |
-| **6a** | Tutorial 05 integration test + MCP protocol test | 4–5 days | ⏳ In progress |
-| **6b** | Manual Claude Desktop walkthrough | 1 day (after 6a) | ⏳ Blocked on 6a |
+| **6a** | Tutorial 05 integration test + MCP protocol test | 4–5 days | ✅ Complete |
+| **6b** | Manual Claude Desktop walkthrough | 1 day (after 6a) | ⏳ To do |
 | **7a** | Documentation (README expansion, guides, examples) | 2–3 days | ⏳ To do |
 | **7b** | CI/CD setup (GitHub Actions, PyPI publish) | 1–2 days | ⏳ To do |
 | **7c** | Public release (tagging, registry submission, outreach) | 1 day | ⏳ To do |

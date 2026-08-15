@@ -93,6 +93,9 @@ Add to `~/.config/claude/claude_desktop_config.json`:
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, module responsibilities, file structure, tech stack |
 | [TOOLS.md](TOOLS.md) | Full tool reference: inputs, outputs, error codes |
 | [TASKS.md](TASKS.md) | Phased implementation plan with checkboxes |
+| [RESEARCH/capability-matrix.md](research/capability-matrix.md) | MODFLOW 6 + PEST capability coverage vs. MCP tools |
+| [RESEARCH/discovery/catalog.md](research/discovery/catalog.md) | Catalogue of open-source models/tutorials, capability-tagged |
+| [RESEARCH/holdout-registry.md](research/holdout-registry.md) | Sealed validation pool — the data itself lives in the sibling `GW-MCP-holdout/` folder, outside this repo |
 
 ---
 
