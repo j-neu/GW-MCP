@@ -226,6 +226,8 @@ def _impl_compute_water_balance(
 
     for text_raw in unique_texts:
         label = (text_raw.decode().strip() if isinstance(text_raw, bytes) else text_raw.strip())
+        if "FLOW-JA-FACE" in label.upper():
+            continue  # internal cell-to-cell flow, not a boundary flux
         try:
             records = cbf.get_data(kstpkper=target, text=text_raw)
         except Exception:
@@ -236,8 +238,6 @@ def _impl_compute_water_balance(
             arr = np.asarray(rec)
             if arr.dtype.names and "q" in arr.dtype.names:
                 total += float(arr["q"].sum())
-            elif arr.dtype.names and "FLOW-JA-FACE" in arr.dtype.names:
-                pass  # skip internal cell-to-cell flow
             elif arr.dtype.names:
                 # Structured record without a recognised flow field — skip
                 pass
