@@ -148,6 +148,7 @@ def _impl_check_model(model: str) -> dict:
 
 def _impl_run_simulation(model: str, silent: bool = False) -> dict:
     """Run MODFLOW 6 and return convergence status and timing."""
+    sim = get_sim(model)
     exe = _find_mf6_binary()
 
     sim = get_sim(model)
