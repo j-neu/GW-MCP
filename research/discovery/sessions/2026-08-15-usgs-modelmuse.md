@@ -5,6 +5,22 @@
 - Target source: USGS ModelMuse tutorial pages
 - Client: **playwright MCP browser NOT available** (registered but needs a Kilo client restart) — this session used the playbook fallback path (`webfetch` + `websearch` on the same target sites). **Browser verification of the listed URLs is PENDING** per playbook; re-verify the help pages render and the download links resolve in the browser session.
 
+## BROWSER VERIFICATION — COMPLETE (2026-08-15, playwright MCP after Kilo restart)
+
+All URLs below re-verified in the browser (page loads + link targets confirmed):
+
+- `Help/examples.html` — loads ("Examples/Tutorials"); links: PHAST/MODFLOW/SUTRA/PEST Examples; examples installed at `C:\Users\Public\Documents\ModelMuse Examples\examples` per the page.
+- `Help/modflow_examples.html` — loads; confirms all MODFLOW 6 example links:
+  `modflow_6_example.html`, `modflow-6-unsaturated-flow-wit.html`,
+  `modflow-6-transfer-of-solute-a.html`, `modflow-6-transfer-of-solutes-.html` (LAK/SFR/CNC), plus Subsidence and ATES pages not yet catalogued.
+- **`pest_examples.htm` → 404** ("Object not found!"). Correct URL is
+  `pest_examples.html` — catalog row fixed.
+- Downloads page `water.usgs.gov/water-resources/software/ModelMuse/` — loads;
+  Current Version **5.4.0.0**; direct zip:
+  `https://water.usgs.gov/water-resources/software/ModelMuse/ModelMuse64_5_4.zip`
+  (78 MB, 64-bit); installer `ModelMuseSetup64_5_4.exe` (68 MB). Catalog's
+  download URL stands; direct zip URL added to the MODFLOW 6 Example row.
+
 ## URL movement / fallback notes
 
 - `https://water.usgs.gov/ogw/modelmuse/tutorials.html` → **404 Not Found** (old tutorials index is gone).

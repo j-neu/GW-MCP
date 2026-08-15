@@ -5,6 +5,18 @@
 - Target source: Aquaveo GMS tutorials index
 - Client: **playwright MCP browser NOT available** (registered but needs a Kilo client restart) — this session used the playbook fallback path (`webfetch` + `websearch`). **Browser verification of the listed URLs is PENDING** per playbook; re-verify page rendering and S3 links in the browser session.
 
+## BROWSER VERIFICATION — COMPLETE (2026-08-15, playwright MCP after Kilo restart)
+
+- `https://www.aquaveo.com/software/gms-learning-tutorials` loads (redirects to
+  `https://aquaveo.com/software/gms/learning-tutorials`, title "GMS Tutorials").
+  Tutorial tables render with per-row PDF + project-zip links.
+- All 10 catalog S3 links verified **HTTP 200** (HEAD):
+  MODFLOW6-GridApproach.pdf + mf6_grid.zip, MODFLOW6-SFR.pdf + mf6_sfr.zip,
+  MODFLOW6_PEST_Obs_SS.pdf + mf6_pest_obs_ss.zip, MODFLOW-USG-Quadtree.pdf +
+  Quadtree.zip, MODFLOW-USG-Calibration.pdf + Calibration.zip.
+- Zip filename check: Quadtree row zip is `Quadtree.zip` and Calibration row
+  zip is `Calibration.zip` — catalog's `+ <zip>` suffixes confirmed.
+
 ## URL movement / fallback notes
 
 - `https://www.aquaveo.com/gms-tutorials` → **404 Not Found** (old URL moved).

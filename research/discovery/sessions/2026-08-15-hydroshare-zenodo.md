@@ -4,6 +4,26 @@
 - Playbook: `research/discovery/playbooks/hydroshare-zenodo.md`
 - Client: **playwright MCP browser NOT available** (registered but needs a Kilo client restart) — this session used the playbook fallback path (`webfetch` + `websearch`; Zenodo REST API `https://zenodo.org/api/records?q=...`; HydroShare resource pages render server-side via webfetch). **Browser verification of the listed resources is PENDING** per playbook; re-verify licenses, file lists, and download buttons in the browser session.
 
+## BROWSER VERIFICATION — COMPLETE (2026-08-15, playwright MCP after Kilo restart)
+
+- **Zenodo 21381071** — record page loads; License = **Creative Commons
+  Attribution 4.0 International** (button + cc-by-4.0 icon); Files (183.6 MB):
+  all 10 files + README.txt listed with md5 checksums (e.g.
+  `06_Sample_MODFLOW_MODPATH_Simulation.zip` md5 `4c00174f...`); download
+  links `/records/21381071/files/<name>?download=1`. README confirms
+  Windows-run notebooks (Python 3.11, R 4.2.1) and the PESTPP-IES calibration
+  workflow. Catalog row confirmed.
+- **HydroShare d3b23a5e...** — resource page loads; license text verbatim:
+  "This resource is shared under the Creative Commons Attribution CC BY."
+  (links to http://creativecommons.org/licenses/by/4.0/); Abstract confirms 18
+  MODFLOW 2000 scenarios (5 BMR treatments × gaining/losing/strongly-losing)
+  in GMS 9.2; BagIt download available; DOI 10.4211/hs.d3b23a5e59cb408c8953b6eff2ee7b73.
+  Catalog row confirmed. File list renders in the Content pane (file names
+  not needed for the row).
+- Zenodo 8047723 (Aare Valley) and 13069893 (Emilia-Romagna) not
+  browser-verified (not holdout-selected; large); licenses recorded verbatim
+  from the API in round 1 remain the source. Optional later check.
+
 ## Method / fallback notes
 
 - **Zenodo HTML search** (`https://zenodo.org/search?q=modflow6`) → JS/bot challenge ("Checking your browser…"); used the public REST API instead (`https://zenodo.org/api/records?q=...`), which returns license + file list + size + stable per-file download URLs.

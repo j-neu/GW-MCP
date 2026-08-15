@@ -118,16 +118,16 @@ Method: websearch + GitHub API/HTML searches per capability; 12 repos shallow-cl
 
 ---
 
-## USGS ModelMuse tutorials (2026-08-15; webfetch fallback — browser verification pending)
+## USGS ModelMuse tutorials (2026-08-15; **browser-verified 2026-08-15**)
 
-Session log: `sessions/2026-08-15-usgs-modelmuse.md`. Tutorials now live in
-the ModelMuse Help "Examples/Tutorials" section
+Session log: `sessions/2026-08-15-usgs-modelmuse.md`. Tutorials live in the
+ModelMuse Help "Examples/Tutorials" section
 (`https://water.usgs.gov/nrp/gwsoftware/ModelMuse/Help/examples.html`); old
 `tutorials.html` is 404, `water.usgs.gov/nrp/gwsoftware/ModelMuse/` is
 bot-guarded (403). Projects ship inside the distribution zip
 (`https://water.usgs.gov/water-resources/software/ModelMuse/`, v5.4.0.0,
-~71–78 MB). ModelMuse supports DISV (quadtree) but NOT DISU/SWT/GNC. PEST
-tutorials use classic PEST (not PEST++).
+64-bit zip `ModelMuse64_5_4.zip`, 78 MB). ModelMuse supports DISV (quadtree)
+but NOT DISU/SWT/GNC. PEST tutorials use classic PEST (not PEST++).
 
 | name | source | url | type | capabilities showcased | toolchain | input format | data formats | license | accessibility | download url | size | calibration-ready | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -135,19 +135,21 @@ tutorials use classic PEST (not PEST++).
 | MODFLOW 6 Transfer of Solute Among Multiaquifer Wells | USGS ModelMuse Help (Examples/Tutorials) | https://water.usgs.gov/nrp/gwsoftware/ModelMuse/Help/modflow-6-transfer-of-solute-a.html | HTML step-by-step tutorial + ModelMuse project | DIS, TDIS/IMS, NPF, IC, OC, MAW, MVR, GWT, GWF-GWT | ModelMuse 5.4 + MODFLOW 6 (GWF+GWT) | ModelMuse .gpt project; exports MF6 text input | .gpt, MF6 text input | USGS public domain — verify | Direct download, no registration | https://water.usgs.gov/water-resources/software/ModelMuse/ (distribution zip) | per-tutorial not published | n | GWT solute-transport model coupled to GWF via multi-aquifer wells (MAW) with water-mover (MVR) transfers. |
 | MODFLOW 6 Unsaturated Flow with Solute Transport | USGS ModelMuse Help (Examples/Tutorials) | https://water.usgs.gov/nrp/gwsoftware/ModelMuse/Help/modflow-6-unsaturated-flow-wit.html | HTML step-by-step tutorial + ModelMuse project | DIS, TDIS/IMS, NPF, IC, OC, CHD/WEL/RIV/DRN/RCH/EVT/GHB/SFR (RCH/EVT via UZF), UZF, GWT, GWF-GWT | ModelMuse 5.4 + MODFLOW 6 (GWF+UZF+GWT) | ModelMuse .gpt project; exports MF6 text input | .gpt, MF6 text input | USGS public domain — verify | Direct download, no registration | https://water.usgs.gov/water-resources/software/ModelMuse/ (distribution zip) | per-tutorial not published | n | Unsaturated-zone flow (UZF6) with solute transport through the unsaturated and saturated zones (UZT/GWT); irrigation + ET scenario. |
 | MODFLOW 6 Transfer of Solutes Between Streams and Lakes (LAK/SFR/CNC) | USGS ModelMuse Help (Examples/Tutorials) | https://water.usgs.gov/nrp/gwsoftware/ModelMuse/Help/modflow-6-transfer-of-solutes-.html | HTML step-by-step tutorial + ModelMuse project | DIS, TDIS/IMS, NPF, IC, OC, CHD/WEL/RIV/DRN/RCH/EVT/GHB/SFR (SFR), LAK, GWT, GWF-GWT | ModelMuse 5.4 + MODFLOW 6 (GWF+GWT) | ModelMuse .gpt project; exports MF6 text input | .gpt, shapefiles (data/LakSfrCnc), MF6 text input | USGS public domain — verify | Direct download, no registration | https://water.usgs.gov/water-resources/software/ModelMuse/ (distribution zip) | per-tutorial not published | n | LAK + SFR + CNC packages; stream/lake exchange of solutes; flow and transport run as two simulations (ModelMonitor runs twice); grid built from shapefiles. |
-| PEST Examples (MODFLOW 6 / MODFLOW-2005 / SUTRA) | USGS ModelMuse Help (Examples/Tutorials) | https://water.usgs.gov/nrp/gwsoftware/ModelMuse/Help/pest_examples.htm | HTML step-by-step tutorial + 3–4 ModelMuse projects per model version | DIS, TDIS/IMS, NPF, IC, OC, CHD/WEL/RIV/DRN/RCH/EVT/GHB/SFR (specified-head lake+stream, WEL), OBS, output, plots | ModelMuse 5.4 + PEST (classic; NOT PEST++) with MODFLOW 6 / MODFLOW-2005 / SUTRA | ModelMuse .gpt project (start/true/calibrated variants); exports model input | .gpt, model input files, PEST control/obs files | USGS public domain — verify | Direct download, no registration | https://water.usgs.gov/water-resources/software/ModelMuse/ (distribution zip) | per-tutorial not published | y (within-tutorial: calibrated "true" vs parameter-estimated variants; tutorial is not a real-world dataset) | RMA-based exercise: head + flow observations, parameter estimation for data sets and boundary conditions, visualization of calibrated model. PEST classic, so pestpp-*/ucode tags intentionally not used. |
+| PEST Examples (MODFLOW 6 / MODFLOW-2005 / SUTRA) | USGS ModelMuse Help (Examples/Tutorials) | https://water.usgs.gov/nrp/gwsoftware/ModelMuse/Help/pest_examples.html | HTML step-by-step tutorial + 3–4 ModelMuse projects per model version | DIS, TDIS/IMS, NPF, IC, OC, CHD/WEL/RIV/DRN/RCH/EVT/GHB/SFR (specified-head lake+stream, WEL), OBS, output, plots | ModelMuse 5.4 + PEST (classic; NOT PEST++) with MODFLOW 6 / MODFLOW-2005 / SUTRA | ModelMuse .gpt project (start/true/calibrated variants); exports model input | .gpt, model input files, PEST control/obs files | USGS public domain — verify | Direct download, no registration | https://water.usgs.gov/water-resources/software/ModelMuse/ (distribution zip) | per-tutorial not published | y (within-tutorial: calibrated "true" vs parameter-estimated variants; tutorial is not a real-world dataset) | RMA-based exercise: head + flow observations, parameter estimation for data sets and boundary conditions, visualization of calibrated model. PEST classic, so pestpp-*/ucode tags intentionally not used. URL is `pest_examples.html` — `.htm` 404s (browser-verified). |
 
 ---
 
-## Aquaveo GMS tutorials (2026-08-15; webfetch fallback — browser verification pending)
+## Aquaveo GMS tutorials (2026-08-15; **browser-verified 2026-08-15**)
 
-Session log: `sessions/2026-08-15-aquaveo-gms.md`. Current index:
-`https://www.aquaveo.com/software/gms-learning-tutorials` (GMS 10.9); PDF+zip
+Session log: `sessions/2026-08-15-aquaveo-gms.md`. Index:
+`https://www.aquaveo.com/software/gms-learning-tutorials` (redirects to
+`https://aquaveo.com/software/gms/learning-tutorials`, GMS 10.9); PDF+zip
 pairs on `https://s3.amazonaws.com/gmstutorials-10.9.aquaveo.com/` (direct,
-no registration). "Copyright © Aquaveo, LLC. All rights reserved." — NOT
-public domain. GMS-project input is not MCP-consumable (no GMS importer);
-`calibration-ready: n` for all rows. MODFLOW-USG set = authoritative DISU
-source; saltwater via SEAWAT/SWI2 (legacy), GNC via MODFLOW-USG GncPackage.
+no registration — all 10 catalog links HEAD-verified 200). "Copyright ©
+Aquaveo, LLC. All rights reserved." — NOT public domain. GMS-project input is
+not MCP-consumable (no GMS importer); `calibration-ready: n` for all rows.
+MODFLOW-USG set = authoritative DISU source; saltwater via SEAWAT/SWI2
+(legacy), GNC via MODFLOW-USG GncPackage.
 
 | name | source | url | type | capabilities showcased | toolchain | input format | data formats | license | accessibility | download url | size | calibration-ready | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -159,14 +161,17 @@ source; saltwater via SEAWAT/SWI2 (legacy), GNC via MODFLOW-USG GncPackage.
 
 ---
 
-## HydroShare / Zenodo (2026-08-15; REST API + webfetch fallback — browser verification pending)
+## HydroShare / Zenodo (2026-08-15; **browser-verified 2026-08-15**)
 
 Session log: `sessions/2026-08-15-hydroshare-zenodo.md`. Zenodo HTML search is
 bot-challenged; the public REST API works (`https://zenodo.org/api/records?q=...`).
 HydroShare search is a JS-only SPA; resource pages render server-side.
-Licenses recorded verbatim from the API/resource page. Excluded: Groundwater
-Vistas `.gwv` archives (proprietary, non-MF6), a Discoverable HydroShare
-resource (files not public), and test/unrelated resources (rationales in log).
+Licenses recorded verbatim from the API/resource page and confirmed in the
+browser for the rowed records (Zenodo 21381071: CC BY 4.0 + 183.6 MB files
+with md5s; HydroShare d3b23a5e: CC BY 4.0 + BagIt download; 8047723/13069893
+API-license only). Excluded: Groundwater Vistas `.gwv` archives (proprietary,
+non-MF6), a Discoverable HydroShare resource (files not public), and
+test/unrelated resources (rationales in log).
 
 | name | source | url | type | capabilities showcased | toolchain | input format | data formats | license | accessibility | download url | size | calibration-ready | notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
