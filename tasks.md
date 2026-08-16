@@ -202,6 +202,16 @@ reference-model access. Sessions logged in `research/discovery/sessions/`:
 
 ---
 
+## TODO — Phase 6d (Real-life model validation) and Phase 7 (Polish, Release, Dissemination)
+
+### 6d — Real-life regional model validation
+**Goal:** Prove the MCP on genuinely real models (not test problems/tutorials), closed-book, before release. Added 2026-08-16 after the Phase 6c review: the plan's hardest targets (test005, freyberg, tutorial-05) are test/benchmark/tutorial scale — real regional models were catalogued but never scheduled.
+
+Aare Valley (3 GB) and Emilia-Romagna (22.6 GB) are deliberately NOT targets here: Aare is a stochastic-geology (ArchPy/Bayesian) archive whose calibration is not PEST++-based (doesn't exercise the MCP calibration chain), and ER's size makes an agent iteration loop impractically slow plus it documents no observations. Both are v0.2.0+ "scale-up" targets once the MCP is proven at tractable scale.
+
+- [ ] **mf6brabant** (Brabant NL regional aquifer; usgs-independent, tomvansteijn/mf6brabant @ `d681f912`, MIT, 3.5 MB) — independent closed-book agent session: build the real regional model via the MCP toolchain from the repo's data (multi-layer, real boundaries), run, postprocess, calibrate if observations exist (catalog flags `calibration-ready: n` — if none, calibrate against the model's own outputs and document; the build/run/postprocess at regional scale is the point). Inspect repo structure at download: if flopy-script-only, the agent reproduces the model via MCP tools from the repo's data rather than running the scripts. Download pinned → `GW-MCP-holdout/selected/mf6brabant/` + registry row + session log.
+- [ ] **Zenodo 21381071** (real-world MODFLOW 6 + PESTPP-IES + MODPATH calibrated ensemble; CC BY 4.0, 183 MB main zip) — adopt the sample simulation into an MCP workspace → run → postprocess → PEST++-IES ensemble calibration through the MCP chain (`setup_pest_control`/`run_pestpp_ies` → `summarise_calibration` → `run_ies_uncertainty`). Validates the ensemble-calibration + uncertainty path on a real calibrated model. Download pinned → `GW-MCP-holdout/selected/zenodo-21381071/` + registry row + session log.
+
 ## TODO — Phase 7 (Polish, Release, Dissemination)
 
 ### 7a — Documentation & Examples
@@ -364,6 +374,7 @@ silently running as steady state — no STO tool, no warning). See
 | **6a** | Tutorial 05 integration test + MCP protocol test + Mode A holdout replay | 4–5 days | ✅ Complete |
 | **6b** | Mode B manual Layer-3 sessions (dry-run + closed-book rerun-2/3/4) + rerun-2/rerun-4 fixes + `check_environment` | 1–2 days | ✅ Complete (rerun-4 = post-fix verification, zero permission prompts) |
 | **6c** | Transient support (STO) + expanded validation gate (test005 + freyberg holdout rounds) | 1–2 days | ✅ Complete (2026-08-16; `add_sto_package`, guard, 39 tools, all green) |
+| **6d** | Real-life regional model validation (mf6brabant build+run+calibrate; Zenodo 21381071 PESTPP-IES ensemble) | 1–2 days | ⏳ To do |
 | **7a** | Documentation (README expansion, guides, examples) | 2–3 days | ⏳ To do |
 | **7b** | CI/CD setup (GitHub Actions, PyPI publish) | 1–2 days | ⏳ To do |
 | **7c** | Public release (tagging, registry submission, outreach) | 1 day | ⏳ To do |
