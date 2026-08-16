@@ -6,7 +6,7 @@ An open-source Python MCP server for AI-assisted groundwater modelling with MODF
 
 ## Overview
 
-The server exposes 36 tools across 6 modules, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 39 tools across 7 modules, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -37,6 +37,9 @@ The server exposes 36 tools across 6 modules, running locally over stdio transpo
 ---
 
 ## Module responsibilities
+
+### environment
+Preflight checks for a hands-free session. `check_environment` reports the server's own Python interpreter, the installed packages (flopy, pyemu, geopandas, rasterio) with versions, the paths to the MODFLOW 6 / PEST++ / UCODE executables, the local docs index state, and the default workspace root — so an agent verifies the stack in one call instead of probing with shell commands (which commonly hit the wrong interpreter).
 
 ### docs
 Builds a local full-text + semantic search index from the public MODFLOW 6, FloPy, and PEST++ GitHub repositories at install time. Works fully offline. No external API required.
@@ -71,7 +74,8 @@ groundwater-mcp/
 │       │   ├── builder.py      ← create_model, add_*_package, summarise_model
 │       │   ├── runner.py       ← run_simulation, check_model, get_run_log
 │       │   ├── postprocess.py  ← read_heads, read_budget, plot_*, compute_*
-│       │   └── calibration.py  ← setup_pest_control, run_pestpp_*, setup_ucode_control, run_ucode_*, summarise_*
+│       │   ├── calibration.py  ← setup_pest_control, run_pestpp_*, setup_ucode_control, run_ucode_*, summarise_*
+│       │   └── environment.py  ← check_environment (preflight stack check)
 │       └── utils/
 │           ├── workspace.py    ← model directory management
 │           ├── plotting.py     ← shared matplotlib helpers
@@ -113,8 +117,9 @@ Three layers, each catching different failure modes:
 |---|---|---|
 | **Pytest integration tests** (`tests/test_tutorial_*.py`) | Tool logic with real spatial data from the sealed dev set `tests/fixtures/tutorial_04` and `tutorial_05` | Every commit (CI) |
 | **MCP protocol tests** (`tests/test_mcp_protocol.py`) | JSON-RPC message handling, tool registration, error envelope schema | Every commit (CI) |
-| **Manual Claude Desktop walkthrough** | Natural-language usability, tool description quality, full user journey | Before each release |
-| **Holdout validation** (Mode A replay + Mode B manual, at v0.1.0 freeze) | Independent validation of the frozen tool set against sealed projects never seen in development | At the v0.1.0 freeze |
+| **Holdout replay (Mode A)** (`tests/test_holdout_replay.py`) | Automated build→run→postprocess replay of sealed projects (test051, test020) + GAP clean-failure gates | Dry-run green; official run at the v0.1.0 freeze |
+| **Mode B manual Layer-3** | Natural-language usability, tool-description quality, full user journey on a closed-book held-out tutorial | Completed (dry-run 1 + rerun-2, 0 reprompts); post-fix re-run pending |
+| **Manual Claude Desktop walkthrough** | Natural-language usability, tool description quality, full user journey | Before each release (optional — Mode B is the recorded protocol) |
 
 The tutorial datasets used are:
 

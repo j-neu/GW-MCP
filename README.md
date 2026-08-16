@@ -25,10 +25,11 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (36 total)
+## Tools (39 total)
 
 | Module | Tools |
 |---|---|
+| **environment** | `check_environment` |
 | **docs** | `search_docs`, `search_tutorials`, `get_doc_file` |
 | **parameterise** | `import_grid_from_shapefile`, `assign_top_from_raster`, `assign_k_from_zones`, `import_river_from_shapefile`, `import_obs_from_csv` |
 | **model builder** | `create_model`, `set_simulation`, `add_dis_package`, `add_disv_package`, `add_npf_package`, `add_ic_package`, `add_boundary_package`, `add_oc_package`, `summarise_model`, `list_model_files` |

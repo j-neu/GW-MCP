@@ -4,9 +4,11 @@ Row schema:
 `capability (package/process/mode) | MCP status today (covered | partial | gap | legacy-out-of-scope) | covering tool(s) | catalog example refs | notes`
 
 Status verified against `tools.md` + tool module source on 2026-08-15
-(`src/groundwater_mcp/tools/`, 36 tools across 6 modules). `add_boundary_package`
-dispatch list verified at `builder.py:_BOUNDARY_PKG_CLASSES` (CHD, WEL, RIV, DRN,
-RCH, EVT, GHB, SFR). "catalog example refs" are filled from discovery round 1
+(`src/groundwater_mcp/tools/`, 37 tools across 6 modules; `check_environment`
+added 2026-08-16 → 38 tools across 7 modules; `add_sto_package` added
+2026-08-16 → 39 tools). `add_boundary_package` dispatch list verified at
+`builder.py:_BOUNDARY_PKG_CLASSES` (CHD, WEL, RIV, DRN, RCH, EVT, GHB, SFR).
+"catalog example refs" are filled from discovery round 1
 (`discovery/catalog.md`); a gap row with zero refs is a red flag.
 
 ## GWF — flow (discretisation + stress packages)
@@ -17,7 +19,7 @@ RCH, EVT, GHB, SFR). "catalog example refs" are filled from discovery round 1
 | DISV (layered vertex grid) | covered | `add_disv_package` | test006_gwf3_disv, ex-gwf-u1disv, mf6Voronoi, Modflow-API-Ag-Package | |
 | DISU (fully unstructured) | **gap** | — | test009_3lay-disu, test006_gwf3_gnc, ex-gwf-radial, MF6_EnKF_DISU, GMS Quadtree | User-flagged; first v0.2.0 item |
 | TDIS / IMS (time + solver) | covered | `set_simulation` | all testmodels/examples (mfsim.nam) | nper, perlen, nstp, tsmult, ims_complexity |
-| STO (storage) | **gap** | — | test003_gwfs_tr, test020_NevilleTonkinTransient, ex-gwf-advtidal | Not exposed as a tool |
+| STO (storage) | covered | `add_sto_package` | test003_gwfs_tr, test020_NevilleTonkinTransient, ex-gwf-advtidal | v0.1.0 gate (2026-08-16): iconvert/ss/sy + steady/transient periods |
 | NPF (properties) | covered | `add_npf_package` | all testmodels/examples | |
 | IC (initial conditions) | covered | `add_ic_package` | all testmodels/examples | |
 | OC (output control) | covered | `add_oc_package` | all testmodels/examples | head/budget filerecords + saverecord |
@@ -80,7 +82,7 @@ RCH, EVT, GHB, SFR). "catalog example refs" are filled from discovery round 1
 
 ## Coverage summary
 
-- covered: 14 rows · partial: 1 · gap: 12 (DISU, STO, MAW, UZF, LAK, GNC, MVR,
+- covered: 15 rows · partial: 1 · gap: 11 (DISU, MAW, UZF, LAK, GNC, MVR,
   GWT, SWT, GWF-GWT coupling, pestpp-sen, pestpp-pareto/swp) · legacy-out-of-scope: 4
 - Round-1 red flags (see `discovery/catalog.md` "Round-1 red flags"): SWT has
   no MF6 SWT6 package (variable density via GWT hydraulic-head formulation);
