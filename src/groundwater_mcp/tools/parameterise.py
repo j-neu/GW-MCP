@@ -8,11 +8,10 @@ geodata-mcp server.
 from __future__ import annotations
 
 import warnings
-from pathlib import Path
 
 import numpy as np
 
-from groundwater_mcp.utils.model_store import get_gwf, get_sim, save_sim
+from groundwater_mcp.utils.model_store import get_gwf, save_sim
 from groundwater_mcp.utils.workspace import resolve_workspace
 
 # ---------------------------------------------------------------------------
@@ -40,10 +39,10 @@ def _impl_import_grid_from_shapefile(
 ) -> dict:
     """Build a DIS or DISV grid from a catchment polygon shapefile."""
     import flopy.mf6 as mf6
+
     from groundwater_mcp.utils.spatial import (
         dis_grid_props_from_shapefile,
         disv_grid_props_from_shapefile,
-        sample_raster_at_points,
     )
 
     gwf = get_gwf(model)
@@ -251,6 +250,7 @@ def _impl_assign_k_from_zones(
 ) -> dict:
     """Assign K arrays to model layers from geological zone polygons."""
     import geopandas as gpd
+
     from groundwater_mcp.utils.spatial import grid_centroids, intersect_points_with_polygons
 
     gwf = get_gwf(model)
@@ -350,11 +350,12 @@ def _impl_import_river_from_shapefile(
     cond_field: str | None,
     depth_field: str | None,
     stress_periods: list[int] | None,
+    stage_raster: str | None = None,
+    stage_offset: float = 1.0,
 ) -> dict:
     """Intersect river/drain polylines with the model grid and add boundary package."""
-    import flopy.mf6 as mf6
-    from groundwater_mcp.utils.spatial import intersect_lines_with_dis_grid
     from groundwater_mcp.tools.builder import _BOUNDARY_PKG_CLASSES
+    from groundwater_mcp.utils.spatial import intersect_lines_with_dis_grid
 
     pkg_name = package.upper()
     if pkg_name not in ("RIV", "DRN", "GHB"):
@@ -378,15 +379,32 @@ def _impl_import_river_from_shapefile(
             "Check that the shapefile and model grid share the same CRS.",
         )
 
+    # Optional stage-from-raster: sample the raster at each reach's cell
+    # centroid; stage = sampled elevation - stage_offset.
+    if stage_raster:
+        from groundwater_mcp.utils.spatial import sample_raster_at_points
+
+        cell_ids = [r["cellid"] for r in reaches]
+        cc = mg.xyzcellcenters
+        x = np.asarray([float(cc[1][cid[1], cid[2]]) for cid in cell_ids])
+        y = np.asarray([float(cc[0][cid[1], cid[2]]) for cid in cell_ids])
+        dem_vals = sample_raster_at_points(stage_raster, x, y, mg.crs)
+
     # Build stress period data
     sps = stress_periods or [0]
     spd = {}
     for sp in sps:
         records = []
-        for reach in reaches:
+        for i, reach in enumerate(reaches):
             cellid = reach["cellid"]
             if pkg_name == "RIV":
-                stage = float(reach.get(stage_field, 0.0)) if stage_field else 0.0
+                if stage_raster:
+                    elev = dem_vals[i]
+                    if elev is None or elev != elev:  # NaN check
+                        elev = float(reach.get(stage_field, 0.0)) if stage_field else 0.0
+                    stage = float(elev) - stage_offset
+                else:
+                    stage = float(reach.get(stage_field, 0.0)) if stage_field else 0.0
                 cond = float(reach.get(cond_field, reach["length_m"])) if cond_field else reach["length_m"]
                 rbot = stage - float(reach.get(depth_field, 1.0)) if depth_field else stage - 1.0
                 records.append([list(cellid), stage, cond, rbot])
@@ -411,6 +429,7 @@ def _impl_import_river_from_shapefile(
         "model": model,
         "package": pkg_name,
         "reach_count": len(reaches),
+        "stage_source": "raster" if stage_raster else ("attribute" if stage_field else "default"),
         "stress_periods": {sp: len(spd[sp]) for sp in sps},
     }
 
@@ -427,8 +446,8 @@ def _impl_import_obs_from_csv(
     layer: int,
 ) -> dict:
     """Read head/flow observations from CSV and write a MODFLOW 6 OBS file."""
-    import pandas as pd
     import flopy.mf6 as mf6
+    import pandas as pd
 
     gwf = get_gwf(model)
     mg = gwf.modelgrid
@@ -619,18 +638,34 @@ def register(mcp) -> None:
         stage_field: str | None = None,
         cond_field: str | None = None,
         depth_field: str | None = None,
+        stage_raster: str | None = None,
+        stage_offset: float = 1.0,
         stress_periods: list[int] | None = None,
     ) -> dict:
-        """Build RIV, DRN, or GHB stress period data from a river/drain polyline shapefile.
+        """Build RIV, DRN, or GHB stress period data from a river/drain shapefile.
 
-        Intersects the river network with the model grid. Stage, conductance, and
-        depth values are read from the shapefile attributes if provided, otherwise
-        defaults are used (stage=0, cond=intersection length, depth=1 m).
-        Currently supports DIS grids only.
+        Intersects the river network with the model grid. Stage, conductance,
+        and depth values are read from the shapefile attributes if provided,
+        otherwise defaults are used (stage=0, cond=intersection length,
+        depth=1 m). Currently supports DIS grids only.
+
+        NOTE on defaults: a stage of 0.0 makes the river act as a deep drain
+        (heads can drop well below the channel, draining the aquifer). Set a
+        realistic stage — preferably via stage_raster (a ground-surface
+        elevation raster; stage = sampled elevation - stage_offset) or the
+        stage_field attribute.
         """
         try:
             return _impl_import_river_from_shapefile(
-                model, shapefile, package, stage_field, cond_field, depth_field, stress_periods
+                model,
+                shapefile,
+                package,
+                stage_field,
+                cond_field,
+                depth_field,
+                stress_periods,
+                stage_raster,
+                stage_offset,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

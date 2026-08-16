@@ -21,7 +21,6 @@ from groundwater_mcp.index_builder import (
     extract_title,
 )
 
-
 # ---------------------------------------------------------------------------
 # Minimal index fixture
 # ---------------------------------------------------------------------------
@@ -469,7 +468,56 @@ def test_no_index_returns_error(tmp_path, monkeypatch):
     monkeypatch.setattr(docs_module, "_whoosh_index", None)
     monkeypatch.setattr(docs_module, "_embeddings", None)
     monkeypatch.setattr(docs_module, "_metadata", None)
+    monkeypatch.setattr(docs_module, "_AUTOBUILD_INDEX", False)
 
     result = _impl_search_docs("anything")
     assert result["error"] is True
     assert result["code"] == "INDEX_NOT_BUILT"
+
+
+def test_no_index_returns_error_autobuild_disabled_by_default_in_tests(
+    tmp_path, monkeypatch
+):
+    """INDEX_NOT_BUILT is returned when the index is missing, no crash."""
+    from groundwater_mcp.tools.docs import _impl_search_docs
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(docs_module, "WHOOSH_DIR", empty / "whoosh")
+    monkeypatch.setattr(docs_module, "EMBEDDINGS_PATH", empty / "embeddings.npy")
+    monkeypatch.setattr(docs_module, "METADATA_PATH", empty / "metadata.json")
+    monkeypatch.setattr(docs_module, "_whoosh_index", None)
+    monkeypatch.setattr(docs_module, "_embeddings", None)
+    monkeypatch.setattr(docs_module, "_metadata", None)
+    monkeypatch.setattr(docs_module, "_AUTOBUILD_INDEX", False)
+
+    result = _impl_search_docs("something")
+    assert result["error"] is True
+    assert result["code"] == "INDEX_NOT_BUILT"
+
+
+def test_autobuild_starts_on_first_call_when_enabled(tmp_path, monkeypatch):
+    """With _AUTOBUILD_INDEX enabled, a missing index triggers a build."""
+    from groundwater_mcp.tools.docs import _impl_search_docs
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(docs_module, "WHOOSH_DIR", empty / "whoosh")
+    monkeypatch.setattr(docs_module, "EMBEDDINGS_PATH", empty / "embeddings.npy")
+    monkeypatch.setattr(docs_module, "METADATA_PATH", empty / "metadata.json")
+    monkeypatch.setattr(docs_module, "_whoosh_index", None)
+    monkeypatch.setattr(docs_module, "_embeddings", None)
+    monkeypatch.setattr(docs_module, "_metadata", None)
+    monkeypatch.setattr(docs_module, "_AUTOBUILD_INDEX", True)
+    monkeypatch.setattr(docs_module, "_autobuild_started", False)
+
+    calls = []
+    monkeypatch.setattr(
+        docs_module, "build_index", lambda *a, **kw: calls.append(1)
+    )
+
+    result = _impl_search_docs("anything")
+    # The call still reports the index is not built yet
+    assert result["error"] is True
+    assert result["code"] == "INDEX_NOT_BUILT"
+    assert calls, "expected build_index to be triggered by the first call"

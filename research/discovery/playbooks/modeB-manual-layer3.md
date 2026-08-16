@@ -20,13 +20,52 @@ tool names; it must discover them from the tool descriptions.
 1. MCP server registered globally in `C:\Users\jakob\.config\kilo\kilo.jsonc`
    (`groundwater-mcp` → `.venv\Scripts\groundwater-mcp.exe serve`,
    `groundwater-mcp_*` auto-allowed). Any Kilo session in any folder can now
-   use the 36 groundwater-mcp tools.
+    use the 38 groundwater-mcp tools.
 2. Restart Kilo so the server loads.
 3. **Closed-book data folder** (self-contained, no answers inside):
    `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\modeB\tutorial05\data\`
    — `river.shp`, `chd_high.shp`, `chd_lower.shp`, `wells.shp`,
    `wells_obs.csv` (heads 30–46 m — reachable with the CHD 40/70 boundaries),
    `activeZone.shp` + `dem_clipped.tif`.
+
+## Session setup checklist (added after rerun-2, 2026-08-15)
+
+- **ALL data must live in the agent's working folder.** Nothing may be
+  referenced from outside it. The prompt below references ONLY in-folder
+  relative names (`activeZone.shp`, `dem_clipped.tif` are in the same folder).
+  Rerun-2's prompt still pointed at `tests\fixtures\tutorial_04` for those two
+  files because the user pasted a stale prompt — do not paste stale prompts.
+- Before starting, verify the working folder contains **every data file the
+  prompt mentions** (river/chd_high/chd_lower/wells `.shp` + `.prj`/`.dbf`,
+  `wells_obs.csv`, `activeZone.shp` **and its sidecars** `.dbf`/`.shx`/`.prj`,
+  `dem_clipped.tif`). If any file is missing, copy it into the folder BEFORE
+  starting. (Rerun-3 lost ~10 min because `activeZone.shx` was missing and the
+  agent had to rebuild it by hand.)
+- Permission fix (applied 2026-08-15 to `~/.config/kilo/kilo.jsonc`): the
+  holdout folder is allow-listed under `permission.external_directory`
+  (`"C:\\Users\\jakob\\Documents\\Cursor projects\\GW-MCP-holdout\\**": "allow"`),
+  so the session reads/writes it without "allow access to external files"
+  prompts. Requires a Kilo restart after editing. The MCP server's own data
+  dir (`C:\Users\jakob\.groundwater-mcp\**`) was added 2026-08-16 so default
+  workspaces are also prompt-free.
+
+## Preflight (added after rerun-3, 2026-08-16)
+
+Rerun-3 lost time to (a) permission prompts from a default workspace outside
+the session folder and (b) the agent wrongly concluding flopy/pyemu were
+"not available" because it probed the system Python, not the server venv.
+Before building, the assistant should:
+
+1. Call the MCP `check_environment` tool once — it reports the server's own
+   Python, the installed packages (flopy/pyemu/geopandas/rasterio) with
+   versions, the MODFLOW 6 / PEST++ / UCODE executable paths, docs index
+   state, and the default workspace root. If anything is missing, report it
+   and stop; do not guess with shell commands.
+2. Create the model workspace **inside the session folder** (e.g. a `model\`
+   subfolder) by passing an explicit `workspace` path to `create_model`, so
+   all data + model files live in one place and no permission prompts occur.
+   The rerun-3 agent used the default `~/.groundwater-mcp/workspaces/...`
+   which sat outside the session folder and caused repeated prompts.
 
 ## Closed-book rules (added after dry-run 1, 2026-08-15)
 
@@ -87,6 +126,10 @@ Please:
    parameter estimation, then summarise the calibration results.
 
 Work step by step and explain what you are doing at each step.
+
+Before building, verify the modelling environment is ready (dependencies,
+MODFLOW executables) and list the data files you found in this folder. Keep
+all model files in a new subfolder "model" of this folder.
 
 You must work CLOSED-BOOK: do not read the groundwater-mcp source code, its
 tests, the tutorial PDFs, or any reference model files. Build everything from

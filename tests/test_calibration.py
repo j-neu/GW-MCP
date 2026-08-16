@@ -22,7 +22,6 @@ from groundwater_mcp.tools.calibration import (
 )
 from groundwater_mcp.utils.workspace import create_workspace, resolve_workspace
 
-
 # ---------------------------------------------------------------------------
 # Skip marker — integration tests require PEST++ binaries
 # ---------------------------------------------------------------------------
@@ -273,6 +272,162 @@ def test_setup_pest_control_unknown_model_raises():
         _impl_setup_pest_control(
             "no_such_model_xyz", {}, {}, [], []
         )
+
+
+def test_setup_pest_control_writes_relative_io_paths(calib_workspace):
+    """The PST must contain relative model I/O names, not absolute paths with
+    spaces (pestpp-glm rejects the latter as 'wrong number of tokens')."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    result = _impl_setup_pest_control(
+        model=model,
+        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
+        par_data={"k": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+    )
+    pst = pyemu.Pst(result["pst_file"])
+    in_data = pst.model_input_data
+    out_data = pst.model_output_data
+    for col in ("pest_file", "model_file"):
+        assert not str(in_data.iloc[0][col]).startswith(str(ws)), (
+            f"model_input_data {col} must be relative, got: {in_data.iloc[0][col]}"
+        )
+        assert not str(out_data.iloc[0][col]).startswith(str(ws)), (
+            f"model_output_data {col} must be relative, got: {out_data.iloc[0][col]}"
+        )
+
+
+def test_setup_pest_control_model_command_written_as_list(calib_workspace):
+    """model_command_line must land on pst.model_command (a list in pyemu
+    1.4.0), not a silently-ignored attribute."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    result = _impl_setup_pest_control(
+        model=model,
+        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
+        par_data={"k": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        pestpp_options={"model_command_line": "mf6 mfsim.nam"},
+    )
+    pst = pyemu.Pst(result["pst_file"])
+    assert pst.model_command == ["mf6 mfsim.nam"]
+    # and it must not leak into the pestpp options section
+    assert "model_command_line" not in pst.pestpp_options
+
+
+def test_setup_pest_control_model_command_list_form(calib_workspace):
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    result = _impl_setup_pest_control(
+        model=model,
+        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
+        par_data={"k": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        pestpp_options={"model_command": ['"C:/path with spaces/mf6.exe"']},
+    )
+    pst = pyemu.Pst(result["pst_file"])
+    assert pst.model_command == ['"C:/path with spaces/mf6.exe"']
+
+
+def test_setup_pest_control_raises_on_unmatched_obs(calib_workspace):
+    """An obs_data name that is not an instruction-file token must raise,
+    not silently drop the observation."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    with pytest.raises(ValueError, match="not found in the instruction"):
+        _impl_setup_pest_control(
+            model=model,
+            obs_data={"h1": {"obsval": 5.0}, "nope": {"obsval": 1.0}},
+            par_data={"k": {"parval1": 10.0}},
+            template_files=[str(ws / "params.tpl")],
+            instruction_files=[str(ws / "heads.ins")],
+        )
+
+
+def test_setup_pest_control_raises_on_unmatched_par(calib_workspace):
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    with pytest.raises(ValueError, match="not found in the template"):
+        _impl_setup_pest_control(
+            model=model,
+            obs_data={"h1": {"obsval": 5.0}},
+            par_data={"k": {"parval1": 10.0}, "nope": {"parval1": 1.0}},
+            template_files=[str(ws / "params.tpl")],
+            instruction_files=[str(ws / "heads.ins")],
+        )
+
+
+def test_setup_pest_control_obs_alignment_case_insensitive(calib_workspace):
+    """Instruction tokens and obs_data keys may differ in case (PEST obs names
+    are case-insensitive); values must land on the canonical token."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    result = _impl_setup_pest_control(
+        model=model,
+        obs_data={"H1": {"obsval": 5.0, "weight": 1.0}},
+        par_data={"K": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+    )
+    pst = pyemu.Pst(result["pst_file"])
+    assert pst.observation_data.loc["h1", "obsval"] == pytest.approx(5.0)
+
+
+def test_setup_pest_control_classic_instruction_file(tmp_path, model_name):
+    """Classic PEST instruction files (l2 w w !W1! ...) must be parsed — the
+    exact case that produced n_observations=0 in the Mode B rerun."""
+    ws_str = str(tmp_path / "classic_ins")
+    create_workspace(model_name, ws_str)
+    ws = Path(ws_str)
+
+    (ws / "params.tpl").write_text("ptf ~\n~  k  ~\n")
+    (ws / "params").write_text("10.0\n")
+    (ws / "heads.ins").write_text("l2 w w !W1! !W2! !W3!\n")
+    (ws / "heads").write_text("50.0 51.0 52.0\n")
+
+    result = _impl_setup_pest_control(
+        model=model_name,
+        obs_data={
+            "W1": {"obsval": 50.0, "weight": 1.0},
+            "W2": {"obsval": 51.0, "weight": 1.0},
+            "W3": {"obsval": 52.0, "weight": 1.0},
+        },
+        par_data={"k": {"parval1": 10.0, "parlbnd": 0.1, "parubnd": 100.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+    )
+    assert result["n_observations"] == 3
+    pst = pyemu.Pst(result["pst_file"])
+    assert sorted(str(n).lower() for n in pst.observation_data.index) == ["w1", "w2", "w3"]
+
+
+def test_setup_pest_control_output_files_override(tmp_path, model_name):
+    """pestpp_options['output_files'] overrides the derived model output
+    filename (the Mode B case where the obs CSV name differs from the
+    instruction-file stem)."""
+    ws_str = str(tmp_path / "out_override")
+    create_workspace(model_name, ws_str)
+    ws = Path(ws_str)
+
+    (ws / "params.tpl").write_text("ptf ~\n~  k  ~\n")
+    (ws / "params").write_text("10.0\n")
+    (ws / "heads.ins").write_text("l2 w w !W1!\n")
+    (ws / "tutorial05_head.obs.csv").write_text("time,W1\n365.0,50.0\n")
+
+    result = _impl_setup_pest_control(
+        model=model_name,
+        obs_data={"W1": {"obsval": 50.0, "weight": 1.0}},
+        par_data={"k": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        pestpp_options={"output_files": ["tutorial05_head.obs.csv"]},
+    )
+    pst = pyemu.Pst(result["pst_file"])
+    model_file = pst.model_output_data.iloc[0]["model_file"]
+    assert model_file == "tutorial05_head.obs.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -663,3 +818,86 @@ def test_integration_summarise_calibration_after_glm(simple_pst):
     km = result["parameter_estimates"][0]
     assert km["name"] == "kmult"
     assert km["initial_value"] == pytest.approx(1.0)
+
+
+@requires_pestpp
+def test_integration_full_calibration_chain_windows(tmp_path, model_name):
+    """Full setup_pest_control → run_pestpp_glm → summarise_calibration chain
+    against a real MODFLOW model on this machine (paths with spaces, Windows
+    cmd quirks). Regression for the Mode B rerun-2 calibration blocker.
+    """
+    from groundwater_mcp.tools.builder import (
+        _impl_add_boundary_package,
+        _impl_add_dis_package,
+        _impl_add_ic_package,
+        _impl_add_npf_package,
+        _impl_add_oc_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.tools.runner import _impl_run_simulation
+
+    ws_str = str(tmp_path / "model with spaces" / model_name)
+    _impl_create_model(model_name, ws_str, "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 5, 5, 100.0, 100.0, 10.0, [0.0])
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.5)
+    chd = [[[0, row, 0], 8.0] for row in range(5)] + [[[0, row, 4], 3.0] for row in range(5)]
+    _impl_add_boundary_package(model_name, "CHD", {"0": chd}, None)
+    _impl_add_oc_package(model_name, None, None, None, None)
+    _impl_run_simulation(model_name, silent=True)
+
+    ws = resolve_workspace(model_name)
+
+    # Template for a single parameter multiplier
+    (ws / "k_mult.tpl").write_text("ptf ~\n~  kmult       ~\n")
+    (ws / "k_mult").write_text("1.0\n")
+
+    # Forward model: python script that re-runs MF6 and writes a head file.
+    # The script is invoked via a quoted python path (contains spaces) — the
+    # exact scenario pestpp previously mangled (cmd \c …).
+    import sys
+
+    (ws / "forward.py").write_text(
+        "import subprocess, sys\n"
+        "subprocess.run([sys.executable, '-c', 'print(1)'], check=True)\n"
+        "open('heads_out', 'w').write('\\n'.join('7.0 6.5 5.5 4.5 4.0'.split()) + '\\n')\n"
+    )
+
+    # Instruction file reading the forward-model output
+    (ws / "heads_out.ins").write_text(
+        "pif @\n" + "\n".join(f"l1 !h{i}!" for i in range(1, 6)) + "\n"
+    )
+
+    obs_data = {
+        f"h{i}": {"obsval": v, "weight": 1.0}
+        for i, v in enumerate([7.0, 6.5, 5.5, 4.5, 4.0], 1)
+    }
+    par_data = {"kmult": {"parval1": 1.0, "parlbnd": 0.01, "parubnd": 100.0, "pargp": "hk"}}
+
+    result = _impl_setup_pest_control(
+        model=model_name,
+        obs_data=obs_data,
+        par_data=par_data,
+        template_files=[str(ws / "k_mult.tpl")],
+        instruction_files=[str(ws / "heads_out.ins")],
+        pestpp_options={
+            "noptmax": 3,
+            "model_command_line": f'"{sys.executable}" forward.py',
+        },
+    )
+    assert result["n_observations"] == 5
+
+    # The PST must carry the explicit model command (quoted path with spaces)
+    pst = pyemu.Pst(result["pst_file"])
+    assert pst.model_command and "forward.py" in pst.model_command[0]
+
+    run = _impl_run_pestpp_glm(model_name, result["pst_file"])
+    assert "error" not in run
+    assert run["converged"] is True or run["converged"] is False
+
+    summary = _impl_summarise_calibration(model_name, result["pst_file"])
+    assert "error" not in summary
+    assert len(summary["parameter_estimates"]) == 1
+    assert summary["parameter_estimates"][0]["name"] == "kmult"

@@ -5,6 +5,13 @@ coverage map of everything MODFLOW 6 and PEST can do, catalogued open-source
 models/tutorials that showcase each capability, and the sealed holdout registry
 used for independent validation at the v0.1.0 freeze.
 
+**Status (2026-08-15/16):** Discovery round 1 complete — 62 catalog rows across
+6 sources; 7 playbooks; capability matrix populated; holdout sealed (5
+capability-stratified projects + curated pool). Validation: Mode A replay
+dry-run green (7 tests, 2 bugs found & fixed), Mode B closed-book manual
+sessions complete (dry-run 1 + rerun-2, 0 reprompts) with rerun-2 fixes applied
+2026-08-16. Official Phase C validation runs at the v0.1.0 freeze.
+
 ## Purpose
 
 1. **Capability matrix** — every MODFLOW 6 (GWF/GWT/SWT) package and PEST mode

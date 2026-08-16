@@ -23,9 +23,9 @@ from groundwater_mcp.tools.postprocess import (
     _impl_plot_heads_map,
     _impl_read_budget,
     _impl_read_heads,
+    _impl_view_image,
 )
 from groundwater_mcp.tools.runner import _find_mf6_binary, _impl_run_simulation
-
 
 # ---------------------------------------------------------------------------
 # Skip marker — integration tests require the mf6 binary
@@ -75,7 +75,6 @@ def ran_model(runnable_model):
 @pytest.fixture()
 def synthetic_hds(runnable_model):
     """Inject a synthetic .hds file so unit tests don't need the mf6 binary."""
-    import flopy.utils as fu
     import struct
 
     from groundwater_mcp.utils.workspace import resolve_workspace
@@ -317,3 +316,55 @@ def test_plot_cross_section_auto_output_file(ran_model):
     assert "error" not in result
     assert result["output_file"].endswith(".png")
     assert Path(result["output_file"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# _impl_view_image
+# ---------------------------------------------------------------------------
+
+
+def _make_png(path: Path) -> None:
+    import base64
+
+    # Minimal valid 1x1 PNG
+    png_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+    path.write_bytes(base64.b64decode(png_b64))
+
+
+def test_view_image_returns_base64(runnable_model, tmp_path):
+    img = Path(tmp_path) / "head.png"
+    _make_png(img)
+    result = _impl_view_image(runnable_model, str(img))
+    assert "error" not in result
+    assert result["mime_type"] == "image/png"
+    assert result["size_bytes"] > 0
+    assert result["data_base64"]
+
+
+def test_view_image_relative_path(runnable_model, tmp_path):
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    ws = resolve_workspace(runnable_model)
+    _make_png(ws / "heads.png")
+    result = _impl_view_image(runnable_model, "heads.png")
+    assert "error" not in result
+    assert result["file"].endswith("heads.png")
+
+
+def test_view_image_missing_file_raises(runnable_model):
+    with pytest.raises(FileNotFoundError):
+        _impl_view_image(runnable_model, "does_not_exist.png")
+
+
+def test_view_image_unsupported_format_raises(runnable_model, tmp_path):
+    img = tmp_path / "head.txt"
+    img.write_text("not an image")
+    with pytest.raises(ValueError, match="Unsupported image format"):
+        _impl_view_image(runnable_model, str(img), output_format="txt")
+
+
+def test_view_image_unknown_model_raises():
+    with pytest.raises(KeyError):
+        _impl_view_image("no_such_model_xyz", "heads.png")

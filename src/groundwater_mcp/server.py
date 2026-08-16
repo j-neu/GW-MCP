@@ -10,6 +10,7 @@ from groundwater_mcp.tools import (
     builder,
     calibration,
     docs,
+    environment,
     parameterise,
     postprocess,
     runner,
@@ -31,6 +32,7 @@ builder.register(mcp)
 runner.register(mcp)
 postprocess.register(mcp)
 calibration.register(mcp)
+environment.register(mcp)
 
 
 def main() -> None:

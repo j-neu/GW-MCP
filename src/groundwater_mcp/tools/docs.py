@@ -7,6 +7,7 @@ Build the index first with:  groundwater-mcp build-index
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +17,7 @@ from groundwater_mcp.index_builder import (
     METADATA_PATH,
     PAGE_SIZE_BYTES,
     WHOOSH_DIR,
+    build_index,
     expand_acronyms,
     extract_text,
 )
@@ -28,6 +30,41 @@ _whoosh_index = None
 _embeddings = None  # numpy array, shape (n_docs, dim)
 _metadata: list[dict] | None = None
 _st_model = None  # SentenceTransformer
+
+# Auto-build control — the first search_docs/search_tutorials call when no
+# index exists kicks off a background build (best-effort) and returns the
+# INDEX_NOT_BUILT error with build instructions.  Tests set this to False so
+# a missing index returns the error without hitting the network.
+_AUTOBUILD_INDEX = True
+_autobuild_started = False
+_autobuild_lock = threading.Lock()
+
+
+def _maybe_start_autobuild() -> bool:
+    """Start a background index build on first call if the index is missing.
+
+    Returns True if the index is (now) available, False otherwise.
+    """
+    global _autobuild_started
+    if _index_available():
+        return True
+    if not _AUTOBUILD_INDEX:
+        return False
+    with _autobuild_lock:
+        if _autobuild_started:
+            return False
+        _autobuild_started = True
+    import traceback
+
+    def _run_build() -> None:
+        try:
+            build_index(verbose=False)
+        except Exception:
+            # best-effort: leave the error path to surface build instructions
+            traceback.print_exc()
+
+    threading.Thread(target=_run_build, daemon=True).start()
+    return False
 
 
 def _get_whoosh_index():
@@ -73,7 +110,11 @@ _NO_INDEX_ERROR = {
     "error": True,
     "code": "INDEX_NOT_BUILT",
     "message": "The documentation index has not been built yet.",
-    "suggestion": "Run `groundwater-mcp build-index` to download and index the documentation.",
+    "suggestion": (
+        "Run `groundwater-mcp build-index` to download and index the "
+        "documentation (requires network on first run). A build has been "
+        "started in the background; retry search_docs in a minute."
+    ),
 }
 
 
@@ -228,7 +269,7 @@ def _impl_search_docs(
     method: str = "auto",
     limit: int = 10,
 ) -> dict:
-    if not _index_available():
+    if not _maybe_start_autobuild():
         return _NO_INDEX_ERROR
 
     expanded = expand_acronyms(query)
@@ -255,7 +296,7 @@ def _impl_search_tutorials(
     complexity: str | None = None,
     limit: int = 5,
 ) -> dict:
-    if not _index_available():
+    if not _maybe_start_autobuild():
         return _NO_INDEX_ERROR
 
     if complexity and complexity not in ("beginner", "intermediate", "advanced"):
@@ -280,6 +321,9 @@ def _impl_search_tutorials(
 
 
 def _impl_get_doc_file(path: str, page: int = 1) -> dict:
+    if not _maybe_start_autobuild():
+        return _NO_INDEX_ERROR
+
     _, metadata = _get_embeddings_and_metadata()
     if metadata is None:
         return _NO_INDEX_ERROR

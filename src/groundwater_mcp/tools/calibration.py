@@ -7,16 +7,18 @@ UCODE tools are Phase 5b (stubs kept below).
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyemu
 from mcp.server.fastmcp import FastMCP
 
+from groundwater_mcp.tools.runner import _find_mf6_binary
 from groundwater_mcp.utils.workspace import resolve_workspace
-
 
 # ---------------------------------------------------------------------------
 # Error helper
@@ -174,6 +176,29 @@ def _compute_residual_stats(res_df) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _parse_ins_obs_names(ins_path: Path) -> list[str]:
+    """Extract observation names from a PEST++ instruction file.
+
+    Supports both classic PEST instruction files (``l2 w w !W1! !W2!``) and
+    pyemu's pif/jif (usecol-style) instruction files. Returns ``[]`` if no
+    names can be found.
+    """
+    text = ins_path.read_text()
+    lines = text.splitlines()
+    if not lines:
+        return []
+    header = lines[0].strip().lower()
+    if header.startswith(("pif", "jif")):
+        try:
+            names = pyemu.pst_utils.parse_ins_file(str(ins_path))
+            if names:
+                return list(names)
+        except Exception:
+            pass
+    # Classic PEST format: tokens enclosed in !...!
+    return re.findall(r"!([^!]+)!", text)
+
+
 def _impl_setup_pest_control(
     model: str,
     obs_data: dict,
@@ -191,79 +216,187 @@ def _impl_setup_pest_control(
     obs_data:
         Mapping of observation name → attributes dict.  Recognised keys:
         ``obsval`` (or ``value``), ``weight``, ``obgnme``.
+        Observation names MUST match the tokens in the instruction file(s);
+        a name that cannot be aligned is a hard error (no silent drop).
     par_data:
         Mapping of parameter name → attributes dict.  Recognised keys:
         ``parval1`` (or ``initial_value``), ``parlbnd`` (or ``lower_bound``),
         ``parubnd`` (or ``upper_bound``), ``pargp``, ``partrans``.
+        Parameter names MUST match the tokens in the template file(s).
     template_files:
-        Paths to PEST++ template files (.tpl).  Each must already exist.
-        The corresponding model input file is derived by stripping the .tpl
-        suffix (e.g. ``params.tpl`` → ``params``).
+        Paths to PEST++ template files (.tpl).  Each must already exist and
+        start with a ``ptf``/``jtf`` header.  The corresponding model input
+        file is derived by stripping the .tpl suffix (e.g. ``params.tpl`` →
+        ``params``).
     instruction_files:
         Paths to PEST++ instruction files (.ins).  Each must already exist.
         The corresponding model output file is derived by stripping the .ins
-        suffix (e.g. ``heads.ins`` → ``heads``).
+        suffix (e.g. ``heads.ins`` → ``heads``).  If the model output file
+        has a different name, pass it via ``pestpp_options["output_files"]``
+        (list parallel to ``instruction_files``).
     pestpp_options:
-        Optional PEST++ options written to the ++options section.  The special
-        key ``"model_command_line"`` is extracted and applied to the PST
-        control data directly (not written to pestpp_options).
+        Optional PEST++ options written to the ++options section.  Special
+        keys handled here (not written to ++options):
+
+        - ``"model_command_line"`` (str) or ``"model_command"`` (str|list):
+          the forward-model run command.  pyemu 1.4.0 stores this as a list
+          on ``pst.model_command``; the default is ``model.bat``.
+        - ``"output_files"`` (list): explicit model output file names,
+          parallel to ``instruction_files`` (for when the output file is not
+          the instruction file with ``.ins`` stripped).
+        - ``"noptmax"``: native PEST control data (not a pestpp '++' arg).
+
+        On Windows, the default model command resolves the MF6 binary
+        directly (``<mf6-exe>``) instead of a ``cmd /c model.bat`` wrapper,
+        which fails under ``NoDefaultCurrentDirectoryInExePath=1``.
     """
     ws = resolve_workspace(model)
     pestpp_options = dict(pestpp_options or {})
 
-    # Derive paired in/out file names from tpl/ins paths
-    in_files = []
-    for tpl in template_files:
-        p = Path(tpl)
-        in_files.append(str(p.with_suffix("")) if p.suffix == ".tpl" else str(p) + ".in")
+    # Resolve template/instruction paths relative to the workspace
+    def _resolve(p: str) -> Path:
+        pp = Path(p)
+        return pp if pp.is_absolute() else ws / p
 
-    out_files = []
-    for ins in instruction_files:
-        p = Path(ins)
-        out_files.append(str(p.with_suffix("")) if p.suffix == ".ins" else str(p) + ".out")
+    tpl_paths = [_resolve(t) for t in template_files]
+    ins_paths = [_resolve(i) for i in instruction_files]
 
-    # Build Pst from template/instruction files
-    pst = pyemu.Pst.from_io_files(
-        tpl_files=list(template_files),
-        in_files=in_files,
-        ins_files=list(instruction_files),
-        out_files=out_files,
-        pst_path=str(ws),
+    # Validate template files exist and start with ptf/jtf
+    for tpl in tpl_paths:
+        if not tpl.exists():
+            raise FileNotFoundError(f"Template file not found: {tpl}")
+        first = tpl.read_text().splitlines()[0].strip()
+        if not first.lower().startswith(("ptf", "jtf")):
+            raise ValueError(f"Template file must start with [ptf,jtf], not: {first!r}")
+    for ins in ins_paths:
+        if not ins.exists():
+            raise FileNotFoundError(f"Instruction file not found: {ins}")
+
+    # Extract parameter names from template files
+    par_names: list[str] = []
+    for tpl in tpl_paths:
+        par_names.extend(pyemu.pst_utils.parse_tpl_file(str(tpl)))
+
+    # Extract observation names from instruction files
+    obs_names: list[str] = []
+    for ins in ins_paths:
+        obs_names.extend(_parse_ins_obs_names(ins))
+    if not obs_names:
+        raise ValueError(
+            "No observation names found in the instruction file(s). "
+            "Instruction files must use classic PEST tokens (!name!) or "
+            "pyemu pif/jif (usecol) format."
+        )
+
+    # Build the Pst from the parsed names (not from_io_files — that cannot
+    # parse classic PEST instruction files in pyemu 1.4.0)
+    pst = pyemu.pst_utils.generic_pst(par_names, obs_names)
+
+    # Derive paired in/out file names from tpl/ins paths (relative, so the
+    # PST contains no absolute paths — pestpp-glm rejects absolute paths
+    # with spaces as "wrong number of tokens").
+    in_files = [
+        p.name[:-4] if p.suffix.lower() == ".tpl" else p.name + ".in"
+        for p in tpl_paths
+    ]
+    out_files = [
+        p.name[:-4] if p.suffix.lower() == ".ins" else p.name + ".out"
+        for p in ins_paths
+    ]
+    output_files = pestpp_options.pop("output_files", None)
+    if output_files is not None:
+        if len(output_files) != len(ins_paths):
+            raise ValueError(
+                "len(output_files) must equal len(instruction_files)"
+            )
+        out_files = [Path(o).name for o in output_files]
+
+    pst.model_input_data = pd.DataFrame(
+        {"pest_file": [p.name for p in tpl_paths], "model_file": in_files},
+        index=[p.name for p in tpl_paths],
+    )
+    pst.model_output_data = pd.DataFrame(
+        {"pest_file": [p.name for p in ins_paths], "model_file": out_files},
+        index=[p.name for p in ins_paths],
     )
 
-    # Apply model command line (not a pestpp_option — it's control data)
-    cmd_line = pestpp_options.pop("model_command_line", "")
-    if cmd_line:
-        pst.model_command_line = cmd_line
+    # Apply model command line.  pyemu 1.4.0 stores it as a list on
+    # pst.model_command (NOT model_command_line).
+    cmd_line = pestpp_options.pop("model_command_line", None)
+    if cmd_line is None:
+        cmd_line = pestpp_options.pop("model_command", None)
+    if cmd_line is not None:
+        if isinstance(cmd_line, str):
+            pst.model_command = [cmd_line]
+        else:
+            pst.model_command = list(cmd_line)
+    elif platform.system() == "Windows":
+        # Default forward command: run MF6 directly.  A bare `model.bat`
+        # fails under NoDefaultCurrentDirectoryInExePath=1, and `cmd /c`
+        # is path-normalised by pestpp into `cmd \c` (invalid).
+        try:
+            mf6_exe = _find_mf6_binary()
+            pst.model_command = [f'"{mf6_exe}"']
+        except RuntimeError:
+            pass  # keep pyemu's default model.bat
 
-    # Populate observation values and weights
+    # Populate observation values and weights — validate alignment with the
+    # instruction-file tokens; raise instead of silently dropping.
     obs_df = pst.observation_data
+    obs_index = {str(n).lower(): n for n in obs_df.index}
+    unmatched: list[str] = []
     for obs_name, attrs in obs_data.items():
-        if obs_name in obs_df.index:
-            obs_df.loc[obs_name, "obsval"] = float(
-                attrs.get("obsval", attrs.get("value", 0.0))
-            )
-            obs_df.loc[obs_name, "weight"] = float(attrs.get("weight", 1.0))
-            if "obgnme" in attrs:
-                obs_df.loc[obs_name, "obgnme"] = str(attrs["obgnme"])
+        key = str(obs_name).lower()
+        if key not in obs_index:
+            unmatched.append(obs_name)
+            continue
+        canonical = obs_index[key]
+        obs_df.loc[canonical, "obsval"] = float(
+            attrs.get("obsval", attrs.get("value", 0.0))
+        )
+        obs_df.loc[canonical, "weight"] = float(attrs.get("weight", 1.0))
+        if "obgnme" in attrs:
+            obs_df.loc[canonical, "obgnme"] = str(attrs["obgnme"])
+    if unmatched:
+        available = sorted({str(n) for n in obs_df.index})
+        raise ValueError(
+            "Observation name(s) in obs_data not found in the instruction "
+            f"file(s): {unmatched}. Available observation names from the "
+            f"instruction file(s): {available}. obs_data keys must match the "
+            "tokens in the instruction file(s)."
+        )
 
-    # Populate parameter bounds and initial values
+    # Populate parameter bounds and initial values — validate alignment.
     par_df = pst.parameter_data
+    par_index = {str(n).lower(): n for n in par_df.index}
+    unmatched_par: list[str] = []
     for par_name, attrs in par_data.items():
-        if par_name in par_df.index:
-            par_df.loc[par_name, "parval1"] = float(
-                attrs.get("parval1", attrs.get("initial_value", 1.0))
-            )
-            par_df.loc[par_name, "parlbnd"] = float(
-                attrs.get("parlbnd", attrs.get("lower_bound", 0.01))
-            )
-            par_df.loc[par_name, "parubnd"] = float(
-                attrs.get("parubnd", attrs.get("upper_bound", 100.0))
-            )
-            if "pargp" in attrs:
-                par_df.loc[par_name, "pargp"] = str(attrs["pargp"])
-            if "partrans" in attrs:
-                par_df.loc[par_name, "partrans"] = str(attrs["partrans"])
+        key = str(par_name).lower()
+        if key not in par_index:
+            unmatched_par.append(par_name)
+            continue
+        canonical = par_index[key]
+        par_df.loc[canonical, "parval1"] = float(
+            attrs.get("parval1", attrs.get("initial_value", 1.0))
+        )
+        par_df.loc[canonical, "parlbnd"] = float(
+            attrs.get("parlbnd", attrs.get("lower_bound", 0.01))
+        )
+        par_df.loc[canonical, "parubnd"] = float(
+            attrs.get("parubnd", attrs.get("upper_bound", 100.0))
+        )
+        if "pargp" in attrs:
+            par_df.loc[canonical, "pargp"] = str(attrs["pargp"])
+        if "partrans" in attrs:
+            par_df.loc[canonical, "partrans"] = str(attrs["partrans"])
+    if unmatched_par:
+        available = sorted({str(n) for n in par_df.index})
+        raise ValueError(
+            "Parameter name(s) in par_data not found in the template "
+            f"file(s): {unmatched_par}. Available parameter names from the "
+            f"template file(s): {available}. par_data keys must match the "
+            "tokens in the template file(s)."
+        )
 
     # Apply remaining PEST++ options. noptmax is native PEST control data,
     # not a pestpp '++' argument (pestpp rejects unknown ++ args and exits
@@ -283,8 +416,10 @@ def _impl_setup_pest_control(
         "model": model,
         "pst_file": str(pst_path),
         "n_observations": len(obs_df),
+        "n_observations_matched": len(obs_df) - len(unmatched),
         "n_adjustable_parameters": n_adjustable,
         "n_total_parameters": len(par_df),
+        "model_command": list(pst.model_command),
     }
 
 
@@ -562,8 +697,18 @@ def register(mcp: FastMCP) -> None:
         obs_data maps observation names to dicts with keys: obsval (or value),
         weight, obgnme.  par_data maps parameter names to dicts with keys:
         parval1 (or initial_value), parlbnd (or lower_bound), parubnd (or
-        upper_bound), pargp, partrans.  Pass model_command_line inside
-        pestpp_options to set the forward model run command.
+        upper_bound), pargp, partrans.
+
+        The instruction file(s) must already exist and define the observation
+        tokens (classic PEST `!name!` or pyemu pif/jif).  obs_data keys MUST
+        match those tokens exactly (case-insensitive); a mismatch raises an
+        error instead of silently dropping observations.
+
+        pestpp_options special keys: "model_command_line" (str) or
+        "model_command" (str|list) sets the forward-model run command
+        (default on Windows: the located MF6 binary); "output_files" (list,
+        parallel to instruction_files) sets explicit model output filenames;
+        "noptmax" is native PEST control data.
         """
         try:
             return _impl_setup_pest_control(
