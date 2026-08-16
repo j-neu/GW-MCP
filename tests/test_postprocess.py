@@ -247,6 +247,36 @@ def test_read_budget_invalid_text_raises(ran_model):
 
 
 @requires_mf6
+def test_budget_reader_falls_back_to_double_on_oserror(ran_model, monkeypatch):
+    """Windows regression (independent tutorial-05 transient run): flopy's auto
+    budget precision raises OSError [Errno 22] on larger double-precision .cbb
+    files instead of falling back cleanly. The MCP budget reader must retry
+    with precision='double'."""
+    import flopy.utils as fu
+
+    real_init = fu.CellBudgetFile.__init__
+    calls = {"n": 0}
+
+    def patched_init(self, filename, precision="auto", verbose=False, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(22, "Invalid argument")
+        real_init(self, filename, precision=precision, verbose=verbose, **kwargs)
+
+    monkeypatch.setattr(fu.CellBudgetFile, "__init__", patched_init)
+
+    result = _impl_read_budget(ran_model)
+    assert "error" not in result
+    assert result["record_count"] > 0
+
+    calls["n"] = 0
+    wb = _impl_compute_water_balance(ran_model)
+    assert "error" not in wb
+    assert wb["total_inflow"] > 0
+    assert wb["total_outflow"] < 0  # outflows are reported negative
+
+
+@requires_mf6
 def test_compute_drawdown_same_timestep_is_zero(ran_model):
     """Drawdown between identical time steps should be zero everywhere."""
     result = _impl_compute_drawdown(ran_model, (0, 0), (0, 0), layer=0)

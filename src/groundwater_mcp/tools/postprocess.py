@@ -55,6 +55,21 @@ def _find_budget_file(workspace: Path) -> Path:
     )
 
 
+def _open_budget_file(path: Path) -> fu.CellBudgetFile:
+    """Open a MODFLOW 6 cell-by-cell budget file.
+
+    MODFLOW 6 writes budget files in double precision. FloPy's ``precision
+    = "auto"`` is supposed to fall back from single to double, but on Windows
+    the single-precision read of a larger file raises ``OSError`` (``[Errno
+    22]``, seek past end) instead of returning cleanly, so the fallback never
+    runs. Retry explicitly with ``precision="double"`` on that error.
+    """
+    try:
+        return fu.CellBudgetFile(str(path))
+    except OSError:
+        return fu.CellBudgetFile(str(path), precision="double")
+
+
 # ---------------------------------------------------------------------------
 # Array stats helper
 # ---------------------------------------------------------------------------
@@ -120,7 +135,7 @@ def _impl_read_budget(
     ws = resolve_workspace(model)
     cbb_path = _find_budget_file(ws)
 
-    cbf = fu.CellBudgetFile(str(cbb_path))
+    cbf = _open_budget_file(cbb_path)
     kstpkper_list = cbf.get_kstpkper()
 
     if not kstpkper_list:
@@ -223,7 +238,7 @@ def _impl_compute_water_balance(
     ws = resolve_workspace(model)
     cbb_path = _find_budget_file(ws)
 
-    cbf = fu.CellBudgetFile(str(cbb_path))
+    cbf = _open_budget_file(cbb_path)
     kstpkper_list = cbf.get_kstpkper()
 
     if not kstpkper_list:

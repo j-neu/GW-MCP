@@ -269,6 +269,14 @@ Refs point at `research/discovery/catalog.md` rows.
 - [ ] Cloud execution backend (submit jobs to AWS/GCP Compute, stream results)
 - [ ] Web-based model visualiser (optional companion app for 3D inspection)
 
+**Validation backlog (transient independent run, 2026-08-16; see research/discovery/sessions/2026-08-16-modeB-tutorial05-transient.md):**
+- [x] budget-reader `[Errno 22]` on double-precision `.cbb` *(fixed 2026-08-16: `_open_budget_file` precision="double" retry + regression test)*
+- [ ] `import_river_from_shapefile`: writes reaches for SP1 only (boundary vanishes in later periods unless re-added); `stage_raster` sampling returned nodata → stage −1 (deep drain) for river cells
+- [ ] `setup_pest_control` template header requires two entries with the marker as the second (`jtf @`) — standard pyemu `jtf`/`jtf <file>` rejected with confusing errors; align with pyemu jtf format
+- [ ] `summarise_calibration` reports `phi_progress: []` and `run_pestpp_glm` reports `iterations: 0` even when GLM's log shows iterations — cosmetic reporting gaps
+- [ ] CHD/WEL shapefile importers (agent had to derive CHD cells/heads from GIS linework + model top via a script) — pre-registered backlog item
+- [ ] `run_pestpp_glm` MCP-client 60 s timeout abort (run completes server-side; Tier 2 async/status tool) — pre-registered
+
 **Validation backlog (Mode B rerun-4, 2026-08-16; see research/discovery/sessions/2026-08-16-modeB-tutorial05-rerun4.md):**
 - [ ] PEST++ template token width: `@k@` (3-char token) truncates every substituted value to `1.0` (pestpp formats to fixed token width, `model_interface.cpp::cast_to_fixed_len_string`) → zero Jacobian that looks like "calibration doesn't work". Document in `setup_pest_control` / tools.md: template params must use wide fixed-width tokens (`@          k          @`).
 - [ ] `derinclb` default of 0.0 gives a zero relative derivative increment → zero Jacobian. Set a sensible nonzero default when building the parameter group in `setup_pest_control`.
@@ -312,6 +320,8 @@ silently running as steady state — no STO tool, no warning). See
 - [x] holdout Round-2 selections: test005_advgw_tidal (25-period multi-BC + OBS + time series; TS-driven BCs not replayable at v0.1.0 → synthetic CHD, documented deviation) and mf6_freyberg (usgs/pestpp TM7C26) adopted + full MCP calibration chain (setup_pest_control → run_pestpp_glm → summarise_calibration, 6 welflx params + 10 head obs)
 - [x] `read_budget`/`compute_water_balance` accept `.cbc` budget files (freyberg writes `.cbc`, not `.cbb`)
 - [x] 39-tool suite green; tools.md / README / architecture / capability-matrix / holdout-registry updated
+- [x] **Independent closed-book transient run** (Agent Manager worktree `modeB/tutorial05-transient`, 2026-08-16; see `research/discovery/sessions/2026-08-16-modeB-tutorial05-transient.md`): the tutorial-05 reference was found to be **transient** (SP1 steady + SP2 transient ~20 yr, 7 layers × 66 × 64, MODFLOW-2005) — the earlier Mode B reruns calibrated a 1-layer *steady-state* approximation. Fresh agent built the transient MF6 model (SP1 steady → SP2 20 yr/20 steps, `add_sto_package` steady_state=[0]), converged every run, verified heads evolve (mean drawdown 2.53 m, max 7.71 m) + STO budget terms, and calibrated K=2.85 m/d (phi 1902.3, RMSE 8.10) — **0 reprompts, 44 MCP calls, ~19 min**.
+- [x] **Budget-reader precision fix** (from the run): flopy `CellBudgetFile(precision="auto")` raised `OSError [Errno 22]` on larger double-precision `.cbb` files (Windows seek past end) instead of falling back — broke `read_budget`/`compute_water_balance` for real models. Fixed with an explicit `precision="double"` retry (`postprocess._open_budget_file`); regression test `test_budget_reader_falls_back_to_double_on_oserror`; verified against the tutorial05t 5 MB `.cbb`.
 
 **Tier 2 deferred (v0.2.0 design items from the rerun-2 plan, not yet started):**
 - [ ] async `run_pestpp_glm`/`run_pestpp_ies` with a status/poll tool (client-side 60 s MCP timeout currently aborts long runs even though the run completes server-side)
