@@ -10,6 +10,7 @@ from groundwater_mcp.tools.builder import (
     _impl_add_ic_package,
     _impl_add_npf_package,
     _impl_add_oc_package,
+    _impl_add_sto_package,
     _impl_create_model,
     _impl_set_simulation,
 )
@@ -19,7 +20,6 @@ from groundwater_mcp.tools.runner import (
     _impl_get_run_log,
     _impl_run_simulation,
 )
-
 
 # ---------------------------------------------------------------------------
 # Skip marker — integration tests require the mf6 binary
@@ -166,6 +166,68 @@ def test_check_model_bare_model(bare_model):
 def test_check_model_unknown_model_raises():
     with pytest.raises(KeyError):
         _impl_check_model("no_such_model_xyz")
+
+
+def test_check_model_warns_transient_without_sto(tmp_path, model_name):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(
+        model_name, nper=2, perlen=[100.0, 100.0], nstp=[2, 2], ims_complexity="simple"
+    )
+    _impl_add_dis_package(model_name, 1, 2, 2, 100.0, 100.0, 10.0, [0.0])
+    result = _impl_check_model(model_name)
+    assert result["check_passed"] is True  # warning, not an error
+    stowarns = [
+        w for w in result["warnings"]
+        if isinstance(w, dict) and "STO" in w.get("package", "").upper()
+    ]
+    assert stowarns, f"expected an STO warning, got: {result['warnings']}"
+
+
+def test_check_model_clean_with_sto(tmp_path, model_name):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(
+        model_name, nper=2, perlen=[100.0, 100.0], nstp=[2, 2], ims_complexity="simple"
+    )
+    _impl_add_dis_package(model_name, 1, 2, 2, 100.0, 100.0, 10.0, [0.0])
+    _impl_add_sto_package(
+        model_name, iconvert=1, ss=1e-5, sy=0.2, steady_state=[0], save_flows=True
+    )
+    result = _impl_check_model(model_name)
+    assert all("STO" not in w.get("package", "").upper() for w in result["warnings"])
+
+
+def test_run_simulation_warns_transient_without_sto(runnable_model, monkeypatch):
+    """run_simulation returns a warning field when the trap fires (no binary needed)."""
+    import groundwater_mcp.tools.runner as runner_module
+    from groundwater_mcp.tools.builder import _impl_set_simulation
+    from groundwater_mcp.utils import model_store
+
+    _impl_set_simulation(
+        runnable_model, nper=2, perlen=[100.0, 100.0], nstp=[2, 2], ims_complexity="simple"
+    )
+    monkeypatch.setattr(runner_module, "_find_mf6_binary", lambda: "/fake/mf6")
+    sim = model_store.get_sim(runnable_model)
+    monkeypatch.setattr(sim, "run_simulation", lambda **_kwargs: (True, ["normal termination"]))
+
+    result = _impl_run_simulation(runnable_model, silent=True)
+    assert result["success"] is True
+    assert "warning" in result
+    assert "STO" in result["warning"]
+    assert "WARNING" in result["listing_summary"]
 
 
 # ---------------------------------------------------------------------------

@@ -11,9 +11,9 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from groundwater_mcp.tools.builder import _transient_like_without_sto
 from groundwater_mcp.utils.model_store import get_sim, invalidate
 from groundwater_mcp.utils.workspace import resolve_workspace
-
 
 # ---------------------------------------------------------------------------
 # Error helper
@@ -95,7 +95,6 @@ def _impl_check_model(model: str) -> dict:
         check_results = sim.check(verbose=True, level=1)
     finally:
         sys.stdout, sys.stderr = old_stdout, old_stderr
-
     captured = buf.getvalue()
 
     warnings: list = []
@@ -137,6 +136,17 @@ def _impl_check_model(model: str) -> dict:
             elif lower.startswith("warning") or ": warning" in lower:
                 warnings.append(stripped)
 
+    # Loud guard: a transient-looking model with no STO silently runs as
+    # steady state — surface it here so the agent fixes it before running.
+    gwf = sim.get_model(model) if model in sim.model_names else None
+    if gwf is None:
+        mnames = list(sim.model_names)
+        gwf = sim.get_model(mnames[0]) if mnames else None
+    if gwf is not None:
+        trap, sto_msg = _transient_like_without_sto(sim, gwf)
+        if trap:
+            warnings.append({"type": "warning", "package": "STO", "description": sto_msg})
+
     return {
         "model": model,
         "warnings": warnings,
@@ -151,7 +161,12 @@ def _impl_run_simulation(model: str, silent: bool = False) -> dict:
     sim = get_sim(model)
     exe = _find_mf6_binary()
 
-    sim = get_sim(model)
+    mnames = list(sim.model_names)
+    gwf = sim.get_model(model) if model in mnames else None
+    if gwf is None and mnames:
+        gwf = sim.get_model(mnames[0])
+    trap, sto_msg = _transient_like_without_sto(sim, gwf) if gwf is not None else (False, "")
+
     ws = resolve_workspace(model)
     sim.set_sim_path(str(ws))
     sim.exe_name = exe
@@ -170,13 +185,18 @@ def _impl_run_simulation(model: str, silent: bool = False) -> dict:
     tail = buff[-20:] if buff and len(buff) > 20 else (buff or [])
     listing_summary = "\n".join(tail)
 
-    return {
+    result = {
         "model": model,
         "success": success,
         "elapsed_s": round(elapsed, 2),
         "convergence": convergence,
         "listing_summary": listing_summary,
     }
+    if trap:
+        result["warning"] = sto_msg
+        result["listing_summary"] = "WARNING: " + sto_msg + "\n" + result["listing_summary"]
+        print(f"WARNING: {sto_msg}", file=sys.stderr)
+    return result
 
 
 def _impl_get_run_log(model: str, tail: int = 100) -> dict:

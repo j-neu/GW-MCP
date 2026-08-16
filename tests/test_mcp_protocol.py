@@ -1,7 +1,7 @@
 """Phase 6 Layer 2 — MCP protocol tests.
 
 Verifies that the groundwater-mcp server behaves correctly at the MCP layer:
-  - tool listing (all 36 tools registered, metadata complete)
+  - tool listing (all 39 tools registered, metadata complete)
   - JSON response format (TextContent, parseable JSON, no extra keys)
   - error paths (MODEL_NOT_FOUND, etc.)
   - multi-step in-process workflow (create → grid → run → read_heads)
@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 36
+_EXPECTED_TOOL_COUNT = 39
 
 _EXPECTED_TOOLS: dict[str, list[str]] = {
     "docs": ["search_docs", "search_tutorials", "get_doc_file"],
@@ -75,12 +75,14 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "add_dis_package",
         "add_npf_package",
         "add_ic_package",
+        "add_sto_package",
         "add_oc_package",
         "add_boundary_package",
         "summarise_model",
         "list_model_files",
     ],
     "runner": ["check_model", "run_simulation", "get_run_log"],
+    "environment": ["check_environment"],
     "postprocess": [
         "read_heads",
         "read_budget",
@@ -88,6 +90,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "compute_water_balance",
         "plot_heads_map",
         "plot_cross_section",
+        "view_image",
     ],
     "calibration": [
         "setup_pest_control",
@@ -138,6 +141,24 @@ def test_tool_names_are_snake_case():
     tools = _run(mcp.list_tools())
     non_snake = [t.name for t in tools if t.name != t.name.lower().replace("-", "_")]
     assert not non_snake, f"Non-snake-case tool names: {non_snake}"
+
+
+# ---------------------------------------------------------------------------
+# Environment preflight
+# ---------------------------------------------------------------------------
+
+
+def test_check_environment_reports_server_stack():
+    result = _run(mcp.call_tool("check_environment", {}))
+    data = _parse(result)
+    assert isinstance(data, dict)
+    assert "python" in data and "executable" in data["python"]
+    assert "packages" in data
+    for pkg in ("flopy", "pyemu", "geopandas", "rasterio"):
+        assert pkg in data["packages"], f"missing {pkg} in package report"
+    assert "binaries" in data and "mf6" in data["binaries"]
+    assert "ready" in data
+    assert "workspace_root" in data
 
 
 # ---------------------------------------------------------------------------

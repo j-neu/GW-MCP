@@ -47,8 +47,11 @@ python_version = "3.11"
 strict = false
 ignore_missing_imports = true
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+  [tool.pytest.ini_options]
+  testpaths = ["tests"]
+  markers = [
+      "slow: long-running tests (holdout PEST++ calibration) — run explicitly",
+  ]
 
 [dependency-groups]
 dev = [

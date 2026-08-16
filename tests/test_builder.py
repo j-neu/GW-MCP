@@ -11,12 +11,12 @@ from groundwater_mcp.tools.builder import (
     _impl_add_ic_package,
     _impl_add_npf_package,
     _impl_add_oc_package,
+    _impl_add_sto_package,
     _impl_create_model,
     _impl_list_model_files,
     _impl_set_simulation,
     _impl_summarise_model,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -95,20 +95,30 @@ def test_create_model_duplicate_raises(tmp_path, model_name):
         _impl_create_model(model_name, ws, "METERS", "DAYS")
 
 
+def test_create_model_name_too_long_raises(tmp_path):
+    long_name = "tutorial05_catchment"  # 21 chars — exceeds MF6's 16-char MODELNAME cap
+    with pytest.raises(ValueError, match="16 characters"):
+        _impl_create_model(long_name, str(tmp_path / "ws"), "METERS", "DAYS")
+
+
 # ---------------------------------------------------------------------------
 # set_simulation
 # ---------------------------------------------------------------------------
 
 
 def test_set_simulation_basic(bare_model):
-    result = _impl_set_simulation(bare_model, nper=1, perlen=[365.0], nstp=[12], ims_complexity="simple")
+    result = _impl_set_simulation(
+        bare_model, nper=1, perlen=[365.0], nstp=[12], ims_complexity="simple"
+    )
     assert "error" not in result
     assert result["nper"] == 1
     assert result["total_time"] == pytest.approx(365.0)
 
 
 def test_set_simulation_multiperiod(bare_model):
-    result = _impl_set_simulation(bare_model, nper=3, perlen=[1.0, 10.0, 100.0], nstp=[1, 2, 5], ims_complexity="moderate")
+    result = _impl_set_simulation(
+        bare_model, nper=3, perlen=[1.0, 10.0, 100.0], nstp=[1, 2, 5], ims_complexity="moderate"
+    )
     assert result["nper"] == 3
     assert result["total_time"] == pytest.approx(111.0)
 
@@ -143,7 +153,10 @@ def test_add_dis_package_writes_dis_file(model_with_dis):
 def test_add_dis_package_botm_mismatch_raises(bare_model):
     _impl_set_simulation(bare_model, 1, [1.0], [1], "simple")
     with pytest.raises(ValueError, match="nlay"):
-        _impl_add_dis_package(bare_model, 3, 10, 10, 100.0, 100.0, 50.0, [40.0, 30.0])  # only 2 botm entries
+        # only 2 botm entries for nlay=3
+        _impl_add_dis_package(
+            bare_model, 3, 10, 10, 100.0, 100.0, 50.0, [40.0, 30.0]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +236,45 @@ def test_add_invalid_package_raises(model_with_dis):
         _impl_add_boundary_package(model_with_dis, "XYZ", {}, None)
 
 
+def test_add_boundary_package_save_flows_default_on(model_with_dis):
+    """SAVE FLOWS should be on by default so compute_water_balance can see
+    CHD/WEL/GHB/RIV fluxes without hand-editing the package file."""
+    spd = {"0": [[[0, 0, 0], -500.0]]}
+    result = _impl_add_boundary_package(model_with_dis, "WEL", spd, None)
+    assert result["save_flows"] is True
+
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    gwf = get_gwf(model_with_dis)
+    wel_pkg = gwf.get_package("wel")
+    assert wel_pkg.save_flows.array is True
+
+
+def test_add_boundary_package_save_flows_false(model_with_dis):
+    spd = {"0": [[[0, 0, 0], -500.0]]}
+    result = _impl_add_boundary_package(
+        model_with_dis, "WEL", spd, None, save_flows=False
+    )
+    assert result["save_flows"] is False
+
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    gwf = get_gwf(model_with_dis)
+    assert gwf.get_package("wel").save_flows.array is False
+
+
+def test_add_boundary_package_overwrite_warns(model_with_dis):
+    """Re-adding a package of the same type must return a warning (previously
+    it silently overwrote the first package)."""
+    spd1 = {"0": [[[0, 0, 0], 45.0]]}
+    spd2 = {"0": [[[0, 0, 1], 40.0]]}
+    first = _impl_add_boundary_package(model_with_dis, "CHD", spd1, None)
+    assert "warning" not in first
+    second = _impl_add_boundary_package(model_with_dis, "CHD", spd2, None)
+    assert "warning" in second
+    assert "replaced" in second["warning"].lower()
+
+
 # ---------------------------------------------------------------------------
 # add_oc_package
 # ---------------------------------------------------------------------------
@@ -245,6 +297,192 @@ def test_add_oc_package_custom_filenames(model_with_dis):
     )
     assert result["head_file"] == "my_heads.hds"
     assert result["budget_file"] == "my_budget.cbb"
+
+
+# ---------------------------------------------------------------------------
+# add_sto_package
+# ---------------------------------------------------------------------------
+
+
+def test_add_sto_package_defaults(model_with_dis):
+    """Default steady_state=[0] → SP0 steady, rest transient."""
+    result = _impl_add_sto_package(
+        model_with_dis, iconvert=1, ss=1e-5, sy=0.2, steady_state=None, save_flows=True
+    )
+    assert "error" not in result
+    assert result["package"] == "STO"
+    assert result["steady_state_periods"] == [0]
+    assert result["transient_periods"] == [1]
+    assert result["save_flows"] is True
+
+
+def test_add_sto_package_writes_sto_file(model_with_dis):
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    _impl_add_sto_package(
+        model_with_dis, iconvert=1, ss=1e-5, sy=0.2, steady_state=None, save_flows=True
+    )
+    ws = resolve_workspace(model_with_dis)
+    sto_file = ws / f"{model_with_dis}.sto"
+    assert sto_file.exists()
+    text = sto_file.read_text().upper()
+    assert "SAVE_FLOWS" in text
+    assert "STEADY-STATE" in text  # period 1 (0-based 0)
+    assert "TRANSIENT" in text     # period 2 (0-based 1)
+
+
+def test_add_sto_package_sy_required_for_convertible(model_with_dis):
+    """sy is mandatory when any cell is convertible (iconvert>0)."""
+    with pytest.raises(ValueError, match="sy"):
+        _impl_add_sto_package(
+            model_with_dis, iconvert=1, ss=1e-5, sy=None, steady_state=None, save_flows=True
+        )
+
+
+def test_add_sto_package_sy_optional_when_confined(model_with_dis):
+    result = _impl_add_sto_package(
+        model_with_dis, iconvert=0, ss=1e-5, sy=None, steady_state=[0], save_flows=True
+    )
+    assert "error" not in result
+
+
+def test_add_sto_package_requires_tdis(model_with_dis):
+    """set_simulation must run first so the period count is known."""
+    from groundwater_mcp.utils.model_store import get_sim, save_sim
+
+    name = model_with_dis
+    sim = get_sim(name)
+    tdis = sim.get_package("tdis")
+    sim.remove_package(tdis)
+    save_sim(name, sim)
+    with pytest.raises(ValueError, match="set_simulation"):
+        _impl_add_sto_package(name, iconvert=1, ss=1e-5, sy=0.2, steady_state=None, save_flows=True)
+
+
+def test_add_sto_package_steady_state_out_of_range(model_with_dis):
+    with pytest.raises(ValueError, match="out of range"):
+        _impl_add_sto_package(
+            model_with_dis, iconvert=1, ss=1e-5, sy=0.2, steady_state=[5], save_flows=True
+        )
+
+
+def test_add_sto_package_overwrite_warns(model_with_dis):
+    first = _impl_add_sto_package(
+        model_with_dis, iconvert=1, ss=1e-5, sy=0.2, steady_state=[0], save_flows=True
+    )
+    assert "warning" not in first
+    second = _impl_add_sto_package(
+        model_with_dis, iconvert=1, ss=2e-5, sy=0.3, steady_state=[0], save_flows=True
+    )
+    assert "warning" in second
+
+
+def test_add_sto_package_single_period_stays_steady(tmp_path, model_name):
+    """nper=1 → all periods steady, no TRANSIENT block."""
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 2, 2, 100.0, 100.0, 10.0, [0.0])
+    result = _impl_add_sto_package(
+        model_name, iconvert=0, ss=1e-5, sy=None, steady_state=None, save_flows=True
+    )
+    assert result["steady_state_periods"] == [0]
+    assert result["transient_periods"] == []
+
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    text = (resolve_workspace(model_name) / f"{model_name}.sto").read_text().upper()
+    assert "TRANSIENT" not in text
+
+
+def test_add_sto_package_all_transient(tmp_path, model_name):
+    """steady_state=[] → all periods transient (PERIOD 1 TRANSIENT), no STEADY-STATE block."""
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(
+        model_name, nper=2, perlen=[100.0, 100.0], nstp=[2, 2], ims_complexity="simple"
+    )
+    _impl_add_dis_package(model_name, 1, 2, 2, 100.0, 100.0, 10.0, [0.0])
+    result = _impl_add_sto_package(
+        model_name, iconvert=0, ss=1e-5, sy=None, steady_state=[], save_flows=True
+    )
+    assert result["steady_state_periods"] == []
+    assert result["transient_periods"] == [0, 1]
+
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    text = (resolve_workspace(model_name) / f"{model_name}.sto").read_text().upper()
+    assert "TRANSIENT" in text
+    assert "STEADY-STATE" not in text
+
+
+# ---------------------------------------------------------------------------
+# transient-without-STO guard + storage reporting
+# ---------------------------------------------------------------------------
+
+
+def test_transient_like_without_sto_detects_trap(model_with_dis):
+    """nper=2 with no STO must flag the steady-state trap."""
+    from groundwater_mcp.tools.builder import _transient_like_without_sto
+    from groundwater_mcp.utils.model_store import get_gwf, get_sim
+
+    gwf = get_gwf(model_with_dis)
+    sim = get_sim(model_with_dis)
+    trap, msg = _transient_like_without_sto(sim, gwf)
+    assert trap is True
+    assert "STO" in msg
+
+
+def test_transient_like_without_sto_clean_with_sto(model_with_dis):
+    from groundwater_mcp.tools.builder import _impl_add_sto_package, _transient_like_without_sto
+    from groundwater_mcp.utils.model_store import get_gwf, get_sim
+
+    _impl_add_sto_package(
+        model_with_dis, iconvert=1, ss=1e-5, sy=0.2, steady_state=[0], save_flows=True
+    )
+    gwf = get_gwf(model_with_dis)
+    sim = get_sim(model_with_dis)
+    trap, msg = _transient_like_without_sto(sim, gwf)
+    assert trap is False
+
+
+def test_transient_like_without_sto_clean_when_steady(tmp_path, model_name):
+    """nper=1, nstp=1 without STO is a legitimate steady-state model — no trap."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+        _transient_like_without_sto,
+    )
+    from groundwater_mcp.utils.model_store import get_gwf, get_sim
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 2, 2, 100.0, 100.0, 10.0, [0.0])
+    gwf = get_gwf(model_name)
+    sim = get_sim(model_name)
+    trap, _ = _transient_like_without_sto(sim, gwf)
+    assert trap is False
+
+
+def test_summarise_model_reports_storage(model_with_dis):
+    from groundwater_mcp.tools.builder import _impl_add_sto_package
+
+    _impl_add_sto_package(
+        model_with_dis, iconvert=1, ss=1e-5, sy=0.2, steady_state=[0], save_flows=True
+    )
+    result = _impl_summarise_model(model_with_dis)
+    assert result["storage"] == {
+        "package": "STO",
+        "steady_state_periods": [0],
+        "transient_periods": [1],
+    }
+
+
+def test_summarise_model_storage_none_without_sto(model_with_dis):
+    result = _impl_summarise_model(model_with_dis)
+    assert result["storage"] is None
 
 
 # ---------------------------------------------------------------------------

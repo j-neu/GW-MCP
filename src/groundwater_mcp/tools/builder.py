@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import flopy.mf6 as mf6
+import numpy as np
 
 from groundwater_mcp.utils.model_store import get_gwf, get_sim, save_sim
 from groundwater_mcp.utils.workspace import create_workspace, resolve_workspace
@@ -61,6 +62,11 @@ def _impl_create_model(
     units: str,
     time_units: str,
 ) -> dict:
+    if len(name) > 16:
+        raise ValueError(
+            f"Model name '{name}' is {len(name)} characters; MODFLOW 6 caps "
+            "MODELNAME at 16 characters. Use a shorter name."
+        )
     model_dir = create_workspace(name, workspace or None)
     sim = mf6.MFSimulation(
         sim_name="mfsim",
@@ -230,11 +236,126 @@ def _impl_add_ic_package(model: str, strt: float | list) -> dict:
     return {"model": model, "package": "IC"}
 
 
+def _impl_add_sto_package(
+    model: str,
+    iconvert: int | list,
+    ss: float | list,
+    sy: float | list | None,
+    steady_state: list[int] | None,
+    save_flows: bool,
+) -> dict:
+    """Add a Storage (STO) package.
+
+    Required for transient simulations. ``steady_state`` holds the 0-based
+    stress-period indices (matching set_simulation) that are steady-state;
+    every other period is transient. Default ``[0]`` → first period steady,
+    the rest transient (nper=1 stays fully steady). ``sy`` (specific yield)
+    is required when any cell is convertible (iconvert>0).
+    """
+    gwf = get_gwf(model)
+    sim = get_sim(model)
+
+    tdis = sim.get_package("tdis")
+    if tdis is None:
+        raise ValueError(
+            "set_simulation must be called before add_sto_package so the "
+            "stress-period count is known."
+        )
+    nper = int(tdis.nper.array)
+
+    if steady_state is None:
+        steady_state = [0]
+    else:
+        steady_state = sorted(int(i) for i in steady_state)
+        for i in steady_state:
+            if not (0 <= i < nper):
+                raise ValueError(
+                    f"steady_state period index {i} out of range for nper={nper}. "
+                    "Use 0-based indices matching set_simulation."
+                )
+
+    if sy is None:
+        iconvert_arr = np.asarray(iconvert, dtype=int)
+        has_convertible = (
+            int(iconvert_arr) > 0
+            if iconvert_arr.ndim == 0
+            else bool((iconvert_arr > 0).any())
+        )
+        if has_convertible:
+            raise ValueError(
+                "sy (specific yield) is required because iconvert contains at "
+                "least one convertible cell (iconvert>0)."
+            )
+
+    pkg = gwf.get_package("sto")
+    replaced = pkg is not None
+    if pkg is not None:
+        gwf.remove_package(pkg)
+
+    sto_kwargs: dict = {"iconvert": iconvert, "ss": ss, "save_flows": save_flows}
+    if sy is not None:
+        sto_kwargs["sy"] = sy
+    if steady_state:
+        sto_kwargs["steady_state"] = {i: True for i in steady_state}
+    transient_start = (max(steady_state) + 1) if steady_state else 0
+    if transient_start < nper:
+        sto_kwargs["transient"] = {transient_start: True}
+
+    mf6.ModflowGwfsto(gwf, **sto_kwargs)
+    save_sim(model, sim)
+
+    transient_periods = [i for i in range(nper) if i not in set(steady_state)]
+    ws = resolve_workspace(model)
+    meta = _read_meta(ws)
+    meta["sto_steady_state"] = steady_state
+    meta["sto_transient"] = transient_periods
+    _write_meta(ws, meta)
+
+    result: dict = {
+        "model": model,
+        "package": "STO",
+        "steady_state_periods": steady_state,
+        "transient_periods": transient_periods,
+        "save_flows": save_flows,
+    }
+    if replaced:
+        result["warning"] = "A previous STO package was removed and replaced by this call."
+    return result
+
+
+def _transient_like_without_sto(sim, gwf) -> tuple[bool, str]:
+    """Return (True, message) when TDIS looks transient but no STO exists.
+
+    MODFLOW 6 runs a model without an STO package as steady state regardless
+    of TDIS settings — a multi-time-step configuration is therefore silently
+    stripped of storage physics. This helper lets check_model and
+    run_simulation surface that loudly.
+    """
+    if gwf.get_package("sto") is not None:
+        return False, ""
+    tdis = sim.get_package("tdis")
+    if tdis is None:
+        return False, ""
+    try:
+        rows = list(tdis.perioddata.array)
+    except Exception:
+        return False, ""
+    if len(rows) > 1 or any(int(row[1]) > 1 for row in rows):
+        return True, (
+            "No STO (storage) package present — the model runs as steady state "
+            "even though multiple time steps are configured. If a transient "
+            "simulation is intended, add storage first: "
+            "add_sto_package(iconvert=1, ss=1e-5, sy=0.2)."
+        )
+    return False, ""
+
+
 def _impl_add_boundary_package(
     model: str,
     package: str,
     stress_period_data: dict,
     kwargs: dict | None,
+    save_flows: bool = True,
 ) -> dict:
     pkg_name = package.upper()
     if pkg_name not in _BOUNDARY_PKG_CLASSES:
@@ -251,19 +372,30 @@ def _impl_add_boundary_package(
 
     # Remove existing package of same type if present (allow re-adding)
     existing = gwf.get_package(pkg_name.lower())
+    replaced = existing is not None
     if existing is not None:
         gwf.remove_package(existing)
 
-    pkg_kwargs = kwargs or {}
+    pkg_kwargs = dict(kwargs or {})
+    if "save_flows" not in pkg_kwargs:
+        pkg_kwargs["save_flows"] = save_flows
     pkg_cls(gwf, stress_period_data=spd, **pkg_kwargs)
     save_sim(model, gwf.simulation)
 
     cell_counts = {sp: len(rows) for sp, rows in spd.items()}
-    return {
+    result: dict = {
         "model": model,
         "package": pkg_name,
         "stress_periods": cell_counts,
+        "save_flows": bool(pkg_kwargs.get("save_flows", save_flows)),
     }
+    if replaced:
+        result["warning"] = (
+            f"A previous {pkg_name} package was removed and replaced by this "
+            "call. If that was unintentional (e.g. two separate CHD sets were "
+            "meant to be combined), re-add the boundary in a single call."
+        )
+    return result
 
 
 def _impl_add_oc_package(
@@ -349,6 +481,15 @@ def _impl_summarise_model(model: str) -> dict:
         if gwf.get_package(pkg.lower()) is not None
     ]
 
+    storage: dict | None = None
+    if gwf.get_package("sto") is not None:
+        meta = _read_meta(ws)
+        storage = {
+            "package": "STO",
+            "steady_state_periods": list(meta.get("sto_steady_state", [])),
+            "transient_periods": list(meta.get("sto_transient", [])),
+        }
+
     return {
         "model": model,
         "workspace": str(ws),
@@ -356,6 +497,7 @@ def _impl_summarise_model(model: str) -> dict:
         "grid": grid_info,
         "stress_periods": stress_periods,
         "boundary_types": boundary_types,
+        "storage": storage,
     }
 
 
@@ -387,7 +529,12 @@ def register(mcp) -> None:
         units: str = "METERS",
         time_units: str = "DAYS",
     ) -> dict:
-        """Create a new MODFLOW 6 GWF model workspace."""
+        """Create a new MODFLOW 6 GWF model workspace.
+
+        ``workspace`` is the absolute path where the model files are written. Pass an
+        explicit path — ideally a subfolder of the folder containing your data — so all
+        model inputs and outputs live together. If empty, the model is created under the
+        default workspace root (~/.groundwater-mcp/workspaces/<name>)."""
         try:
             return _impl_create_model(name, workspace, units, time_units)
         except ValueError as exc:
@@ -480,15 +627,57 @@ def register(mcp) -> None:
             return _err("PACKAGE_ERROR", str(exc))
 
     @mcp.tool()
+    def add_sto_package(
+        model: str,
+        iconvert: int | list,
+        ss: float | list,
+        sy: float | list | None = None,
+        steady_state: list[int] | None = None,
+        save_flows: bool = True,
+    ) -> dict:
+        """Add a Storage (STO) package defining aquifer storage properties.
+
+        Required for transient simulations (without it, a multi-time-step
+        model silently runs as steady state). ``steady_state`` lists the
+        0-based stress-period indices (matching set_simulation) that are
+        steady-state; all other periods run transient. Default ``[0]`` marks
+        the first period steady and the rest transient. ``sy`` (specific
+        yield) is required when any cell is convertible (iconvert>0)."""
+        try:
+            return _impl_add_sto_package(
+                model, iconvert, ss, sy, steady_state, save_flows
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
     def add_boundary_package(
         model: str,
         package: str,
         stress_period_data: dict,
         kwargs: dict | None = None,
+        save_flows: bool = True,
     ) -> dict:
-        """Add a boundary condition package (CHD, WEL, RIV, DRN, RCH, EVT, GHB, SFR)."""
+        """Add a boundary condition package (CHD, WEL, RIV, DRN, RCH, EVT, GHB, SFR).
+
+        stress_period_data maps a stress-period index (0-based, matching the
+        nper/perioddata set in set_simulation) to a list of records.  Each
+        record uses 0-based cell indices (layer, row, col) for DIS grids and
+        (layer, node) for DISV grids — indices are converted to the 1-based
+        form written to the package file.  Example:
+        ``{"0": [[[0, 2, 3], 55.0], [[0, 2, 4], 55.0]]}``
+
+        save_flows writes the SAVE FLOWS option into the package file so the
+        package's fluxes appear in the budget file for compute_water_balance.
+        """
         try:
-            return _impl_add_boundary_package(model, package, stress_period_data, kwargs)
+            return _impl_add_boundary_package(
+                model, package, stress_period_data, kwargs, save_flows
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:

@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-
 import flopy.utils as fu
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 
 from groundwater_mcp.utils.model_store import get_gwf
 from groundwater_mcp.utils.workspace import resolve_workspace
-
 
 # ---------------------------------------------------------------------------
 # Error helper
@@ -42,6 +40,19 @@ def _find_output_file(workspace: Path, extension: str) -> Path:
             "Run the simulation first with run_simulation."
         )
     return matches[0]
+
+
+def _find_budget_file(workspace: Path) -> Path:
+    """Locate the cell-by-cell budget file (.cbb or the .cbc used by many
+    existing models)."""
+    for ext in (".cbb", ".cbc"):
+        matches = list(workspace.glob(f"*{ext}"))
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(
+        f"No .cbb/.cbc budget file found in {workspace}. "
+        "Run the simulation first with run_simulation."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +118,7 @@ def _impl_read_budget(
 ) -> dict:
     """Read cell budget records from the binary .cbb output file."""
     ws = resolve_workspace(model)
-    cbb_path = _find_output_file(ws, ".cbb")
+    cbb_path = _find_budget_file(ws)
 
     cbf = fu.CellBudgetFile(str(cbb_path))
     kstpkper_list = cbf.get_kstpkper()
@@ -210,7 +221,7 @@ def _impl_compute_water_balance(
 ) -> dict:
     """Aggregate budget by boundary type and compute net water balance."""
     ws = resolve_workspace(model)
-    cbb_path = _find_output_file(ws, ".cbb")
+    cbb_path = _find_budget_file(ws)
 
     cbf = fu.CellBudgetFile(str(cbb_path))
     kstpkper_list = cbf.get_kstpkper()
@@ -233,23 +244,27 @@ def _impl_compute_water_balance(
         except Exception:
             continue
 
-        total = 0.0
+        in_amt = 0.0
+        out_amt = 0.0
         for rec in records:
             arr = np.asarray(rec)
             if arr.dtype.names and "q" in arr.dtype.names:
-                total += float(arr["q"].sum())
+                q = arr["q"].astype(float)
+                in_amt += float(q[q > 0].sum())
+                out_amt += float(q[q < 0].sum())
             elif arr.dtype.names:
                 # Structured record without a recognised flow field — skip
                 pass
             else:
                 vals = arr.astype(float).ravel()
                 vals = vals[vals != 1e30]
-                total += float(vals.sum()) if vals.size > 0 else 0.0
+                in_amt += float(vals[vals > 0].sum()) if vals.size > 0 else 0.0
+                out_amt += float(vals[vals < 0].sum()) if vals.size > 0 else 0.0
 
-        if total >= 0:
-            inflow[label] = total
-        else:
-            outflow[label] = total
+        if in_amt:
+            inflow[label] = in_amt
+        if out_amt:
+            outflow[label] = out_amt
 
     total_in = sum(inflow.values())
     total_out = sum(outflow.values())
@@ -263,6 +278,45 @@ def _impl_compute_water_balance(
         "total_inflow": total_in,
         "total_outflow": total_out,
         "net_balance": net,
+    }
+
+
+def _impl_view_image(
+    model: str,
+    filename: str,
+    output_format: str = "png",
+) -> dict:
+    """Read an image file from the workspace and return it base64-encoded.
+
+    Enables an agent to visually verify plot_heads_map / plot_cross_section
+    output instead of only checking file existence.
+    """
+    import base64
+
+    ws = resolve_workspace(model)
+    img_path = Path(filename)
+    if not img_path.is_absolute():
+        img_path = ws / filename
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image file not found: {img_path}")
+
+    fmt = output_format.lower().lstrip(".")
+    mime = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+    }.get(fmt)
+    if mime is None:
+        raise ValueError(f"Unsupported image format '{fmt}'. Use png, jpg/jpeg, or gif.")
+
+    data = img_path.read_bytes()
+    return {
+        "model": model,
+        "file": str(img_path),
+        "mime_type": mime,
+        "size_bytes": len(data),
+        "data_base64": base64.b64encode(data).decode("ascii"),
     }
 
 
@@ -429,6 +483,33 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("WATER_BALANCE_FAILED", str(exc))
+
+    @mcp.tool()
+    def view_image(
+        model: str,
+        filename: str,
+        output_format: str = "png",
+    ) -> dict:
+        """Read an image (e.g. a head-map PNG) from the workspace and return it base64-encoded.
+
+        Use this to visually verify the output of plot_heads_map or
+        plot_cross_section. Returns the image bytes base64-encoded together
+        with the MIME type and file size.
+        """
+        try:
+            return _impl_view_image(model, filename, output_format)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err(
+                "IMAGE_FILE_MISSING",
+                str(exc),
+                "Run plot_heads_map or plot_cross_section first.",
+            )
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("VIEW_IMAGE_FAILED", str(exc))
 
     @mcp.tool()
     def plot_heads_map(

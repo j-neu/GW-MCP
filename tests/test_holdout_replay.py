@@ -21,11 +21,15 @@ Pre-registered success criteria (research/holdout-registry.md):
 Mode A v1 scope (documented deviations):
   - Grid + time discretisation replayed faithfully from the holdout .dis/.tdis
     (via FloPy's loader, which handles all MF6 array formats).
-  - Boundaries: WEL/GHB stress data parsed from the holdout files when
-    present; projects whose only stress packages are GAP capabilities (MAW)
-    get a synthetic CHD gradient instead (deviation noted per project).
-  - NPF/IC use constant values; STO/UZF/MAW/OBS packages are NOT replayed —
-    they are GAP/partial matrix rows covered by the known-limitation gate.
+  - Boundaries: WEL/GHB/RIV/DRN/CHD stress data parsed from the holdout files
+    when present; projects whose only stress packages are GAP capabilities
+    (MAW) get a synthetic CHD gradient instead (deviation noted per project).
+    Array-based RCH/EVT and time-series-driven records are not replayed
+    (deviation; noted per project).
+  - NPF/IC use constant values; STO IS replayed (v0.1.0 gate) — iconvert/ss/sy
+    arrays plus the steady/transient period structure. UZF/MAW/OBS packages are
+    NOT replayed — they are GAP/partial matrix rows covered by the
+    known-limitation gate.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -161,24 +166,63 @@ def _load_project(project_dir: Path) -> dict:
     top = top_arr.tolist()
     botm = [b.tolist() for b in botm_arrs]
 
-    # Simple boundary packages (WEL/GHB) — only fully-replayed packages.
+    # Simple boundary packages — only list-based, fully-replayed packages.
+    # Array-based (RCH/EVT) and time-series-driven records are not replayed
+    # (documented deviation).
     boundaries: dict[str, dict] = {}
-    for pkg in ("WEL", "GHB"):
+    for pkg in ("WEL", "GHB", "RIV", "DRN", "CHD"):
         p = gwf.get_package(pkg.lower())
         if p is None:
             continue
         spd: dict[str, list] = {}
         for per, frame in p.stress_period_data.get_data().items():
             records = []
-            names = frame.dtype.names
-            for row in frame:
-                cellid = row["cellid"]
-                cellid = [int(v) for v in cellid] if hasattr(cellid, "__iter__") else [int(cellid)]
-                records.append([cellid, *[float(row[n]) for n in names if n != "cellid"]])
+            try:
+                names = frame.dtype.names
+                for row in frame:
+                    cellid = row["cellid"]
+                    if hasattr(cellid, "__iter__"):
+                        cellid = [int(v) for v in cellid]
+                    else:
+                        cellid = [int(cellid)]
+                    records.append([cellid, *[float(row[n]) for n in names if n != "cellid"]])
+            except (TypeError, ValueError):
+                continue  # non-numeric (time-series) record — package not replayable
             if records:
                 spd[str(per)] = records
         if spd:
             boundaries[pkg] = spd
+
+    # STO package — storage arrays + steady/transient period structure.
+    storage: dict | None = None
+    sto = gwf.get_package("sto")
+    if sto is not None:
+        import re
+
+        steady_periods: list[int] = []
+        transient_periods: list[int] = []
+        sto_file = project_dir / str(sto.filename)
+        if sto_file.exists():
+            in_period: int | None = None
+            for line in sto_file.read_text(errors="replace").splitlines():
+                m = re.match(r"\s*BEGIN\s+period\s+(\d+)", line, re.I)
+                if m:
+                    in_period = int(m.group(1)) - 1  # 0-based
+                    continue
+                if re.match(r"\s*STEADY-STATE\b", line, re.I) and in_period is not None:
+                    steady_periods.append(in_period)
+                elif re.match(r"\s*TRANSIENT\b", line, re.I) and in_period is not None:
+                    transient_periods.append(in_period)
+                elif re.match(r"\s*END\s+period", line, re.I):
+                    in_period = None
+        storage = {
+            "iconvert": np.asarray(sto.iconvert.array, dtype=int).tolist(),
+            "ss": np.asarray(sto.ss.array, dtype=float).tolist(),
+            "sy": np.asarray(sto.sy.array, dtype=float).tolist()
+            if sto.sy is not None else None,
+            "steady_periods": steady_periods,
+            "transient_periods": transient_periods,
+        }
 
     return {
         "name": project_dir.name,
@@ -195,23 +239,29 @@ def _load_project(project_dir: Path) -> dict:
         "top_max": float(np.asarray(top).max()),
         "botm_min": float(botm_flat.min()),
         "boundaries": boundaries,
+        "storage": storage,
     }
 
 
 # Per-project replay notes:
-#   - boundaries: WEL/GHB replayed from the holdout files (flopy-normalised);
-#     GAP stress packages (SFR/UZF/STO/MAW) are not replayed at v0.1.0.
+#   - boundaries: list-based packages replayed from the holdout files
+#     (flopy-normalised); GAP stress packages (SFR/UZF/MAW) and array-based
+#     RCH/EVT are not replayed at v0.1.0. STO IS replayed (v0.1.0 gate).
 #   - balance_expected: water-balance closure is only asserted when ALL stress
-#     is replayed (test020: CHD only). test051's SFR/UZF/STO stresses are GAP
+#     is replayed (test020: CHD only). test051's SFR/UZF stresses are GAP
 #     capabilities, so its replayed WEL+GHB budget cannot close — the closure
 #     criterion applies to fully-replayed projects only (v1 limitation).
 _BOUNDARY_FILES: dict[str, list[str]] = {
     "test051_uzfp2": ["WEL", "GHB"],
     "test020_NevilleTonkinTransient": [],  # only MAW stress — GAP; synthetic CHD instead
+    # test005: WEL/RIV/GHB/EVT all carry time-series (TS6) records, which the
+    # v0.1.0 replay framework does not resolve — synthetic CHD instead (deviation).
+    "test005_advgw_tidal": [],
 }
 _BALANCE_EXPECTED: dict[str, bool] = {
-    "test051_uzfp2": False,  # partial stress replay (SFR/UZF/STO are GAP)
+    "test051_uzfp2": False,  # partial stress replay (SFR/UZF are GAP)
     "test020_NevilleTonkinTransient": True,  # CHD-only, fully replayed
+    "test005_advgw_tidal": False,  # RCH/EVT time-series stress not replayed
 }
 
 
@@ -219,7 +269,7 @@ _BALANCE_EXPECTED: dict[str, bool] = {
 # Flow-project replay (build -> run -> postprocess)
 # ---------------------------------------------------------------------------
 
-_FLOW_PROJECTS = ["test051_uzfp2", "test020_NevilleTonkinTransient"]
+_FLOW_PROJECTS = ["test051_uzfp2", "test020_NevilleTonkinTransient", "test005_advgw_tidal"]
 
 
 @pytest.fixture(params=_FLOW_PROJECTS)
@@ -274,6 +324,17 @@ def _build_flow_model(project_dir: Path, model_name: str, ws_str: str) -> dict:
     })
     _call("add_ic_package", {"model": model_name, "strt": proj["top_max"]})
     _call("add_oc_package", {"model": model_name})
+
+    # Storage — replayed from the holdout .sto (v0.1.0 gate) when present.
+    if proj.get("storage"):
+        s = proj["storage"]
+        _call("add_sto_package", {
+            "model": model_name,
+            "iconvert": s["iconvert"],
+            "ss": s["ss"],
+            "sy": s["sy"],
+            "steady_state": s["steady_periods"],
+        })
 
     # Boundaries: WEL/GHB from holdout files (flopy-normalised cellids) when
     # present; otherwise a synthetic CHD gradient (deviation noted above).
@@ -357,7 +418,6 @@ _GAP_TOOLS = [
     "add_lak_package",
     "add_gnc_package",
     "add_mvr_package",
-    "add_sto_package",
     "add_gwt_package",
     "add_swt_package",
     "add_obs_package",
@@ -365,7 +425,7 @@ _GAP_TOOLS = [
 
 
 def test_gap_tools_not_exposed(holdout_root):
-    """GAP capabilities must not be exposed at v0.1.0 (frozen 36 tools)."""
+    """GAP capabilities must not be exposed at v0.1.0."""
     tools = {t.name for t in _run(mcp.list_tools())}
     leaked = [t for t in _GAP_TOOLS if t in tools]
     assert not leaked, f"GAP capability tools must not exist at v0.1.0: {leaked}"
@@ -421,6 +481,8 @@ def test_holdout_sealed_projects_present(holdout_root):
         "test020_NevilleTonkinTransient",
         "test201_gwtbuy-henryCHD",
         "ex-gwt-keating",
+        "test005_advgw_tidal",
+        "mf6_freyberg",
     ):
         assert _selected_dir(holdout_root, name).is_dir(), (
             f"seal broken: {name} missing under {holdout_root}"
@@ -428,3 +490,151 @@ def test_holdout_sealed_projects_present(holdout_root):
     assert (holdout_root / "pools" / "modflow6-examples").is_dir(), (
         "seal broken: pools/modflow6-examples archive missing"
     )
+
+
+# ---------------------------------------------------------------------------
+# Freyberg benchmark — adopted model + full MCP calibration chain (slow)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+@requires_mf6
+def test_freyberg_calibration_chain(holdout_root, tmp_path):
+    """Adopt the sealed freyberg benchmark (usgs/pestpp, TM7C26) into an MCP
+    workspace and run the full MCP chain on it: run_simulation ->
+    setup_pest_control -> run_pestpp_glm -> summarise_calibration.
+
+    Validates the runner and calibration chain against a real SFR/RCH/WEL/GHB/
+    OBS/STO model rather than a tutorial. Marked slow (PEST++ forward runs)."""
+    import csv
+    import re
+    import shutil
+
+    src = _selected_dir(holdout_root, "mf6_freyberg")
+    if not src.is_dir():
+        pytest.skip("holdout project mf6_freyberg not present")
+
+    from groundwater_mcp.tools.builder import _impl_create_model
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_glm,
+        _impl_setup_pest_control,
+        _impl_summarise_calibration,
+    )
+    from groundwater_mcp.tools.postprocess import (
+        _impl_compute_water_balance,
+        _impl_read_heads,
+    )
+    from groundwater_mcp.tools.runner import _impl_run_simulation
+    from groundwater_mcp.utils.model_store import invalidate
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    model = "freyberg"
+    _impl_create_model(model, str(tmp_path / model), "METERS", "DAYS")
+    ws = resolve_workspace(model)
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, ws / f.name)
+    invalidate(model)  # reload the adopted freyberg simulation from disk
+
+    # Run gate: the real benchmark must converge through run_simulation.
+    r = _impl_run_simulation(model, silent=True)
+    assert r["success"] is True, f"freyberg did not converge: {r}"
+    assert r["convergence"] == "converged"
+
+    # Post-process gate on a real model.
+    h = _impl_read_heads(model, kstpkper=[0, 0], layer=0)
+    assert h["shape"] == [40, 20], f"unexpected freyberg head shape: {h['shape']}"
+    wb = _impl_compute_water_balance(model)
+    assert "total_inflow" in wb and "total_outflow" in wb
+
+    # --- Build a subset calibration from freyberg's own files ---
+    # Observations: first 10 head columns at the first monthly time step.
+    raw = (ws / "heads.csv").read_text().splitlines()
+    header = raw[0].split(",")[1:]  # e.g. TRGW_2_2_15, ...
+    obs_names = ["trgw_" + c.split("_", 1)[1] + "_20151231" for c in header[:10]]
+
+    obs_by_name: dict[str, float] = {}
+    with open(ws / "freyberg6_run.obs_data.csv", newline="") as f:
+        for row in csv.DictReader(f):
+            obs_by_name[row["obsnme"]] = float(row["obsval"])
+    obs_data = {n: {"obsval": obs_by_name[n], "weight": 1.0} for n in obs_names}
+
+    # Instruction file: one value per line (matches forward.py output).
+    ins = ws / "heads_subset.ins"
+    ins.write_text("pif @\n" + "".join(f"l1 !{n}!\n" for n in obs_names))
+
+    # Parameters: the six month-0 well-flux factors (subset of freyberg6.wel.tpl).
+    tpl_text = (ws / "freyberg6.wel.tpl").read_text()
+    wel_text = (ws / "freyberg6.wel").read_text()
+    month0_params = sorted(
+        m.group(1) for m in re.finditer(r"~\s*(\w+)\s*~", tpl_text)
+        if m.group(1).endswith("_0")
+    )
+    keep_params = set(month0_params[:6])
+
+    # Subset template: keep the chosen tokens, hard-code every other value
+    # from the current wel file (lines correspond 1:1).
+    subset_lines = []
+    for t_line, m_line in zip(tpl_text.splitlines(), wel_text.splitlines()):
+        m = re.search(r"~\s*(\w+)\s*~", t_line)
+        if m and m.group(1) in keep_params:
+            subset_lines.append(t_line)
+        elif m:
+            subset_lines.append(m_line)
+        else:
+            subset_lines.append(t_line)
+    (ws / "freyberg6.wel.tpl").write_text("\n".join(subset_lines) + "\n")
+
+    par_by_name: dict[str, dict] = {}
+    with open(ws / "freyberg6_run.par_data.csv", newline="") as f:
+        for row in csv.DictReader(f):
+            par_by_name[row["parnme"]] = row
+    par_data: dict[str, dict] = {}
+    for p in sorted(keep_params):
+        row = par_by_name[p]
+        par_data[p] = {
+            "parval1": float(row["parval1"]),
+            "parlbnd": float(row["parlbnd"]),
+            "parubnd": float(row["parubnd"]),
+            "pargp": row["pargp"],
+            "partrans": row["partrans"],
+        }
+
+    # Forward model: run MF6, then convert the raw continuous heads output
+    # (heads.csv) into one-value-per-line output for the instruction file.
+    mf6_exe = _find_mf6_binary()
+    fwd = ws / "forward.py"
+    fwd.write_text(
+        "import csv, subprocess\n"
+        f"subprocess.run([r'{mf6_exe}'], check=True)\n"
+        "rows = list(csv.reader(open('heads.csv')))\n"
+        "header = rows[0][1:]\n"
+        "names = " + repr(obs_names) + "\n"
+        "with open('heads_subset.txt', 'w') as fh:\n"
+        "    for name in names:\n"
+        "        col = 'TRGW_' + name[5:].split('_20151231')[0].upper()\n"
+        "        idx = header.index(col)\n"
+        "        fh.write(rows[1][idx + 1] + '\\n')\n"
+    )
+
+    setup = _impl_setup_pest_control(
+        model=model,
+        obs_data=obs_data,
+        par_data=par_data,
+        template_files=[str(ws / "freyberg6.wel.tpl")],
+        instruction_files=[str(ins)],
+        pestpp_options={
+            "noptmax": 3,
+            "model_command": [sys.executable, "forward.py"],
+        },
+    )
+    assert "error" not in setup, setup
+
+    run = _impl_run_pestpp_glm(model, setup["pst_file"])
+    assert "error" not in run, run
+    assert run["iterations"] >= 0
+
+    summ = _impl_summarise_calibration(model, setup["pst_file"])
+    assert "error" not in summ, summ
+    assert len(summ["parameter_estimates"]) == 6
+    assert {p["name"] for p in summ["parameter_estimates"]} == keep_params
