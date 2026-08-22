@@ -40,7 +40,13 @@
 ## Rules
 
 - Metadata only. Capability tags match matrix row names.
-- GMS project files (`.gpr/.gpt` + zips) are NOT directly consumable by the MCP
-  (no GMS importer) — flag `input format: GMS project` rows as
-  `calibration-ready: n` for MCP purposes unless a flopy/MF6-input companion
-  exists.
+- **GMS zips are MCP-usable despite the `.gpr/.gpt` project files (corrected
+  2026-08-16):** the tutorial zips ship the *generated MF6 text input sets*
+  (`sample/…_models/MODFLOW 6/` — `.nam/.dis/.disv/.npf/.chd/.wel/.drn/.riv/
+  .ghb/.rch` + `_input/` + `_output/`) AND the GIS source data (shapefiles,
+  GeoTIFFs) used to build each model. No GMS importer is needed — record
+  `input format: MF6 text input (generated) + GMS project + GIS source data`,
+  and set `calibration-ready: y` where a PEST obs interface ships (e.g.
+  `mf6_pest_obs_ss`: `model.pobs`, `mf6mod2obs`, `obs.out`,
+  `pest_obs_stats.txt`). Verify inside the zip (tar listing), not from the PDF
+  alone.

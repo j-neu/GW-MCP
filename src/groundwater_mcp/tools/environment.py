@@ -2,19 +2,17 @@
 
 Provides a single ``check_environment`` tool that reports everything an agent
 needs before building a model: the server's own Python environment (packages
-with versions), the locations of the MODFLOW 6 / PEST++ / UCODE executables,
-the docs index state, and the default workspace root.  The agent should call
-this once at the start of a session instead of probing ``sys.executable``
-with shell commands (which commonly checks the wrong interpreter).
+with versions), the locations of the MODFLOW 6 / PEST++ executables, the docs
+index state, and the default workspace root.  The agent should call this once
+at the start of a session instead of probing ``sys.executable`` with shell
+commands (which commonly checks the wrong interpreter).
 """
 
 from __future__ import annotations
 
 import importlib
 import platform
-import shutil
 import sys
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -67,31 +65,11 @@ def _package_versions() -> dict[str, str | None]:
     return versions
 
 
-def _find_ucode_binary() -> str | None:
-    """Locate a UCODE_2014 executable (ucode_2014 / ucode_2014.exe)."""
-    exe_name = "ucode_2014.exe" if platform.system() == "Windows" else "ucode_2014"
-    found = shutil.which(exe_name)
-    if found:
-        return found
-    home = Path.home()
-    candidates = [
-        home / ".local" / "bin" / exe_name,
-        home / "ucode" / exe_name,
-        home / "ucode_2014" / exe_name,
-        Path("/usr/local/bin") / exe_name,
-        Path("/opt/local/bin") / exe_name,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
 def _impl_check_environment() -> dict:
     """Assemble the full environment report for the running server."""
     packages = _package_versions()
 
-    binaries: dict[str, str | None] = {"mf6": None, "ucode_2014": None}
+    binaries: dict[str, str | None] = {"mf6": None}
     for exe in _PESTPP_BINARIES:
         binaries[exe] = None
 
@@ -104,7 +82,6 @@ def _impl_check_environment() -> dict:
         binaries["mf6"] = _find_mf6_binary()
     except RuntimeError:
         pass
-    binaries["ucode_2014"] = _find_ucode_binary()
 
     index_built = (METADATA_PATH.exists() and WHOOSH_DIR.exists()) or (
         INDEX_DIR.exists() and any(INDEX_DIR.iterdir())
@@ -143,9 +120,9 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     def check_environment() -> dict:
         """Report the server's runtime environment: Python, installed packages with
-        versions (flopy, pyemu, geopandas, rasterio, ...), the paths to the MODFLOW 6,
-        PEST++, and UCODE executables, the local docs index state, and the default
-        model workspace root. Call this once at the start of a session to confirm the
+        versions (flopy, pyemu, geopandas, rasterio, ...), the paths to the MODFLOW 6
+        and PEST++ executables, the local docs index state, and the default model
+        workspace root. Call this once at the start of a session to confirm the
         stack is ready before building a model — do not probe with shell commands.
         """
         try:

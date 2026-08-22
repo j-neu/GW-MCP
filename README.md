@@ -1,6 +1,6 @@
 # groundwater-mcp
 
-> An open-source Python MCP server for AI-assisted groundwater modelling with MODFLOW 6, FloPy, PEST++, pyEMU, and UCODE.
+> An open-source Python MCP server for AI-assisted groundwater modelling with MODFLOW 6, FloPy, PEST++, and pyEMU.
 
 No waitlist. No paywall. No closed components. Runs entirely on your machine.
 
@@ -25,20 +25,35 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (39 total)
+## Tools (63 total, plus 2 MCP prompts and 3 MCP resource templates)
 
 | Module | Tools |
 |---|---|
 | **environment** | `check_environment` |
-| **docs** | `search_docs`, `search_tutorials`, `get_doc_file` |
+| **docs** | `search_docs`, `search_tutorials`, `get_doc_file`, `describe_package` |
 | **parameterise** | `import_grid_from_shapefile`, `assign_top_from_raster`, `assign_k_from_zones`, `import_river_from_shapefile`, `import_obs_from_csv` |
-| **model builder** | `create_model`, `set_simulation`, `add_dis_package`, `add_disv_package`, `add_npf_package`, `add_ic_package`, `add_boundary_package`, `add_oc_package`, `summarise_model`, `list_model_files` |
-| **runner** | `check_model`, `run_simulation`, `get_run_log` |
-| **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `plot_heads_map`, `plot_cross_section` |
-| **calibration (PEST++)** | `setup_pest_control`, `run_pestpp_glm`, `run_pestpp_ies`, `summarise_calibration`, `run_ies_uncertainty` |
-| **calibration (UCODE)** | `setup_ucode_control`, `run_ucode`, `summarise_ucode_calibration`, `run_ucode_uncertainty` |
+| **model builder** | `create_model`, `adopt_model`, `set_simulation`, `set_model_crs`, `add_dis_package`, `add_disv_package`, `add_npf_package`, `add_ic_package`, `add_sto_package`, `add_boundary_package`, `add_oc_package`, `flush_model`, `summarise_model`, `model_status`, `list_model_files`, `list_models`, `delete_model` |
+| **runner** | `check_model`, `run_simulation`, `get_run_log`, `diagnose_convergence`, `validate_model`, `start_run`, `get_job_status`, `cancel_job` |
+| **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `diagnose_water_balance`, `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `read_simulated_observations`, `compare_to_observed`, `plot_heads_map`, `plot_cross_section` |
+| **calibration (PEST++)** | `setup_calibration`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `summarise_calibration`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
+| **spec / provenance** | `apply_model_spec`, `export_model_spec`, `export_reproducible_script`, `describe_model`, `export_model_report`, `clone_model`, `compare_scenarios` |
 
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
+
+### Safety guarantees
+
+- **Long jobs never block the client (7e-A3).** `start_run` and
+  `start_calibration` execute in a background thread and return a `job_id`
+  immediately; `get_job_status` reports live progress (stress period / time
+  step / percent complete for MF6; iteration + phi for PEST++), and
+  `cancel_job` terminates the process — a >30-minute calibration no longer
+  trips the client timeout or forces a shell workaround.
+- **Builder writes are deferred.** Model-building calls mutate the in-memory model and report `written: false`; the disk write happens once at `flush_model` (or automatically at `check_model`/`run_simulation`/`list_model_files` and the calibration handoff). A regional build no longer re-serialises every array on every call.
+- **Adopted models are read-only by default.** `adopt_model` registers an existing on-disk MODFLOW 6 simulation without rewriting it; any mutating builder call on it returns `MODEL_ADOPTED_READONLY` unless `allow_modify=True` was passed.
+- **External edits are never lost.** The model cache detects package-file changes on disk and reloads from disk instead of serving (and later overwriting with) a stale in-memory copy.
+- **Spatial data is never compared in an assumed coordinate space.** A river importer call fails with `CRS_UNKNOWN` when the grid has no CRS but the data declares one; `stage_raster` sampling fails loudly (`STAGE_RASTER_NO_COVERAGE`) when the raster does not cover the reaches.
+- **Post-processing validates indices.** Layer arguments are checked against the model's `nlay`, returning `INVALID_INPUT` instead of a silent wrong layer or a raw `IndexError`.
+- **Build ordering surfaces proactively, not just as the next error (7e-C8).** Every builder/parameterise tool's result carries a `next_steps` list — the missing prerequisites for the model to be runnable, in build order — and `model_status(model)` reports the same thing on demand. Two MCP prompts (`build_model_from_data`, `calibrate_model`) and three MCP resources (`.lst`/`.pst`/file listing as readable URIs) round out the same "don't make the agent infer the ordering" goal.
 
 ---
 
@@ -83,7 +98,6 @@ Add to `~/.config/claude/claude_desktop_config.json`:
 - MODFLOW 6 binary (via `get-modflow`)
 - pyemu (for PEST++ calibration tools)
 - PEST++ binaries (for PEST++ calibration tools)
-- UCODE_2014 binary (for UCODE calibration tools; download from https://geology.mines.edu/igwmc/ucode/)
 
 ---
 

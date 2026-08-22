@@ -8,8 +8,22 @@ from pathlib import Path
 import flopy.mf6 as mf6
 import numpy as np
 
-from groundwater_mcp.utils.model_store import get_gwf, get_sim, save_sim
-from groundwater_mcp.utils.workspace import create_workspace, resolve_workspace
+from groundwater_mcp.utils.model_store import (
+    ModelReadOnlyError,
+    cache_sim,
+    consume_reload_flag,
+    flush_model,
+    get_gwf,
+    get_sim,
+    invalidate,
+    save_sim,
+)
+from groundwater_mcp.utils.workspace import (
+    create_workspace,
+    delete_workspace,
+    list_workspaces,
+    resolve_workspace,
+)
 
 # ---------------------------------------------------------------------------
 # Supported boundary packages
@@ -21,10 +35,66 @@ _BOUNDARY_PKG_CLASSES: dict[str, type] = {
     "RIV": mf6.ModflowGwfriv,
     "DRN": mf6.ModflowGwfdrn,
     "RCH": mf6.ModflowGwfrch,
+    "RCHA": mf6.ModflowGwfrcha,
     "EVT": mf6.ModflowGwfevt,
+    "EVTA": mf6.ModflowGwfevta,
     "GHB": mf6.ModflowGwfghb,
     "SFR": mf6.ModflowGwfsfr,
 }
+
+# List-based boundary packages (stress_period_data = list of cell records).
+# Array-based packages (RCHA/EVTA) take a full-grid array per stress period.
+_ARRAY_BOUNDARY_PKGS = {"RCHA", "EVTA"}
+
+# Conductivity unit → metres per model-time-unit (default time unit = DAYS).
+_K_UNITS_TO_PER_DAY: dict[str, float] = {
+    "m/d": 1.0,
+    "m/s": 86400.0,
+    "m/yr": 1.0 / 365.0,
+    "cm/s": 864.0,
+    "ft/d": 0.3048,
+    "ft/s": 0.3048 * 86400.0,
+}
+
+# Rate unit → metres per day.
+_RATE_UNITS_TO_MD: dict[str, float] = {
+    "m/d": 1.0,
+    "m/yr": 1.0 / 365.0,
+    "mm/d": 0.001,
+    "mm/yr": 0.001 / 365.0,
+}
+
+_SECONDS_PER_TIME_UNIT: dict[str, float] = {
+    "SECONDS": 1.0,
+    "MINUTES": 60.0,
+    "HOURS": 3600.0,
+    "DAYS": 86400.0,
+    "YEARS": 31536000.0,
+}
+
+
+def _convert_k_to_model(value, k_units: str, time_units: str):
+    """Convert a conductivity value from *k_units* into the model's length/time
+    convention (length is metres; time comes from the model's time_units)."""
+    if k_units not in _K_UNITS_TO_PER_DAY:
+        raise ValueError(
+            f"Unrecognised k_units '{k_units}'. Accepted: {sorted(_K_UNITS_TO_PER_DAY)}."
+        )
+    per_second = _K_UNITS_TO_PER_DAY[k_units] / 86400.0
+    target_per_second = _SECONDS_PER_TIME_UNIT.get(time_units, 86400.0)
+    factor = per_second * target_per_second
+    if isinstance(value, (int, float)):
+        return float(value) * factor
+    return np.asarray(value, dtype=float) * factor
+
+
+def _convert_rate_to_md(value, rate_units: str) -> float:
+    """Convert a recharge/ET rate from *rate_units* into m/d."""
+    if rate_units not in _RATE_UNITS_TO_MD:
+        raise ValueError(
+            f"Unrecognised rate_units '{rate_units}'. Accepted: {sorted(_RATE_UNITS_TO_MD)}."
+        )
+    return float(value) * _RATE_UNITS_TO_MD[rate_units]
 
 # ---------------------------------------------------------------------------
 # Shared error helper
@@ -33,6 +103,13 @@ _BOUNDARY_PKG_CLASSES: dict[str, type] = {
 
 def _err(code: str, message: str, suggestion: str = "") -> dict:
     return {"error": True, "code": code, "message": message, "suggestion": suggestion}
+
+
+class PayloadTooLargeError(ValueError):
+    """Raised when an inline payload exceeds a size guard (7f-I4)."""
+
+
+_DISV_INLINE_CELL_LIMIT = 50_000
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +152,77 @@ def _impl_create_model(
     )
     mf6.ModflowGwf(sim, modelname=name, model_nam_file=f"{name}.nam")
     _write_meta(model_dir, {"name": name, "units": units.upper(), "time_units": time_units.upper()})
-    save_sim(name, sim)
+    written = save_sim(name, sim)
     return {
         "model": name,
         "workspace": str(model_dir),
         "units": units.upper(),
         "time_units": time_units.upper(),
+        "written": written,
     }
+
+
+def _impl_adopt_model(
+    name: str,
+    workspace: str,
+    units: str,
+    time_units: str,
+    allow_modify: bool = False,
+) -> dict:
+    """Register an existing MODFLOW 6 simulation on disk as a model.
+
+    ``workspace`` must be a directory that already contains a runnable MF6
+    input set (``mfsim.nam`` plus the package files it references). The
+    simulation is loaded into the in-process cache from the on-disk files
+    (no stub is created and no files are rewritten), so subsequent tools
+    (check_model, run_simulation, summarise_model, calibration) operate on
+    the real model.
+
+    Model-name length is capped at 16 characters (MODFLOW 6 MODELNAME).
+    The GWF model name inside the files need NOT match ``name`` — tools that
+    resolve the GWF fall back to the first model in the simulation.
+
+    Adopted models are registered read-only by default (7f-D4.2): every
+    ``save_sim``-backed builder call is refused with MODEL_ADOPTED_READONLY so
+    a real published model cannot be silently rewritten. Pass
+    ``allow_modify=True`` to opt out. Non-mutating tools (check_model,
+    run_simulation, summarise_model, read_heads) always work.
+    """
+    if len(name) > 16:
+        raise ValueError(
+            f"Model name '{name}' is {len(name)} characters; MODFLOW 6 caps "
+            "MODELNAME at 16 characters. Use a shorter name."
+        )
+    model_dir = create_workspace(name, workspace or None)
+    sim_nam = model_dir / "mfsim.nam"
+    if not sim_nam.exists():
+        raise FileNotFoundError(
+            f"No mfsim.nam found in {model_dir}. adopt_model registers an "
+            "existing MODFLOW 6 simulation — the workspace must already "
+            "contain a runnable input set (mfsim.nam + package files)."
+        )
+    sim = mf6.MFSimulation.load(sim_ws=str(model_dir), verbosity_level=0)
+    cache_sim(name, sim)
+    _write_meta(model_dir, {
+        "name": name,
+        "units": units.upper(),
+        "time_units": time_units.upper(),
+        "adopted": True,
+        "allow_modify": bool(allow_modify),
+    })
+    result: dict = {
+        "model": name,
+        "workspace": str(model_dir),
+        "units": units.upper(),
+        "time_units": time_units.upper(),
+        "adopted": True,
+        "model_names": list(sim.model_names),
+    }
+    if allow_modify:
+        result["allow_modify"] = True
+    else:
+        result["read_only"] = True
+    return result
 
 
 def _impl_set_simulation(
@@ -116,13 +257,68 @@ def _impl_set_simulation(
     ims = mf6.ModflowIms(sim, pname="ims", complexity=ims_complexity.upper())
     sim.register_ims_package(ims, list(sim.model_names))
 
-    save_sim(model, sim)
+    written = save_sim(model, sim)
     return {
         "model": model,
         "nper": nper,
         "time_units": time_units,
         "ims_complexity": ims_complexity.upper(),
         "total_time": sum(perlen),
+        "written": written,
+    }
+
+
+def _impl_set_model_crs(
+    model: str,
+    crs: str,
+    xorigin: float | None = None,
+    yorigin: float | None = None,
+    angrot: float | None = None,
+) -> dict:
+    """Set the coordinate reference system and offsets on the model grid.
+
+    A grid built with ``add_dis_package`` / ``add_disv_package`` has no CRS
+    until this is called — every downstream spatial tool (assign_top_from_raster,
+    assign_k_from_zones, import_river_from_shapefile) needs a CRS to compare
+    coordinates, and without one those calls fail loudly (CRS_UNKNOWN) rather
+    than guessing. ``crs`` accepts anything rasterio accepts (e.g. "EPSG:32718"
+    or a WKT string). ``xorigin``/``yorigin`` are the lower-left corner of the
+    grid; ``angrot`` the rotation in degrees (default 0).
+    """
+    gwf = get_gwf(model)
+    angrot = angrot if angrot is not None else 0.0
+    gwf.modelgrid.set_coord_info(xoff=xorigin, yoff=yorigin, angrot=angrot, crs=crs)
+
+    dis_pkg = gwf.get_package("dis")
+    if dis_pkg is not None:
+        if xorigin is not None:
+            dis_pkg.xorigin.set_data(xorigin)
+        if yorigin is not None:
+            dis_pkg.yorigin.set_data(yorigin)
+    disv_pkg = gwf.get_package("disv")
+    if disv_pkg is not None:
+        if xorigin is not None:
+            disv_pkg.xorigin.set_data(xorigin)
+        if yorigin is not None:
+            disv_pkg.yorigin.set_data(yorigin)
+
+    ws = resolve_workspace(model)
+    meta = _read_meta(ws)
+    meta["crs"] = str(crs)
+    if xorigin is not None:
+        meta["xorigin"] = float(xorigin)
+    if yorigin is not None:
+        meta["yorigin"] = float(yorigin)
+    _write_meta(ws, meta)
+
+    written = save_sim(model, gwf.simulation)
+    return {
+        "model": model,
+        "crs": str(crs),
+        "xorigin": xorigin,
+        "yorigin": yorigin,
+        "angrot": angrot,
+        "written": written,
     }
 
 
@@ -135,6 +331,7 @@ def _impl_add_dis_package(
     delc: float | list,
     top: float | list,
     botm: list,
+    idomain: int | list | None = None,
 ) -> dict:
     if len(botm) != nlay:
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
@@ -144,17 +341,19 @@ def _impl_add_dis_package(
     if pkg is not None:
         gwf.remove_package(pkg)
 
-    mf6.ModflowGwfdis(
-        gwf,
-        nlay=nlay,
-        nrow=nrow,
-        ncol=ncol,
-        delr=delr,
-        delc=delc,
-        top=top,
-        botm=botm,
-    )
-    save_sim(model, gwf.simulation)
+    dis_kwargs: dict = {
+        "nlay": nlay,
+        "nrow": nrow,
+        "ncol": ncol,
+        "delr": delr,
+        "delc": delc,
+        "top": top,
+        "botm": botm,
+    }
+    if idomain is not None:
+        dis_kwargs["idomain"] = idomain
+    mf6.ModflowGwfdis(gwf, **dis_kwargs)
+    written = save_sim(model, gwf.simulation)
     return {
         "model": model,
         "grid_type": "DIS",
@@ -162,6 +361,7 @@ def _impl_add_dis_package(
         "nrow": nrow,
         "ncol": ncol,
         "ncells": nlay * nrow * ncol,
+        "written": written,
     }
 
 
@@ -172,8 +372,28 @@ def _impl_add_disv_package(
     cell2d: list,
     top: list,
     botm: list,
+    gridprops_file: str | None = None,
 ) -> dict:
+    # Inline cell2d payloads are impractical beyond a size guard; accept a
+    # gridprops file (JSON) instead (7f-I4).
+    if gridprops_file is not None:
+        import json as _json
+
+        props = _json.loads(Path(gridprops_file).read_text())
+        vertices = props["vertices"]
+        cell2d = props["cell2d"]
+        top = props.get("top", top)
+        botm = props.get("botm", botm)
+        nlay = int(props.get("nlay", nlay))
+
     ncpl = len(cell2d)
+    if ncpl > _DISV_INLINE_CELL_LIMIT:
+        raise PayloadTooLargeError(
+            f"{ncpl} inline cell2d entries exceeds the {_DISV_INLINE_CELL_LIMIT} "
+            "cell limit for inline payloads. Use import_grid_from_shapefile "
+            "(method='disv') or pass gridprops_file (a JSON file with "
+            "vertices/cell2d/top/botm) instead."
+        )
     nvert = len(vertices)
     if len(botm) != nlay:
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
@@ -193,7 +413,7 @@ def _impl_add_disv_package(
         top=top,
         botm=botm,
     )
-    save_sim(model, gwf.simulation)
+    written = save_sim(model, gwf.simulation)
     return {
         "model": model,
         "grid_type": "DISV",
@@ -201,6 +421,7 @@ def _impl_add_disv_package(
         "ncpl": ncpl,
         "nvert": nvert,
         "ncells": nlay * ncpl,
+        "written": written,
     }
 
 
@@ -210,19 +431,34 @@ def _impl_add_npf_package(
     k: float | list,
     k33: float | list | None,
     save_flows: bool,
+    k_units: str = "m/d",
 ) -> dict:
     gwf = get_gwf(model)
     pkg = gwf.get_package("npf")
     if pkg is not None:
         gwf.remove_package(pkg)
 
-    kwargs: dict = {"icelltype": icelltype, "k": k, "save_flows": save_flows}
+    # Dimensional arguments carry units (7f-H1.1): convert k/k33 into the
+    # model's length/time convention and record the declared units.
+    ws = resolve_workspace(model)
+    meta = _read_meta(ws)
+    time_units = meta.get("time_units", "DAYS")
+    k_converted = _convert_k_to_model(k, k_units, time_units)
+    kwargs: dict = {"icelltype": icelltype, "k": k_converted, "save_flows": save_flows}
     if k33 is not None:
-        kwargs["k33"] = k33
+        kwargs["k33"] = _convert_k_to_model(k33, k_units, time_units)
+    meta.setdefault("declared_units", {})["k"] = k_units
+    _write_meta(ws, meta)
 
     mf6.ModflowGwfnpf(gwf, **kwargs)
-    save_sim(model, gwf.simulation)
-    return {"model": model, "package": "NPF", "save_flows": save_flows}
+    written = save_sim(model, gwf.simulation)
+    return {
+        "model": model,
+        "package": "NPF",
+        "save_flows": save_flows,
+        "written": written,
+        "k_units": k_units,
+    }
 
 
 def _impl_add_ic_package(model: str, strt: float | list) -> dict:
@@ -232,8 +468,8 @@ def _impl_add_ic_package(model: str, strt: float | list) -> dict:
         gwf.remove_package(pkg)
 
     mf6.ModflowGwfic(gwf, strt=strt)
-    save_sim(model, gwf.simulation)
-    return {"model": model, "package": "IC"}
+    written = save_sim(model, gwf.simulation)
+    return {"model": model, "package": "IC", "written": written}
 
 
 def _impl_add_sto_package(
@@ -302,7 +538,7 @@ def _impl_add_sto_package(
         sto_kwargs["transient"] = {transient_start: True}
 
     mf6.ModflowGwfsto(gwf, **sto_kwargs)
-    save_sim(model, sim)
+    written = save_sim(model, sim)
 
     transient_periods = [i for i in range(nper) if i not in set(steady_state)]
     ws = resolve_workspace(model)
@@ -317,6 +553,7 @@ def _impl_add_sto_package(
         "steady_state_periods": steady_state,
         "transient_periods": transient_periods,
         "save_flows": save_flows,
+        "written": written,
     }
     if replaced:
         result["warning"] = "A previous STO package was removed and replaced by this call."
@@ -356,6 +593,8 @@ def _impl_add_boundary_package(
     stress_period_data: dict,
     kwargs: dict | None,
     save_flows: bool = True,
+    rate_units: str | None = None,
+    pname: str | None = None,
 ) -> dict:
     pkg_name = package.upper()
     if pkg_name not in _BOUNDARY_PKG_CLASSES:
@@ -367,35 +606,126 @@ def _impl_add_boundary_package(
     # Convert JSON string keys to int keys
     spd = {int(k): v for k, v in stress_period_data.items()}
 
+    # Dimensional arguments carry units (7f-H1.1): RCH/EVT rates are converted
+    # from rate_units into m/d, and the declared units are recorded. RCHA/EVTA
+    # (array-based, 7e-B8) apply the same conversion to their full-grid arrays.
+    if rate_units is not None and pkg_name in ("RCH", "EVT"):
+        spd = {
+            sp: [_convert_rate_record(r, rate_units, pkg_name) for r in records]
+            for sp, records in spd.items()
+        }
+        ws = resolve_workspace(model)
+        meta = _read_meta(ws)
+        meta.setdefault("declared_units", {})["recharge"] = rate_units
+        _write_meta(ws, meta)
+    elif rate_units is not None and pkg_name in _ARRAY_BOUNDARY_PKGS:
+        spd = {
+            sp: _convert_rate_array(arr, rate_units) for sp, arr in spd.items()
+        }
+        ws = resolve_workspace(model)
+        meta = _read_meta(ws)
+        meta.setdefault("declared_units", {})["recharge"] = rate_units
+        _write_meta(ws, meta)
+
     gwf = get_gwf(model)
     pkg_cls = _BOUNDARY_PKG_CLASSES[pkg_name]
 
-    # Remove existing package of same type if present (allow re-adding)
-    existing = gwf.get_package(pkg_name.lower())
-    replaced = existing is not None
-    if existing is not None:
-        gwf.remove_package(existing)
+    # Replacement semantics (7e-B10): with an explicit ``pname`` only that
+    # package is replaced (so two CHD sets can coexist, e.g. chd_high +
+    # chd_lower); without one, every package of the type is removed first.
+    existing = _packages_of_type(gwf, pkg_name.lower())
+    if pname:
+        targets = [p for p in existing if _pkg_nam_name(p).lower() == pname.lower()]
+    else:
+        targets = existing
+    for pkg in targets:
+        gwf.remove_package(pkg)
+    replaced = bool(targets)
 
     pkg_kwargs = dict(kwargs or {})
+    if pname:
+        pkg_kwargs["pname"] = pname
     if "save_flows" not in pkg_kwargs:
         pkg_kwargs["save_flows"] = save_flows
-    pkg_cls(gwf, stress_period_data=spd, **pkg_kwargs)
-    save_sim(model, gwf.simulation)
 
-    cell_counts = {sp: len(rows) for sp, rows in spd.items()}
+    if pkg_name == "RCHA":
+        mf6.ModflowGwfrcha(gwf, recharge=spd, **pkg_kwargs)
+    elif pkg_name == "EVTA":
+        mf6.ModflowGwfevta(gwf, rate=spd, **pkg_kwargs)
+    else:
+        pkg_cls(gwf, stress_period_data=spd, **pkg_kwargs)
+    written = save_sim(model, gwf.simulation)
+
+    if pkg_name in _ARRAY_BOUNDARY_PKGS:
+        cell_counts = {sp: int(np.asarray(arr).size) for sp, arr in spd.items()}
+    else:
+        cell_counts = {sp: len(rows) for sp, rows in spd.items()}
     result: dict = {
         "model": model,
         "package": pkg_name,
+        "pname": pname,
         "stress_periods": cell_counts,
         "save_flows": bool(pkg_kwargs.get("save_flows", save_flows)),
+        "written": written,
     }
+    if rate_units is not None and pkg_name in ("RCH", "EVT", "RCHA", "EVTA"):
+        result["rate_units"] = rate_units
     if replaced:
-        result["warning"] = (
-            f"A previous {pkg_name} package was removed and replaced by this "
-            "call. If that was unintentional (e.g. two separate CHD sets were "
-            "meant to be combined), re-add the boundary in a single call."
-        )
+        if pname:
+            result["warning"] = (
+                f"A previous {pkg_name} package named '{pname}' was removed and "
+                "replaced by this call."
+            )
+        else:
+            result["warning"] = (
+                f"A previous {pkg_name} package was removed and replaced by "
+                "this call. If that was unintentional (e.g. two separate CHD "
+                "sets were meant to be combined), pass distinct pname values "
+                "and re-add each boundary in its own call."
+            )
     return result
+
+
+def _convert_rate_record(record, rate_units: str, pkg_name: str) -> list:
+    """Convert the rate element of an RCH (`[cellid, rate]`) or EVT
+    (`[cellid, evtrate, surf_dep, extdp]`) record into m/d."""
+    record = list(record)
+    if len(record) >= 2:
+        record[1] = _convert_rate_to_md(record[1], rate_units)
+    return record
+
+
+def _convert_rate_array(arr, rate_units: str) -> np.ndarray:
+    """Convert a full-grid RCHA/EVTA rate array into m/d (7e-B8)."""
+    if rate_units not in _RATE_UNITS_TO_MD:
+        raise ValueError(
+            f"Unrecognised rate_units '{rate_units}'. Accepted: {sorted(_RATE_UNITS_TO_MD)}."
+        )
+    return np.asarray(arr, dtype=float) * _RATE_UNITS_TO_MD[rate_units]
+
+
+def _pkg_nam_name(pkg) -> str:
+    """The model-nam-file name of a package (flopy stores it as a list)."""
+    name = getattr(pkg, "name", "")
+    if isinstance(name, list):
+        return str(name[0]) if name else ""
+    return str(name)
+
+
+def _packages_of_type(gwf, pkg_type: str) -> list:
+    """Return every package on *gwf* whose ``package_type`` matches.
+
+    ``gwf.get_package(type)`` returns a list when several packages share a
+    type, which the replacement logic must handle (7e-B10) — this helper
+    normalises that.
+    """
+    pkg_type = pkg_type.lower()
+    out = []
+    for nam_name in gwf.get_package_list():
+        p = gwf.get_package(nam_name)
+        if p is not None and getattr(p, "package_type", "").lower() == pkg_type:
+            out.append(p)
+    return out
 
 
 def _impl_add_oc_package(
@@ -425,12 +755,13 @@ def _impl_add_oc_package(
         oc_kwargs["printrecord"] = printrecord
 
     mf6.ModflowGwfoc(gwf, **oc_kwargs)
-    save_sim(model, gwf.simulation)
+    written = save_sim(model, gwf.simulation)
     return {
         "model": model,
         "package": "OC",
         "head_file": head_file,
         "budget_file": budget_file,
+        "written": written,
     }
 
 
@@ -454,6 +785,13 @@ def _impl_summarise_model(model: str) -> dict:
             "ncol": int(dis_pkg.ncol.data),
             "ncells": int(dis_pkg.nlay.data * dis_pkg.nrow.data * dis_pkg.ncol.data),
         }
+        idomain = getattr(dis_pkg, "idomain", None)
+        if idomain is not None:
+            try:
+                id_arr = np.asarray(idomain.array)
+                grid_info["n_active"] = int((id_arr > 0).sum())
+            except Exception:
+                pass
     elif disv_pkg is not None:
         grid_info = {
             "type": "DISV",
@@ -490,6 +828,28 @@ def _impl_summarise_model(model: str) -> dict:
             "transient_periods": list(meta.get("sto_transient", [])),
         }
 
+    # Registered observation targets (7f-F1.1): the site → cellid map plus
+    # observed values/dates persisted by import_obs_from_csv.
+    observations: dict | None = None
+    meta = _read_meta(ws)
+    obs_meta = meta.get("observations")
+    if obs_meta:
+        observations = {
+            "type": obs_meta.get("type"),
+            "layer": obs_meta.get("layer"),
+            "output_csv": obs_meta.get("output_csv"),
+            "site_count": len(obs_meta.get("sites", [])),
+        }
+
+    # Declared units per quantity (7f-H1.3): what was declared, not assumed.
+    declared = meta.get("declared_units", {})
+    units = {
+        "length": meta.get("units", "METERS"),
+        "time": meta.get("time_units", "DAYS"),
+        "k": declared.get("k", "m/d"),
+        "recharge": declared.get("recharge", "m/d"),
+    }
+
     return {
         "model": model,
         "workspace": str(ws),
@@ -498,11 +858,110 @@ def _impl_summarise_model(model: str) -> dict:
         "stress_periods": stress_periods,
         "boundary_types": boundary_types,
         "storage": storage,
+        "observations": observations,
+        "units": units,
+        "reloaded_from_disk": consume_reload_flag(model),
     }
+
+
+def _compute_model_status(model: str) -> dict:
+    """Ordered build-order status for a model (7e-C8): what's present, what's
+    still missing, and what to call next — read-only, no flush/mutation.
+
+    "runnable" means MF6 has everything it needs for a meaningful run: a grid
+    (DIS/DISV), TDIS+IMS (set_simulation), NPF, IC, OC (technically optional
+    for MF6 itself, but without it no output is written), and STO whenever
+    TDIS looks transient (multiple stress periods/time steps). A boundary
+    condition package is recommended, not required — MF6 will run without
+    one, it just won't do anything interesting.
+    """
+    sim = get_sim(model)
+    gwf = get_gwf(model)
+
+    dis_pkg = gwf.get_package("dis")
+    disv_pkg = gwf.get_package("disv")
+    has_grid = dis_pkg is not None or disv_pkg is not None
+    tdis = sim.get_package("tdis")
+    ims = sim.get_package("ims")
+    has_simulation = tdis is not None and ims is not None
+    has_npf = gwf.get_package("npf") is not None
+    has_ic = gwf.get_package("ic") is not None
+    has_oc = gwf.get_package("oc") is not None
+    has_sto = gwf.get_package("sto") is not None
+    has_boundary = any(
+        gwf.get_package(pkg.lower()) is not None for pkg in _BOUNDARY_PKG_CLASSES
+    )
+
+    needs_sto = False
+    sto_warning = ""
+    if not has_sto:
+        needs_sto, sto_warning = _transient_like_without_sto(sim, gwf)
+
+    # (name, present, required, hint) in recommended build order.
+    steps = [
+        ("simulation", has_simulation, True,
+         "set_simulation(model, nper, perlen, nstp, ims_complexity) — defines "
+         "TDIS+IMS; also a documented prerequisite for import_grid_from_shapefile."),
+        ("grid", has_grid, True,
+         "add_dis_package / add_disv_package / import_grid_from_shapefile — "
+         "defines the model grid."),
+        ("npf", has_npf, True,
+         "add_npf_package(model, icelltype, k) — hydraulic properties; must "
+         "exist before assign_k_from_zones, which edits this package in place."),
+        ("ic", has_ic, True,
+         "add_ic_package(model, strt) — starting heads."),
+        ("sto", has_sto, needs_sto,
+         "add_sto_package(model, iconvert, ss, sy, steady_state) — storage, "
+         "required because multiple time steps are configured; without it "
+         "the model silently runs as steady state."),
+        ("oc", has_oc, True,
+         "add_oc_package(model) — declares the head/budget output files."),
+        ("boundary", has_boundary, False,
+         "add_boundary_package / import_river_from_shapefile — at least one "
+         "boundary condition (recommended: MF6 will run without one, but "
+         "nothing will change)."),
+    ]
+
+    missing_required: list[str] = []
+    missing_recommended: list[str] = []
+    next_steps: list[str] = []
+    for name, present, required, hint in steps:
+        if present:
+            continue
+        if name == "sto" and not required:
+            continue  # steady-state model — STO genuinely isn't needed
+        (missing_required if required else missing_recommended).append(name)
+        next_steps.append(hint)
+
+    warnings: list[str] = []
+    if needs_sto:
+        warnings.append(sto_warning)
+
+    return {
+        "model": model,
+        "runnable": len(missing_required) == 0,
+        "missing_required": missing_required,
+        "missing_recommended": missing_recommended,
+        "next_steps": next_steps,
+        "warnings": warnings,
+    }
+
+
+def _impl_flush_model(model: str) -> dict:
+    """Flush a dirty model to disk (7f-E1.2).
+
+    Builder calls defer their disk writes; this tool forces the pending write
+    so the on-disk input set reflects the current in-memory state. It is a
+    no-op (``written: false``) for clean models and for adopted read-only
+    models (which can never be dirty).
+    """
+    written = flush_model(model)
+    return {"model": model, "workspace": str(resolve_workspace(model)), "written": written}
 
 
 def _impl_list_model_files(model: str) -> dict:
     ws = resolve_workspace(model)
+    flushed = flush_model(model)
     files = []
     for f in sorted(ws.iterdir()):
         if f.is_file() and not f.name.startswith("."):
@@ -511,7 +970,28 @@ def _impl_list_model_files(model: str) -> dict:
                 "size_bytes": f.stat().st_size,
                 "extension": f.suffix,
             })
-    return {"model": model, "workspace": str(ws), "files": files}
+    return {
+        "model": model,
+        "workspace": str(ws),
+        "files": files,
+        "flushed": flushed,
+    }
+
+
+def _impl_list_models() -> dict:
+    """Return every registered model name → workspace path (7e-B4.1)."""
+    return {"models": dict(list_workspaces())}
+
+
+def _impl_delete_model(model: str, remove_files: bool = False) -> dict:
+    """Unregister a model; optionally delete its workspace (7e-B4.1)."""
+    delete_workspace(model, remove_files=remove_files)
+    invalidate(model)
+    return {
+        "model": model,
+        "removed": True,
+        "remove_files": bool(remove_files),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +1023,44 @@ def register(mcp) -> None:
             return _err("CREATE_FAILED", str(exc))
 
     @mcp.tool()
+    def adopt_model(
+        name: str,
+        workspace: str,
+        units: str = "METERS",
+        time_units: str = "DAYS",
+        allow_modify: bool = False,
+    ) -> dict:
+        """Register an existing MODFLOW 6 simulation on disk as a model.
+
+        ``workspace`` must be a directory that already contains a runnable
+        MF6 input set (``mfsim.nam`` plus the package files it references).
+        The simulation is loaded into the in-process cache from the on-disk
+        files (no stub is created, no files are rewritten), so check_model,
+        run_simulation, summarise_model, and the calibration chain operate on
+        the real model. The GWF model name inside the files need NOT match
+        ``name``. Model-name length is capped at 16 characters (MODFLOW 6
+        MODELNAME).
+
+        Adopted models are read-only by default (7f-D4.2): save_sim-backed
+        builder calls are refused with MODEL_ADOPTED_READONLY so a real
+        published model cannot be silently rewritten. Pass ``allow_modify=True``
+        to opt out; check_model / run_simulation / summarise_model /
+        read_heads always work on read-only adopted models."""
+        try:
+            return _impl_adopt_model(name, workspace, units, time_units, allow_modify)
+        except ValueError as exc:
+            return _err("MODEL_EXISTS", str(exc), "Use a different model name.")
+        except FileNotFoundError as exc:
+            return _err(
+                "MODEL_FILES_NOT_FOUND",
+                str(exc),
+                "Point workspace at a directory containing an existing MF6 "
+                "input set (mfsim.nam + package files).",
+            )
+        except Exception as exc:
+            return _err("ADOPT_FAILED", str(exc))
+
+    @mcp.tool()
     def set_simulation(
         model: str,
         nper: int,
@@ -555,10 +1073,41 @@ def register(mcp) -> None:
             return _impl_set_simulation(model, nper, perlen, nstp, ims_complexity)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("SET_SIM_FAILED", str(exc))
+
+    @mcp.tool()
+    def set_model_crs(
+        model: str,
+        crs: str,
+        xorigin: float | None = None,
+        yorigin: float | None = None,
+        angrot: float | None = None,
+    ) -> dict:
+        """Set the coordinate reference system (and optional offsets) on the
+        model grid.
+
+        Grids built with add_dis_package / add_disv_package have no CRS until
+        this is called. Every spatial tool (assign_top_from_raster,
+        assign_k_from_zones, import_river_from_shapefile) needs the grid to
+        carry a CRS to compare coordinates — without one they fail with
+        CRS_UNKNOWN rather than guessing. ``crs`` accepts anything rasterio
+        accepts (e.g. "EPSG:32718"); ``xorigin``/``yorigin`` are the grid
+        lower-left corner in that CRS."""
+        try:
+            return _impl_set_model_crs(model, crs, xorigin, yorigin, angrot)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("CRS_SET_FAILED", str(exc))
 
     @mcp.tool()
     def add_dis_package(
@@ -570,12 +1119,22 @@ def register(mcp) -> None:
         delc: float | list,
         top: float | list,
         botm: list,
+        idomain: int | list | None = None,
     ) -> dict:
-        """Add a structured (DIS) grid to the model."""
+        """Add a structured (DIS) grid to the model.
+
+        ``idomain`` marks active/inactive cells: 1 = active, 0 = inactive,
+        -1 = inactive (constant head under some formulations). A 2-D array
+        (nrow, ncol) is broadcast across layers; a 3-D array is (nlay, nrow,
+        ncol). Without it every cell is active."""
         try:
-            return _impl_add_dis_package(model, nlay, nrow, ncol, delr, delc, top, botm)
+            return _impl_add_dis_package(
+                model, nlay, nrow, ncol, delr, delc, top, botm, idomain
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
@@ -589,12 +1148,27 @@ def register(mcp) -> None:
         cell2d: list,
         top: list,
         botm: list,
+        gridprops_file: str | None = None,
     ) -> dict:
-        """Add an unstructured vertex-based (DISV) grid to the model."""
+        """Add an unstructured vertex-based (DISV) grid to the model.
+
+        Inline vertices/cell2d are rejected beyond 50,000 cells
+        (PAYLOAD_TOO_LARGE) — pass gridprops_file (a JSON file with
+        vertices/cell2d/top/botm) or use import_grid_from_shapefile
+        (method='disv') for real Voronoi grids."""
         try:
-            return _impl_add_disv_package(model, nlay, vertices, cell2d, top, botm)
+            return _impl_add_disv_package(model, nlay, vertices, cell2d, top, botm, gridprops_file)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except PayloadTooLargeError as exc:
+            return _err(
+                "PAYLOAD_TOO_LARGE",
+                str(exc),
+                "Use import_grid_from_shapefile (method='disv') or pass "
+                "gridprops_file naming a JSON file.",
+            )
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
@@ -607,12 +1181,22 @@ def register(mcp) -> None:
         k: float | list,
         k33: float | list | None = None,
         save_flows: bool = True,
+        k_units: str = "m/d",
     ) -> dict:
-        """Add a Node Property Flow (NPF) package defining hydraulic conductivity."""
+        """Add a Node Property Flow (NPF) package defining hydraulic conductivity.
+
+        ``k_units`` declares the units of ``k``/``k33`` (default "m/d"); values
+        are converted into the model's length/time convention (length metres,
+        time from the model's time_units) on entry. Accepted k_units:
+        m/d, m/s, m/yr, cm/s, ft/d, ft/s."""
         try:
-            return _impl_add_npf_package(model, icelltype, k, k33, save_flows)
+            return _impl_add_npf_package(model, icelltype, k, k33, save_flows, k_units)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
 
@@ -623,6 +1207,8 @@ def register(mcp) -> None:
             return _impl_add_ic_package(model, strt)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
 
@@ -649,6 +1235,8 @@ def register(mcp) -> None:
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
@@ -661,8 +1249,11 @@ def register(mcp) -> None:
         stress_period_data: dict,
         kwargs: dict | None = None,
         save_flows: bool = True,
+        rate_units: str | None = None,
+        pname: str | None = None,
     ) -> dict:
-        """Add a boundary condition package (CHD, WEL, RIV, DRN, RCH, EVT, GHB, SFR).
+        """Add a boundary condition package (CHD, WEL, RIV, DRN, RCH, RCHA,
+        EVT, EVTA, GHB, SFR).
 
         stress_period_data maps a stress-period index (0-based, matching the
         nper/perioddata set in set_simulation) to a list of records.  Each
@@ -671,15 +1262,30 @@ def register(mcp) -> None:
         form written to the package file.  Example:
         ``{"0": [[[0, 2, 3], 55.0], [[0, 2, 4], 55.0]]}``
 
+        RCHA/EVTA are the array-based recharge/ET packages: instead of cell
+        records, stress_period_data maps each period to a full-grid array
+        (nrow×ncol for DIS layer 0, or ncpl for DISV) of rates.
+
         save_flows writes the SAVE FLOWS option into the package file so the
         package's fluxes appear in the budget file for compute_water_balance.
+
+        rate_units declares the units of RCH/EVT/RCHA/EVTA rates (default None
+        = rates are already m/d); accepted: m/d, m/yr, mm/d, mm/yr. Rates are
+        converted into m/d on entry.
+
+        pname names the package in the model name file. Re-adding a package
+        with the same pname (or with no pname) replaces the existing one(s) of
+        that type; two packages of the same type with different pnames coexist
+        (e.g. pname='chd_high' and pname='chd_lower').
         """
         try:
             return _impl_add_boundary_package(
-                model, package, stress_period_data, kwargs, save_flows
+                model, package, stress_period_data, kwargs, save_flows, rate_units, pname
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
@@ -700,6 +1306,8 @@ def register(mcp) -> None:
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
 
@@ -714,6 +1322,25 @@ def register(mcp) -> None:
             return _err("SUMMARISE_FAILED", str(exc))
 
     @mcp.tool()
+    def model_status(model: str) -> dict:
+        """Ordered build-order status (7e-C8): what's present, what's still
+        missing, and what to call next.
+
+        runnable=True once the grid (DIS/DISV), simulation (TDIS+IMS), NPF,
+        IC, OC, and — when TDIS looks transient — STO all exist.
+        missing_required/missing_recommended name the gaps, and next_steps
+        gives the exact tool call for each, in build order. Call this after
+        create_model to see the whole build order up front, instead of
+        discovering it one error at a time; every builder/parameterise tool's
+        result also carries a next_steps list for the same reason."""
+        try:
+            return _compute_model_status(model)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except Exception as exc:
+            return _err("MODEL_STATUS_FAILED", str(exc))
+
+    @mcp.tool()
     def list_model_files(model: str) -> dict:
         """List all files in the model workspace with sizes and extensions."""
         try:
@@ -722,3 +1349,50 @@ def register(mcp) -> None:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
             return _err("LIST_FILES_FAILED", str(exc))
+
+    @mcp.tool()
+    def flush_model(model: str) -> dict:
+        """Flush staged model changes to disk.
+
+        Builder and parameterisation calls (add_*, assign_*, import_*, ...)
+        mutate the in-memory model and defer the disk write (their results
+        report ``written: false``). This tool performs the pending write so
+        the on-disk input set matches the current in-memory state. It is a
+        no-op (``written: false``) for clean models and for adopted read-only
+        models. check_model, run_simulation and list_model_files also flush
+        automatically before they run.
+        """
+        try:
+            return _impl_flush_model(model)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except Exception as exc:
+            return _err("FLUSH_FAILED", str(exc))
+
+    @mcp.tool()
+    def list_models() -> dict:
+        """List every registered model name and its workspace path (7e-B4.1).
+
+        Models are registered by create_model / adopt_model. Use this to
+        recover the model name when a session loses track, and to discover
+        what is already on disk."""
+        try:
+            return _impl_list_models()
+        except Exception as exc:
+            return _err("LIST_MODELS_FAILED", str(exc))
+
+    @mcp.tool()
+    def delete_model(model: str, remove_files: bool = False) -> dict:
+        """Unregister a model (7e-B4.1).
+
+        Removes the model from the workspace registry. With ``remove_files``
+        also deletes the workspace directory and all its contents — use with
+        care; a recreated model of the same name starts from scratch. Model
+        files left behind by a registry-only delete can be re-adopted with
+        adopt_model."""
+        try:
+            return _impl_delete_model(model, remove_files)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run list_models to see registered models.")
+        except Exception as exc:
+            return _err("DELETE_FAILED", str(exc))

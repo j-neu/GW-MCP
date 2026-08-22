@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
 import matplotlib
+
 matplotlib.use("Agg")  # non-interactive backend; must be set before pyplot import
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure

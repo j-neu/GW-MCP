@@ -102,6 +102,16 @@ def _get_model():
     return _st_model
 
 
+def _semantic_available() -> bool:
+    """Whether the optional sentence-transformers extra is installed (7f-I2)."""
+    try:
+        import sentence_transformers  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Index-not-built error
 # ---------------------------------------------------------------------------
@@ -275,6 +285,19 @@ def _impl_search_docs(
     expanded = expand_acronyms(query)
     effective_method = method if method != "auto" else _auto_method(expanded)
 
+    if effective_method == "semantic" and not _semantic_available():
+        if method == "semantic":
+            return {
+                "error": True,
+                "code": "SEMANTIC_SEARCH_UNAVAILABLE",
+                "message": "Semantic search requires the 'semantic' extra "
+                "(sentence-transformers). Install with: pip install "
+                "groundwater-mcp[semantic], or use method='text'.",
+                "suggestion": "Use method='text' (full-text Whoosh search) "
+                "which works without the extra.",
+            }
+        effective_method = "text"
+
     if effective_method == "text":
         hits = _text_search(expanded, repos, None, None, limit)
     elif effective_method == "semantic":
@@ -376,12 +399,120 @@ def _impl_get_doc_file(path: str, page: int = 1) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# describe_package — machine-readable package spec (7f-I3)
+# ---------------------------------------------------------------------------
+
+# The DFN files the plan expected are not vendored in flopy 3.10, so the
+# authoritative spec is derived from flopy's own package classes: a throwaway
+# simulation is built to introspect the package's blocks and the
+# stress_period_data record fields (which mirror the DFN).
+_PACKAGE_CLASSES = {
+    "DIS": "ModflowGwfdis",
+    "DISV": "ModflowGwfdisv",
+    "NPF": "ModflowGwfnpf",
+    "IC": "ModflowGwfic",
+    "STO": "ModflowGwfsto",
+    "OC": "ModflowGwfoc",
+    "CHD": "ModflowGwfchd",
+    "WEL": "ModflowGwfwel",
+    "RIV": "ModflowGwfriv",
+    "DRN": "ModflowGwfdrn",
+    "RCH": "ModflowGwfrch",
+    "EVT": "ModflowGwfevt",
+    "GHB": "ModflowGwfghb",
+    "SFR": "ModflowGwfsfr",
+}
+
+
+_DUMMY_RECORDS = {
+    "WEL": [[[0, 0, 0], -1.0]],
+    "CHD": [[[0, 0, 0], 1.0, 1.0]],
+    "DRN": [[[0, 0, 0], 1.0, 1.0]],
+    "GHB": [[[0, 0, 0], 1.0, 1.0]],
+    "RIV": [[[0, 0, 0], 1.0, 1.0, 0.0]],
+    "RCH": [[[0, 0, 0], 0.001]],
+    "EVT": [[[0, 0, 0], 0.001, 0.0, 0.0]],
+}
+
+
+def _impl_describe_package(name: str) -> dict:
+    import tempfile
+
+    import flopy.mf6 as mf6
+
+    pkg_name = name.upper()
+    if pkg_name not in _PACKAGE_CLASSES:
+        raise ValueError(
+            f"Unknown package '{pkg_name}'. Known packages: {sorted(_PACKAGE_CLASSES)}."
+        )
+    cls = getattr(mf6, _PACKAGE_CLASSES[pkg_name])
+
+    # Build a throwaway simulation to introspect blocks and record fields.
+    ws = tempfile.mkdtemp(prefix="gw-mcp-spec-")
+    sim = mf6.MFSimulation(sim_name="mfsim", version="mf6", sim_ws=ws)
+    gwf = mf6.ModflowGwf(sim, modelname="spec", model_nam_file="spec.nam")
+    mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", nper=1, perioddata=[(1.0, 1, 1.0)])
+    mf6.ModflowGwfdis(gwf, nlay=1, nrow=2, ncol=2, delr=100.0, delc=100.0, top=10.0, botm=[0.0])
+
+    doc_first = (cls.__doc__ or "").strip().splitlines()[0] if cls.__doc__ else ""
+
+    is_boundary = pkg_name in _DUMMY_RECORDS
+    try:
+        if is_boundary:
+            pkg = cls(gwf, stress_period_data={"0": _DUMMY_RECORDS[pkg_name]})
+        else:
+            pkg = cls(gwf)
+    except Exception:
+        pkg = None
+
+    blocks: list[dict] = []
+    stress_fields: list[str] = []
+    if pkg is not None:
+        try:
+            for block in getattr(pkg, "blocks", []):
+                blocks.append({"name": block.name, "required": block.required})
+        except Exception:
+            pass
+        if is_boundary:
+            try:
+                stress_fields = list(pkg.stress_period_data.dtype.names)
+            except Exception:
+                pass
+
+    result: dict = {
+        "package": pkg_name,
+        "description": doc_first,
+        "blocks": blocks,
+    }
+    if stress_fields:
+        result["stress_period_data"] = stress_fields
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Tool registration
 # ---------------------------------------------------------------------------
 
 
 def register(mcp: FastMCP) -> None:
     """Register docs tools with the MCP server."""
+
+    @mcp.tool()
+    def describe_package(name: str) -> dict:
+        """Return the authoritative package specification for a MODFLOW 6
+        package (7f-I3): required/optional blocks and, for boundary packages,
+        the stress_period_data record fields (cellid + value columns)."""
+        try:
+            return _impl_describe_package(name)
+        except ValueError as exc:
+            return {
+                "error": True,
+                "code": "INVALID_INPUT",
+                "message": str(exc),
+                "suggestion": f"Choose from: {sorted(_PACKAGE_CLASSES)}.",
+            }
+        except Exception as exc:
+            return {"error": True, "code": "DESCRIBE_FAILED", "message": str(exc)}
 
     @mcp.tool()
     def search_docs(

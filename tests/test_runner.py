@@ -17,8 +17,10 @@ from groundwater_mcp.tools.builder import (
 from groundwater_mcp.tools.runner import (
     _find_mf6_binary,
     _impl_check_model,
+    _impl_diagnose_convergence,
     _impl_get_run_log,
     _impl_run_simulation,
+    _impl_validate_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -412,3 +414,260 @@ def test_get_run_log_tail_limit_respected(runnable_model):
     _impl_run_simulation(runnable_model, silent=True)
     result = _impl_get_run_log(runnable_model, tail=10)
     assert len(result["tail_lines"]) <= 10
+
+
+# ---------------------------------------------------------------------------
+# diagnose_convergence (7e-C1) — unit tests, no binary needed
+# ---------------------------------------------------------------------------
+
+
+def _write_failing_lst(model_name) -> None:
+    """Write a synthetic .lst with no 'normal termination' marker."""
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    ws = resolve_workspace(model_name)
+    (ws / "mfsim.lst").write_text(
+        "\n".join([
+            "MODFLOW 6",
+            "  1 STRESS PERIOD(S) IN SIMULATION",
+            "Solving:  Stress period:     1    Time step:     1",
+            "PARSING XML PACKAGES",
+            "STOPPING SIMULATION MID-RUN",
+        ])
+    )
+
+
+def _write_converged_lst(model_name) -> None:
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    ws = resolve_workspace(model_name)
+    (ws / "mfsim.lst").write_text(
+        "\n".join([
+            "MODFLOW 6",
+            "  1 STRESS PERIOD(S) IN SIMULATION",
+            "Solving:  Stress period:     1    Time step:     1",
+            "",
+            " Normal termination of simulation.",
+        ])
+    )
+
+
+def test_diagnose_convergence_no_lst_raises(runnable_model):
+    with pytest.raises(FileNotFoundError, match=r"\.lst"):
+        _impl_diagnose_convergence(runnable_model)
+
+
+def test_diagnose_convergence_unknown_model_raises():
+    with pytest.raises(KeyError):
+        _impl_diagnose_convergence("no_such_model_xyz")
+
+
+def test_diagnose_convergence_converged(runnable_model):
+    _write_converged_lst(runnable_model)
+    result = _impl_diagnose_convergence(runnable_model)
+    assert result["converged"] is True
+    assert result["failure_class"] == "converged"
+    assert result["recommendations"] == []
+
+
+def test_diagnose_convergence_closure_too_tight(nonconverging_model):
+    """nonconverging_model sets outer_dvclose=1e-50 — unresolvable at double precision."""
+    _write_failing_lst(nonconverging_model)
+    result = _impl_diagnose_convergence(nonconverging_model)
+    assert result["converged"] is False
+    assert result["failure_class"] == "closure_too_tight"
+    assert result["evidence"]["outer_dvclose"] == pytest.approx(1e-50)
+    assert result["recommendations"]
+
+
+def test_diagnose_convergence_disconnected_active_domain(tmp_path, model_name):
+    """idomain with a gap in the middle splits a 1x5 row into two regions."""
+    import numpy as np
+
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    idomain = np.array([[1, 1, 0, 1, 1]])
+    _impl_add_dis_package(model_name, 1, 1, 5, 100.0, 100.0, 10.0, [0.0], idomain=idomain)
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+    _write_failing_lst(model_name)
+
+    result = _impl_diagnose_convergence(model_name)
+    assert result["failure_class"] == "disconnected_active_domain"
+    assert result["evidence"]["n_disconnected_regions"] == 2
+
+
+def test_diagnose_convergence_k_contrast(tmp_path, model_name):
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0])
+    k = [1e-6, 1e-6, 1e-6, 1e-6, 1.0, 1.0, 1e6, 1e6, 1e6]
+    _impl_add_npf_package(model_name, icelltype=0, k=k, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+    _write_failing_lst(model_name)
+
+    result = _impl_diagnose_convergence(model_name)
+    assert result["failure_class"] == "k_contrast"
+    assert result["evidence"]["k_ratio"] > 1e4
+
+
+def test_diagnose_convergence_newton_needed(tmp_path, model_name):
+    """Convertible cells starting below the bottom, Newton off."""
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0])
+    _impl_add_npf_package(model_name, icelltype=1, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=-1.0)  # below botm=0.0 everywhere
+    _write_failing_lst(model_name)
+
+    result = _impl_diagnose_convergence(model_name)
+    assert result["failure_class"] == "newton_needed"
+    assert result["evidence"]["dry_risk_cells"] == 9
+
+
+def test_diagnose_convergence_dry_cells_when_newton_already_on(tmp_path, model_name):
+    """Same setup as newton_needed, but with newtonoptions already set."""
+    from groundwater_mcp.utils.model_store import get_sim, save_sim
+
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0])
+    _impl_add_npf_package(model_name, icelltype=1, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=-1.0)
+
+    sim = get_sim(model_name)
+    gwf = sim.get_model(model_name)
+    gwf.newtonoptions.set_data(["NEWTON"])
+    save_sim(model_name, sim)
+
+    _write_failing_lst(model_name)
+
+    result = _impl_diagnose_convergence(model_name)
+    assert result["failure_class"] == "dry_cells"
+    assert result["evidence"]["dry_risk_cells"] == 9
+
+
+def test_diagnose_convergence_unclassified(runnable_model):
+    """runnable_model's own config is clean — no defect for the classifier to find."""
+    _write_failing_lst(runnable_model)
+    result = _impl_diagnose_convergence(runnable_model)
+    assert result["failure_class"] == "unclassified"
+    assert result["recommendations"]
+
+
+# ---------------------------------------------------------------------------
+# validate_model (7e-C2) — unit tests, no binary needed
+# ---------------------------------------------------------------------------
+
+
+def test_validate_model_clean_model_returns_no_findings(runnable_model):
+    result = _impl_validate_model(runnable_model)
+    assert result["clean"] is True
+    assert result["findings"] == []
+
+
+def test_validate_model_unknown_model_raises():
+    with pytest.raises(KeyError):
+        _impl_validate_model("no_such_model_xyz")
+
+
+def test_validate_model_disconnected_active_cells(tmp_path, model_name):
+    import numpy as np
+
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    idomain = np.array([[1, 1, 0, 1, 1]])
+    _impl_add_dis_package(model_name, 1, 1, 5, 100.0, 100.0, 10.0, [0.0], idomain=idomain)
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+
+    result = _impl_validate_model(model_name)
+    finding = next(f for f in result["findings"] if f["type"] == "disconnected_active_cells")
+    assert finding["count"] == 2
+    assert finding["severity"] == "error"
+
+
+def test_validate_model_k_contrast(tmp_path, model_name):
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0])
+    k = [1e-6, 1e-6, 1e-6, 1e-6, 1.0, 1.0, 1e6, 1e6, 1e6]
+    _impl_add_npf_package(model_name, icelltype=0, k=k, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+
+    result = _impl_validate_model(model_name)
+    finding = next(f for f in result["findings"] if f["type"] == "k_contrast")
+    assert finding["k_ratio"] > 1e6
+
+
+def test_validate_model_head_below_bottom(tmp_path, model_name):
+    """strt everywhere below botm=0.0 — impossible regardless of icelltype."""
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0])
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=-5.0)
+
+    result = _impl_validate_model(model_name)
+    finding = next(f for f in result["findings"] if f["type"] == "head_below_bottom")
+    assert finding["count"] == 9
+    assert finding["heads_source"] == "initial_conditions"
+    assert finding["severity"] == "error"
+    assert not any(f["type"] == "head_above_top" for f in result["findings"])
+
+
+def test_validate_model_head_above_top(tmp_path, model_name):
+    """Convertible cells with strt above top=10.0 everywhere."""
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0])
+    _impl_add_npf_package(model_name, icelltype=1, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=15.0)
+
+    result = _impl_validate_model(model_name)
+    finding = next(f for f in result["findings"] if f["type"] == "head_above_top")
+    assert finding["count"] == 9
+    assert finding["severity"] == "warning"
+    assert not any(f["type"] == "head_below_bottom" for f in result["findings"])
+
+
+def test_validate_model_boundary_in_inactive_cell(tmp_path, model_name):
+    import numpy as np
+
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    idomain = np.ones((3, 3), dtype=int)
+    idomain[0, 0] = 0  # one inactive cell
+    _impl_add_dis_package(model_name, 1, 3, 3, 100.0, 100.0, 10.0, [0.0], idomain=idomain)
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+    chd = [[[0, 0, 0], 5.0], [[0, 1, 1], 5.0]]  # first cell is the inactive one
+    _impl_add_boundary_package(model_name, "CHD", {"0": chd}, None)
+
+    result = _impl_validate_model(model_name)
+    finding = next(f for f in result["findings"] if f["type"] == "boundary_in_inactive_cell")
+    assert finding["count"] == 1
+    assert finding["by_package"] == {"CHD": 1}
+
+
+def test_validate_model_boundary_in_inactive_cell_aggregates_at_scale(tmp_path, model_name):
+    """Many inactive-cell boundary records collapse into one finding with a count,
+    not one entry per cell (the zenodo-21381071 569,796-warning scenario)."""
+    import numpy as np
+
+    n = 60  # 3600 cells
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    idomain = np.ones((n, n), dtype=int)
+    idomain[: n // 2, :] = 0  # half the grid inactive
+    _impl_add_dis_package(model_name, 1, n, n, 10.0, 10.0, 10.0, [0.0], idomain=idomain)
+    _impl_add_npf_package(model_name, icelltype=0, k=10.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+    # A CHD record on every single cell, active or not.
+    chd = [[[0, row, col], 5.0] for row in range(n) for col in range(n)]
+    _impl_add_boundary_package(model_name, "CHD", {"0": chd}, None)
+
+    result = _impl_validate_model(model_name)
+    boundary_findings = [f for f in result["findings"] if f["type"] == "boundary_in_inactive_cell"]
+    assert len(boundary_findings) == 1
+    assert boundary_findings[0]["count"] == (n // 2) * n

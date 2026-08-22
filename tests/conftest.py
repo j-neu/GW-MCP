@@ -35,5 +35,11 @@ def clear_model_cache() -> None:
     from groundwater_mcp.utils import model_store
 
     model_store._cache.clear()
+    model_store._mtimes.clear()
+    model_store._reload_flags.clear()
+    model_store._dirty.clear()
     yield
     model_store._cache.clear()
+    model_store._mtimes.clear()
+    model_store._reload_flags.clear()
+    model_store._dirty.clear()

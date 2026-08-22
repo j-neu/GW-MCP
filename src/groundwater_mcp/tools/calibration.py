@@ -1,15 +1,15 @@
-"""calibration module — PEST++ parameter estimation via pyEMU.
-
-PEST++ tools implemented in Phase 5.
-UCODE tools are Phase 5b (stubs kept below).
-"""
+"""calibration module — PEST++ parameter estimation via pyEMU."""
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +18,14 @@ import pyemu
 from mcp.server.fastmcp import FastMCP
 
 from groundwater_mcp.tools.runner import _find_mf6_binary
+from groundwater_mcp.utils import jobs
+from groundwater_mcp.utils.model_store import (
+    flush_model,
+    get_gwf,
+    read_meta,
+    save_sim,
+    write_meta,
+)
 from groundwater_mcp.utils.workspace import resolve_workspace
 
 # ---------------------------------------------------------------------------
@@ -122,25 +130,235 @@ def _read_phi_csv(phi_csv: Path) -> tuple[list[dict], float | None]:
         ]
         final_phi = float(phi_totals.iloc[-1]) if len(phi_totals) > 0 else None
         return phi_progress, final_phi
-    except Exception:
+    except OSError:
         return [], None
 
 
-def _parse_par_file(par_file: Path) -> dict[str, float]:
-    """Read a PEST-format .par file and return {par_name: value}."""
-    values: dict[str, float] = {}
+def _read_iobj_phi(iobj_path: Path) -> tuple[list[dict], float | None]:
+    """Parse a PESTPP-GLM ``.iobj`` file into (phi_progress, final_phi).
+
+    pestpp-glm writes its iteration objective-function history to
+    ``<case>.iobj`` (header: ``iteration,model_runs_completed,total_phi,
+    measurement_phi,regularization_phi,<obsgroup>``) — it never writes
+    ``.phi.actual.csv`` (that is pestpp-ies output). Reading the wrong file is
+    why GLM phi/iterations were silently always empty (7e-B1.1).
+    """
     try:
-        lines = par_file.read_text().strip().splitlines()
-        # First line is the header ("single point" or similar); skip it.
-        for line in lines[1:]:
-            parts = line.split()
-            if len(parts) >= 2:
+        df = pd.read_csv(iobj_path)
+        total = (
+            df["total_phi"]
+            if "total_phi" in df.columns
+            else df.select_dtypes(include="number").iloc[:, 0]
+        )
+        phi_progress = [
+            {"iteration": int(i), "phi": float(v)} for i, v in enumerate(total)
+        ]
+        final_phi = float(total.iloc[-1]) if len(total) > 0 else None
+        return phi_progress, final_phi
+    except OSError:
+        return [], None
+
+
+def _read_glm_phi(ws: Path, base_name: str) -> tuple[list[dict], float | None]:
+    """Read GLM objective-function history, branching on engine (7e-B1.1).
+
+    pestpp-glm writes ``<case>.iobj``; pestpp-ies writes
+    ``<case>.phi.actual.csv``. Return ``(phi_progress, final_phi)`` from the
+    file that exists (the IES file falling back to the old IES reader).
+    """
+    iobj = ws / f"{base_name}.iobj"
+    if iobj.exists():
+        return _read_iobj_phi(iobj)
+    phi_csv = ws / f"{base_name}.phi.actual.csv"
+    if phi_csv.exists():
+        return _read_phi_csv(phi_csv)
+    return [], None
+
+
+def _read_ies_phi(ws: Path, base_name: str) -> tuple[list[dict], float | None]:
+    """Parse a PESTPP-IES ``<case>.phi.actual.csv`` into (phi_progress, final_phi).
+
+    The CSV has one row per iteration; the ``mean`` column holds the
+    ensemble-mean phi (with std/min/max and per-realisation columns besides),
+    so the mean is the reported phi. Without a ``mean`` column the numeric
+    columns (excluding metadata) are averaged.
+    """
+    phi_csv = ws / f"{base_name}.phi.actual.csv"
+    if not phi_csv.exists():
+        return [], None
+    try:
+        df = pd.read_csv(phi_csv)
+    except (OSError, pd.errors.ParserError):
+        return [], None
+    if "iteration" not in df.columns:
+        return [], None
+    progress: list[dict] = []
+    for _, row in df.iterrows():
+        if "mean" in df.columns and pd.notna(row["mean"]):
+            phi: float | None = float(row["mean"])
+        else:
+            values = []
+            for key, value in row.items():
+                if key in ("iteration", "total_runs"):
+                    continue
                 try:
-                    values[parts[0].lower()] = float(parts[1])
-                except ValueError:
-                    pass
-    except Exception:
-        pass
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            phi = float(np.mean(values)) if values else None
+        progress.append({"iteration": int(row["iteration"]), "phi": phi})
+    final_phi = progress[-1]["phi"] if progress else None
+    return progress, final_phi
+
+
+def _pestpp_progress(ws: Path, base_name: str, engine: str) -> dict:
+    """Live progress for a running PEST++ job (7e-A3.3).
+
+    Reads the current iteration and latest phi from ``<case>.iobj`` (GLM) or
+    ``<case>.phi.actual.csv`` (IES); returns ``{}`` before either exists.
+    """
+    if engine == "glm":
+        progress, _ = _read_glm_phi(ws, base_name)
+    else:
+        progress, _ = _read_ies_phi(ws, base_name)
+    if not progress:
+        return {}
+    return {
+        "engine": engine,
+        "iteration": int(progress[-1]["iteration"]),
+        "latest_phi": progress[-1]["phi"],
+        "n_iterations": len(progress),
+    }
+
+
+def _run_process(args: list[str], cwd: str):
+    """Spawn a subprocess capturing stdout+stderr, returning the Popen handle.
+
+    A module-level seam so tests can substitute a fake process; production
+    behaviour is a plain ``subprocess.Popen`` with combined output. The
+    process is spawned in its own process group/session so ``cancel_job`` can
+    terminate the whole tree (grandchildren included) on any platform.
+    """
+    return subprocess.Popen(
+        args,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+    )
+
+
+def _impl_start_calibration(
+    model: str,
+    pst_file: str,
+    method: str = "glm",
+    num_reals: int = 50,
+) -> dict:
+    """Start a PEST++ calibration in the background and return a job id (7e-A3).
+
+    ``method`` is ``"glm"`` (pestpp-glm, default) or ``"ies"`` (pestpp-ies).
+    The calibration executes in a worker thread so the call returns
+    immediately; poll with ``get_job_status`` (which reports live iteration +
+    phi from ``<case>.iobj`` / ``<case>.phi.actual.csv``) and stop with
+    ``cancel_job``. The finished job's ``result`` matches
+    ``run_pestpp_glm`` / ``run_pestpp_ies``.
+    """
+    if method not in ("glm", "ies"):
+        raise ValueError(f"method must be 'glm' or 'ies', got '{method}'.")
+    ws = resolve_workspace(model)
+    pst_path = _resolve_pst_path(model, pst_file)
+    base_name = pst_path.stem
+
+    # Flush staged model changes so the forward model reads the current input
+    # set (7f-E1.2).
+    flush_model(model)
+
+    exe = _find_pestpp_binary("pestpp-glm" if method == "glm" else "pestpp-ies")
+    if method == "ies":
+        pst = pyemu.Pst(str(pst_path))
+        pst.pestpp_options["ies_num_reals"] = num_reals
+        pst.write(str(pst_path))
+
+    proc = _run_process([exe, pst_path.name], str(ws))
+    lines: deque[str] = deque(maxlen=5000)
+
+    def _worker(job) -> dict:
+        for line in proc.stdout:
+            lines.append(line)
+        returncode = proc.wait()
+        if method == "glm":
+            phi_progress, final_phi = _read_glm_phi(ws, base_name)
+            return {
+                "model": model,
+                "pst_file": str(pst_path),
+                "converged": returncode == 0,
+                "final_phi": final_phi,
+                "iterations": len(phi_progress),
+                "stdout": "".join(lines)[-3000:],
+            }
+        phi_csv = ws / f"{base_name}.phi.actual.csv"
+        final_phi_mean: float | None = None
+        final_phi_std: float | None = None
+        iterations = 0
+        if phi_csv.exists():
+            phi_progress, _ = _read_phi_csv(phi_csv)
+            iterations = len(phi_progress)
+            if phi_progress:
+                phi_vals = [row["phi"] for row in phi_progress]
+                final_phi_mean = float(np.mean(phi_vals))
+                final_phi_std = float(np.std(phi_vals))
+        return {
+            "model": model,
+            "pst_file": str(pst_path),
+            "converged": returncode == 0,
+            "final_phi_mean": final_phi_mean,
+            "final_phi_std": final_phi_std,
+            "iterations": iterations,
+            "num_reals": num_reals,
+            "stdout": "".join(lines)[-3000:],
+        }
+
+    job = jobs.submit(
+        model,
+        method,
+        _worker,
+        process=proc,
+        progress_fn=lambda _j: _pestpp_progress(ws, base_name, method),
+    )
+    return {
+        "model": model,
+        "job_id": job.job_id,
+        "kind": method,
+        "pst_file": str(pst_path),
+        "status": "running",
+        "note": "Poll progress with get_job_status; stop with cancel_job.",
+    }
+
+
+
+def _parse_par_file(par_file: Path) -> dict[str, float]:
+    """Read a PEST-format .par file and return {par_name: value}.
+
+    Raises
+    ------
+    OSError / UnicodeDecodeError
+        When the file cannot be read (a malformed .par must surface as an
+        error rather than silently returning ``{}`` — 7e-B3).
+    """
+    values: dict[str, float] = {}
+    lines = par_file.read_text().strip().splitlines()
+    # First line is the header ("single point" or similar); skip it.
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                values[parts[0].lower()] = float(parts[1])
+            except ValueError:
+                pass
     return values
 
 
@@ -167,7 +385,7 @@ def _compute_residual_stats(res_df) -> dict:
             "r_squared": r_squared,
             "n_observations": len(active),
         }
-    except Exception:
+    except (KeyError, TypeError, ValueError, pd.errors.ParserError):
         return {"rmse": None, "bias": None, "r_squared": None, "n_observations": 0}
 
 
@@ -193,10 +411,771 @@ def _parse_ins_obs_names(ins_path: Path) -> list[str]:
             names = pyemu.pst_utils.parse_ins_file(str(ins_path))
             if names:
                 return list(names)
-        except Exception:
+        except (ValueError, TypeError, KeyError):
             pass
     # Classic PEST format: tokens enclosed in !...!
     return re.findall(r"!([^!]+)!", text)
+
+
+def _build_model_obs_interface(model: str, ws: Path) -> tuple[list[str], dict, list[str]]:
+    """Build the obs interface from registered observation targets (7f-F1.5).
+
+    Returns ``(instruction_file_paths, obs_data, output_files)`` for use by
+    ``setup_pest_control(obs_source="model")``.  The generated instruction
+    file is a pyemu pif that reads the model's obs CSV (first data row — the
+    single row for the steady-state models this is aimed at); each site's
+    observed value is the mean of its registered records.
+    """
+    import numpy as np
+
+    from groundwater_mcp.utils.model_store import read_meta
+
+    obs = read_meta(model).get("observations")
+    if not obs or not obs.get("sites"):
+        raise ValueError(
+            "obs_source='model' requires observation targets registered via "
+            "import_obs_from_csv. No 'observations' entry found in "
+            ".gwmcp_meta.json for this model."
+        )
+
+    output_csv = str(obs["output_csv"])
+    entries = list(obs["sites"])
+
+    # PEST caps observation names at 20 characters; the obs CSV columns are
+    # the (up to 40-char) OBS package names, so tokens are read positionally.
+    names: list[str] = []
+    for entry in entries:
+        name = str(entry["site"])[:20]
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError(
+            "Obs names collide after truncation to 20 characters (PEST "
+            "obsnme limit). Use shorter, distinct site names."
+        )
+
+    ins_path = str(ws / f"{output_csv}.ins")
+    _impl_generate_ins_from_obs_csv(str(ws / output_csv), ins_path=ins_path, obs_names=names)
+
+    obs_data = {
+        name: {
+            "obsval": float(np.mean([float(v) for v in entry["values"]])),
+            "weight": 1.0,
+            "obgnme": str(obs.get("type", "HEAD")).lower() + "_obs",
+        }
+        for name, entry in zip(names, entries)
+    }
+    return [str(ins_path)], obs_data, [output_csv]
+
+
+# ---------------------------------------------------------------------------
+# H3 — cheap sensitivity screen (7f-H3)
+# ---------------------------------------------------------------------------
+
+_SENSITIVITY_TOLERANCE = 1e-3
+
+
+def _tpl_substitute(tpl: Path, target: Path, values: dict[str, float]) -> None:
+    """Write the model-input file for *values* from a template, preserving
+    token widths so fixed-width files stay valid. The template header line
+    (``ptf ~``) and the token markers are not part of the model input file."""
+    lines = tpl.read_text().splitlines()
+    marker = lines[0].split()[1]
+    out = []
+    for line in lines[1:]:
+        new = line
+        for name, value in values.items():
+            pat = re.compile(
+                re.escape(marker) + r"\s*" + re.escape(name) + r"\s*" + re.escape(marker)
+            )
+            m = pat.search(new)
+            if m:
+                token = m.group(0)
+                inner_len = len(token) - 2 * len(marker)
+                inner = f"{value!s}".center(inner_len)
+                new = new[: m.start()] + inner + new[m.end():]
+        out.append(new)
+    target.write_text("\n".join(out) + "\n")
+
+
+def _impl_check_parameter_sensitivity(
+    model: str,
+    parameters: dict[str, float],
+    template_files: list[str],
+    delta: float = 0.1,
+) -> dict:
+    """Cheap n+1 forward-run sensitivity screen (7f-H3.1).
+
+    ``parameters`` maps parameter name → base value (one entry per template).
+    Each template's target file must be one the model actually reads (e.g. an
+    NPF ``k`` array via ``OPEN/CLOSE hk.dat`` with template ``hk.dat.tpl``).
+    Runs the base model, then each parameter at ``base * (1 + delta)``, and
+    reports per-parameter sensitivity = mean relative change of the simulated
+    observation set.
+    """
+    from groundwater_mcp.tools.postprocess import _read_simulated_observations_values
+    from groundwater_mcp.tools.runner import _impl_run_simulation
+
+    ws = resolve_workspace(model)
+    if len(parameters) != len(template_files):
+        raise ValueError("len(parameters) must equal len(template_files).")
+
+    tpl_targets: list[tuple[Path, Path]] = []
+    for tpl_name in template_files:
+        tpl = Path(tpl_name) if Path(tpl_name).is_absolute() else ws / tpl_name
+        if not tpl.exists():
+            raise FileNotFoundError(f"Template file not found: {tpl}")
+        first = tpl.read_text().splitlines()[0].strip().lower()
+        if not first.startswith(("ptf", "jtf")):
+            raise ValueError(f"Template file must start with [ptf,jtf]: {tpl}")
+        names = pyemu.pst_utils.parse_tpl_file(str(tpl))
+        if not set(names).issubset(parameters):
+            raise ValueError(
+                f"Template {tpl.name} defines tokens {list(names)}; expected "
+                f"subset of parameters {list(parameters)}."
+            )
+        tpl_targets.append((tpl, tpl.with_suffix("")))
+
+    base_run = _impl_run_simulation(model, silent=True)
+    if not base_run["success"]:
+        return _err(
+            "CONVERGENCE_FAILED",
+            "Base run failed before the sensitivity analysis.",
+            "Check the model converges first (run_simulation).",
+        )
+    base_sim, _, _ = _read_simulated_observations_values(model)
+    base_values = {k: v for k, v in base_sim.items() if v is not None and abs(v) > 1e-12}
+    if not base_values:
+        return _err(
+            "MODEL_HAS_NO_OBSERVATIONS",
+            "No simulated observation values to measure sensitivity against. "
+            "Register observations with import_obs_from_csv and re-run.",
+        )
+
+    results: dict = {}
+    for (tpl, target), (name, base_value) in zip(tpl_targets, parameters.items()):
+        original = target.read_bytes() if target.exists() else None
+        _tpl_substitute(tpl, target, {name: base_value * (1.0 + delta)})
+        try:
+            run = _impl_run_simulation(model, silent=True)
+        finally:
+            if original is not None:
+                target.write_bytes(original)
+            flush_model(model)
+        if not run["success"]:
+            results[name] = {"sensitivity": None, "run_succeeded": False}
+            continue
+        sim, _, _ = _read_simulated_observations_values(model)
+        rel = [
+            abs(sim[site] - base) / base
+            for site, base in base_values.items()
+            if site in sim and sim[site] is not None
+        ]
+        results[name] = {
+            "sensitivity": float(np.mean(rel)) if rel else None,
+            "run_succeeded": True,
+        }
+
+    # Persist the sensitivity results so setup_pest_control can warn on
+    # insensitive parameters (7f-H3.2).
+    meta = read_meta(model)
+    meta["sensitivity"] = {
+        "delta": delta,
+        "parameters": results,
+        "insensitive": [
+            k for k, r in results.items()
+            if r.get("sensitivity") is not None
+            and r["sensitivity"] < _SENSITIVITY_TOLERANCE
+        ],
+    }
+    write_meta(model, meta)
+
+    return {
+        "model": model,
+        "delta": delta,
+        "n_forward_runs": len(parameters) + 1,
+        "parameters": results,
+    }
+
+
+def _choose_method(
+    n_adjustable: int, n_observations: int, time_budget_minutes: float
+) -> tuple[str, str]:
+    """Choose GLM vs IES for a calibration problem (7f-H4.1).
+
+    IES (iterative ensemble smoother) handles many adjustable parameters
+    cheaply per run; GLM (gradient-based) is the best small-problem default.
+    """
+    if n_adjustable > 50:
+        return "ies", (
+            f"{n_adjustable} adjustable parameters > 50 — IES handles high-"
+            "dimensional problems without a Jacobian."
+        )
+    if time_budget_minutes < 5:
+        return "glm", (
+            f"time_budget of {time_budget_minutes:.0f} min is tight — GLM is "
+            "the fastest single-start option for this small problem."
+        )
+    return "glm", (
+        f"{n_adjustable} adjustable parameters and {n_observations} observations "
+        "— GLM (gradient-based) is appropriate for this size."
+    )
+
+
+def _impl_calibrate(
+    model: str,
+    par_data: dict,
+    template_files: list[str],
+    time_budget_minutes: float = 30.0,
+    noptmax: int = 10,
+    num_reals: int = 50,
+) -> dict:
+    """Choose and run the calibration method (7f-H4.1).
+
+    Builds the PEST interface from the registered observation targets
+    (``obs_source="model"``), chooses GLM vs IES from the problem size and
+    time budget, and runs the chosen engine.
+    """
+    obs_meta = read_meta(model).get("observations")
+    n_obs = len(obs_meta.get("sites", [])) if obs_meta else 0
+    n_adjustable = sum(
+        1 for attrs in par_data.values()
+        if str(attrs.get("partrans", "log")).lower() != "fixed"
+    )
+    method, rationale = _choose_method(n_adjustable, n_obs, time_budget_minutes)
+
+    setup = _impl_setup_pest_control(
+        model=model,
+        obs_data={},
+        par_data=par_data,
+        template_files=template_files,
+        instruction_files=[],
+        obs_source="model",
+        pestpp_options={"noptmax": int(noptmax)},
+    )
+    if setup.get("error"):
+        return setup
+    pst_file = setup["pst_file"]
+
+    if method == "glm":
+        result = _impl_run_pestpp_glm(model, pst_file, num_workers=1)
+    else:
+        result = _impl_run_pestpp_ies(model, pst_file, num_reals=num_reals, num_workers=1)
+
+    result["method"] = method
+    result["rationale"] = rationale
+    result["n_adjustable_parameters"] = n_adjustable
+    result["n_observations"] = n_obs
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 7e-A2 — automated calibration setup (setup_calibration)
+# ---------------------------------------------------------------------------
+
+
+def _impl_rewire_npf_k_external(model: str, filename: str | None = None) -> dict:
+    """Rewrite the NPF package so ``k`` is read via ``OPEN/CLOSE <file>``.
+
+    The current ``k`` array is written to the external file (flopy handles the
+    on-disk write) so a PEST template can target it. The model runs unchanged
+    afterwards — the array values are identical, only their storage moved.
+
+    Parameters
+    ----------
+    model:
+        Registered model name.
+    filename:
+        External-array filename (relative to the workspace). Defaults to
+        ``<gwf_name>_k.dat``.
+
+    Returns
+    -------
+    dict
+        ``{model, package, keyword, external_file, written}``.
+    """
+    gwf = get_gwf(model)
+    npf = gwf.get_package("npf")
+    if npf is None:
+        raise ValueError(
+            "No NPF package found; run add_npf_package before rewiring k to "
+            "an external array."
+        )
+    filename = filename or f"{gwf.name}_k.dat"
+    k_arr = np.asarray(npf.k.array)
+    npf.k.set_data({"filename": filename, "data": k_arr})
+    sim = gwf.simulation
+    save_sim(model, sim)
+    flush_model(model)
+    return {
+        "model": model,
+        "package": "NPF",
+        "keyword": "k",
+        "external_file": filename,
+        "written": True,
+    }
+
+
+_SUPPORTED_TARGETS = ("npf:k",)
+_TPL_TOKEN_WIDTH = 15
+
+
+def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
+    """Validate and normalise a ``setup_calibration`` parameterisation spec.
+
+    A parameterisation maps parameter name → spec dict::
+
+        {
+            "target": "npf:k",              # model array to parameterise
+            "scope": "all" | "layer" | "cells",
+            "layer": 0,                      # required when scope == "layer"
+            "cells": [[0, 0, 0], ...],       # required when scope == "cells"
+            "initial": 5.0,                  # base value (required, > 0)
+            "lower_factor": 0.1,             # bound = initial * factor
+            "upper_factor": 10.0,
+            "partrans": "log",               # default "log"
+        }
+
+    Returns the grid info plus per-parameter resolved cell indices::
+
+        {
+            "grid": {"type": "DIS"|"DISV", "nlay": ..., "nrow": ...,
+                     "ncol": ..., "ncpl": ..., "ncell": ...},
+            "cell_to_flat": callable,
+            "parameters": [{name, target, scope, layer, cells (flat list),
+                            initial, lower_bound, upper_bound, partrans}],
+            "cell_param": {flat_index: name},
+        }
+    """
+    if not parameterisation:
+        raise ValueError("parameterisation must name at least one parameter.")
+    gwf = get_gwf(model)
+    dis = gwf.get_package("dis")
+    disv = gwf.get_package("disv")
+    if dis is not None:
+        nlay, nrow, ncol = (
+            int(dis.nlay.data),
+            int(dis.nrow.data),
+            int(dis.ncol.data),
+        )
+        ncell = nlay * nrow * ncol
+
+        def cell_to_flat(cell) -> int:
+            if len(cell) != 3:
+                raise ValueError(
+                    f"Cell {cell} must be [layer, row, col] on a DIS grid."
+                )
+            lay, r, c = (int(v) for v in cell)
+            if not (0 <= lay < nlay and 0 <= r < nrow and 0 <= c < ncol):
+                raise ValueError(
+                    f"Cell {cell} out of bounds on a {nlay}x{nrow}x{ncol} grid."
+                )
+            return lay * (nrow * ncol) + r * ncol + c
+
+        grid = {"type": "DIS", "nlay": nlay, "nrow": nrow, "ncol": ncol, "ncell": ncell}
+    elif disv is not None:
+        nlay, ncpl = int(disv.nlay.data), int(disv.ncpl.data)
+        ncell = nlay * ncpl
+
+        def cell_to_flat(cell) -> int:
+            if len(cell) != 2:
+                raise ValueError(
+                    f"Cell {cell} must be [layer, node] on a DISV grid."
+                )
+            lay, node = (int(v) for v in cell)
+            if not (0 <= lay < nlay and 0 <= node < ncpl):
+                raise ValueError(
+                    f"Cell {cell} out of bounds on a {nlay}x{ncpl} DISV grid."
+                )
+            return lay * ncpl + node
+
+        grid = {"type": "DISV", "nlay": nlay, "ncpl": ncpl, "ncell": ncell}
+    else:
+        raise ValueError("No grid package (DIS/DISV) found on the model.")
+
+    params: list[dict] = []
+    for name, spec in parameterisation.items():
+        name = str(name)
+        if len(name) > 12:
+            raise ValueError(
+                f"Parameter name '{name}' is {len(name)} characters; PEST caps "
+                "parameter names at 12 characters. Use a shorter name."
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{name}' must be a spec dict.")
+        target = spec.get("target")
+        if target not in _SUPPORTED_TARGETS:
+            raise ValueError(
+                f"Unsupported parameterisation target '{target}'. Supported: "
+                f"{list(_SUPPORTED_TARGETS)}."
+            )
+        scope = spec.get("scope", "all")
+        if scope not in ("all", "layer", "cells"):
+            raise ValueError(
+                f"scope must be 'all', 'layer' or 'cells', got '{scope}'."
+            )
+        if "initial" not in spec:
+            raise ValueError(f"Parameter '{name}' is missing required 'initial'.")
+        initial = float(spec["initial"])
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"Parameter '{name}' initial must be a positive number.")
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{name}': lower_factor must be < 1 and upper_factor > 1."
+            )
+
+        cells: list[int] = []
+        if scope == "all":
+            cells = list(range(ncell))
+        elif scope == "layer":
+            layer = spec.get("layer")
+            if layer is None:
+                raise ValueError(f"Parameter '{name}' scope=layer requires 'layer'.")
+            layer = int(layer)
+            if not (0 <= layer < nlay):
+                raise ValueError(
+                    f"Parameter '{name}' layer {layer} out of range (nlay={nlay})."
+                )
+            per_layer = ncell // nlay
+            cells = list(range(layer * per_layer, (layer + 1) * per_layer))
+        else:  # scope == "cells"
+            raw_cells = spec.get("cells")
+            if not raw_cells:
+                raise ValueError(f"Parameter '{name}' scope=cells requires 'cells'.")
+            cells = [cell_to_flat(c) for c in raw_cells]
+
+        params.append({
+            "name": name,
+            "target": target,
+            "scope": scope,
+            "layer": spec.get("layer"),
+            "cells": cells,
+            "initial": initial,
+            "lower_bound": initial * lower_factor,
+            "upper_bound": initial * upper_factor,
+            "partrans": str(spec.get("partrans", "log")).lower(),
+        })
+
+    # Assign cells to parameters; every cell must be claimed exactly once.
+    cell_param: dict[int, str] = {}
+    for p in params:
+        for idx in p["cells"]:
+            if idx in cell_param:
+                raise ValueError(
+                    f"Cell {idx} is claimed by both '{cell_param[idx]}' and "
+                    f"'{p['name']}' — parameter scopes must not overlap."
+                )
+            cell_param[idx] = p["name"]
+    if len(cell_param) != ncell:
+        raise ValueError(
+            f"Parameterisation covers {len(cell_param)} of {ncell} cells; "
+            f"{ncell - len(cell_param)} cells are unassigned. Add a parameter "
+            "with scope='all' (or cover every cell) so the template can be "
+            "written for the whole array."
+        )
+
+    return {
+        "grid": grid,
+        "cell_to_flat": cell_to_flat,
+        "parameters": params,
+        "cell_param": cell_param,
+    }
+
+
+def _impl_generate_tpl(
+    model: str, parameterisation: dict, target_file: str | None = None
+) -> dict:
+    """Generate a PEST template for the parameterised cells (7e-A2.2).
+
+    One wide fixed-width token per array cell in the external file's layout
+    (layer-major, then row/node-major), each referencing the parameter that
+    owns the cell. The template is written as ``<target_file>.tpl`` so the
+    ``.tpl``-stripped name is the file the model actually reads.
+
+    Returns ``{tpl_path, target, parameters}``.
+    """
+    ws = resolve_workspace(model)
+    norm = _normalise_parameterisation(model, parameterisation)
+    gwf = get_gwf(model)
+
+    if target_file is None:
+        target_file = f"{gwf.name}_k.dat"
+    tpl_path = ws / f"{target_file}.tpl"
+
+    order: dict[int, str] = {}
+    for idx in range(norm["grid"]["ncell"]):
+        order[idx] = norm["cell_param"][idx]
+    lines = ["ptf ~"]
+    for idx in range(norm["grid"]["ncell"]):
+        name = order[idx]
+        lines.append("~" + f"{name:^{_TPL_TOKEN_WIDTH}s}" + "~")
+    tpl_path.write_text("\n".join(lines) + "\n")
+
+    return {
+        "tpl_path": str(tpl_path),
+        "target": str(ws / target_file),
+        "parameters": norm["parameters"],
+    }
+
+
+def _impl_generate_ins_from_obs_csv(
+    csv_path: str, ins_path: str | None = None, obs_names: list[str] | None = None
+) -> dict:
+    """Generate a canonical pyemu pif instruction file from an OBS CSV (7e-A2.3).
+
+    The MF6 OBS continuous CSV has a ``time`` column followed by one column
+    per observation site. The generated pif skips the header row and the
+    ``time`` token, then reads each site's value::
+
+        pif ~
+        l1
+        l1 ~,~ !S01! !S02! ...
+
+    When ``obs_names`` is given (e.g. the obs CSV does not exist yet because
+    the model has not run), the header is not read; names are taken verbatim.
+    Names are truncated to PEST's 20-character obsnme cap; a collision after
+    truncation is a hard error.
+
+    Returns ``{ins_path, obs_names}``.
+    """
+    if obs_names is None:
+        p = Path(csv_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Observation CSV not found: {csv_path}")
+        cols = list(pd.read_csv(p, nrows=0).columns)
+        obs_names = [str(c)[:20] for c in cols if str(c) != "time"]
+    if not obs_names:
+        raise ValueError(f"No observation columns found in {csv_path}.")
+    if len(set(obs_names)) != len(obs_names):
+        raise ValueError(
+            "Observation names collide after truncation to 20 characters "
+            "(PEST obsnme limit). Use shorter, distinct site names."
+        )
+    if ins_path is None:
+        ins_path = f"{csv_path}.ins"
+    lines = [
+        "pif ~",
+        "l1",
+        "l1 " + "".join(f"~,~   !{n}!  " for n in obs_names).strip(),
+    ]
+    Path(ins_path).write_text("\n".join(lines) + "\n")
+    return {"ins_path": ins_path, "obs_names": obs_names}
+
+
+def _generate_forward_wrapper(model: str) -> dict:
+    """Generate a Python forward-run wrapper at a space-free path (7e-A2.4).
+
+    PEST++ on Windows cannot execute ``.bat``/``.cmd`` wrappers (it hangs
+    normalising ``cmd /c``) and cannot launch executables whose path contains
+    spaces. This helper emits a plain ``.py`` wrapper — placed at a path with
+    no spaces, in the workspace when the workspace path is space-free and in a
+    space-free system directory otherwise — that runs MODFLOW 6 in the model
+    workspace (the OBS package writes the observations CSV as part of the
+    run). The returned ``model_command`` references the wrapper via the quoted
+    current Python executable.
+
+    Returns ``{wrapper_path, model_command}`` where ``model_command`` is a
+    one-element list suitable for ``pst.model_command``.
+    """
+    ws = resolve_workspace(model)
+    # The wrapper runs the model, so the current in-memory input set must be
+    # on disk first (deferred writes, 7f-E1.2).
+    flush_model(model)
+    try:
+        mf6_exe = _find_mf6_binary()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc} The forward-model wrapper needs the MODFLOW 6 binary; "
+            "install it with: get-modflow :"
+        ) from exc
+
+    wrapper_name = f"gwmcp_run_{model}.py"
+    if " " not in str(ws):
+        wrapper_path = ws / wrapper_name
+    else:
+        candidates = [Path(tempfile.gettempdir()), Path.home()]
+        space_free = next((c for c in candidates if " " not in str(c)), None)
+        if space_free is None:
+            raise RuntimeError(
+                "No space-free directory found for the forward-model wrapper. "
+                "PEST++ on Windows cannot launch executables whose path "
+                "contains spaces; set the workspace at a path without spaces "
+                "or set TMP to a space-free location."
+            )
+        wrapper_path = space_free / wrapper_name
+
+    wrapper_path.write_text(
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        f"\nWS = {str(ws)!r}\n"
+        f"MF6 = {mf6_exe!r}\n"
+        "\n"
+        "os.chdir(WS)\n"
+        "proc = subprocess.run([MF6], cwd=WS)\n"
+        "sys.exit(proc.returncode)\n"
+    )
+
+    # pestpp runs the model command with cwd = the model workspace; reference
+    # the wrapper by relative name when it lives there, absolute otherwise.
+    cmd_target = wrapper_path.name if wrapper_path.parent == ws else str(wrapper_path)
+    model_command = [f'"{sys.executable}" {cmd_target}']
+    return {"wrapper_path": str(wrapper_path), "model_command": model_command}
+
+
+def _needs_forward_wrapper(model: str) -> bool:
+    """True when the default model command (the MF6 binary directly) cannot
+    be launched by pestpp — the workspace or the binary path contains spaces."""
+    if " " in str(resolve_workspace(model)):
+        return True
+    try:
+        return " " in _find_mf6_binary()
+    except RuntimeError:
+        return False
+
+
+def _impl_setup_calibration(
+    model: str,
+    parameterisation: dict,
+    obs_source: str = "model",
+    noptmax: int = 10,
+) -> dict:
+    """Automated calibration setup (7e-A2): emit the whole PEST interface.
+
+    One call generates every file the calibration chain needs, with zero
+    hand-authored artifacts:
+
+    1.  NPF ``k`` is rewired to an external array (``OPEN/CLOSE <file>``) so a
+        template can target it (A2.1).
+    2.  A template with wide fixed-width tokens (>= 15 chars) is generated over
+        the parameterised cells — scope ``all``, ``layer`` or ``cells`` (zones)
+        (A2.2).
+    3.  The instruction file is generated from the model's OBS CSV header
+        (A2.3).
+    4.  When the default forward command would be unsafe on Windows (spaces in
+        the workspace or the MF6 binary path), a Python wrapper is written at a
+        space-free path (A2.4).
+    5.  The ``.pst`` is assembled with safe numeric defaults: ``derinclb > 0``
+        on every parameter group and default bounds base/10–base×10 (A2.5).
+
+    ``parameterisation`` maps parameter name → spec dict:
+
+    ``{"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}``
+    (scope may be ``"all"``, ``"layer"`` with ``layer``, or ``"cells"`` with
+    ``cells`` as a list of ``[layer, row, col]`` — DIS — or ``[layer, node]``
+    — DISV. ``lower_factor``/``upper_factor`` default 0.1/10.0 and set the
+    bounds from ``initial``; ``partrans`` defaults to ``"log"``.)
+
+    ``obs_source`` must be ``"model"`` (the default): observation targets
+    registered by ``import_obs_from_csv`` provide the observed values and the
+    instruction file reads the model's obs CSV.
+
+    The template is applied with the initial parameter values so the on-disk
+    input array matches the PST's initial state. Run the calibration with
+    ``run_pestpp_glm``/``run_pestpp_ies`` (or ``calibrate``) afterwards.
+    """
+    ws = resolve_workspace(model)
+    norm = _normalise_parameterisation(model, parameterisation)
+
+    # 1. Rewire NPF k to an external array so the template can target it.
+    ext_file = None
+    if any(p["target"] == "npf:k" for p in norm["parameters"]):
+        ext_file = _impl_rewire_npf_k_external(model)["external_file"]
+
+    # 2. Generate the wide-token template over the external array.
+    tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
+    tpl_path = Path(tpl["tpl_path"])
+
+    # 3. Observation interface from the registered targets (obs_source="model").
+    if obs_source != "model":
+        raise ValueError(
+            f"setup_calibration supports obs_source='model', got '{obs_source}'."
+        )
+    obs_meta = read_meta(model).get("observations")
+    if not obs_meta or not obs_meta.get("sites"):
+        raise ValueError(
+            "obs_source='model' requires observation targets registered via "
+            "import_obs_from_csv. No 'observations' entry found in "
+            ".gwmcp_meta.json for this model."
+        )
+    ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
+
+    # 4. Forward-model command: the wrapper only when the default MF6 command
+    #    would be unsafe on Windows.
+    wrapper = None
+    model_command = None
+    if _needs_forward_wrapper(model):
+        wrapper = _generate_forward_wrapper(model)
+        model_command = wrapper["model_command"]
+        wrapper = wrapper["wrapper_path"]
+
+    # 5. Assemble the PST with safe numeric defaults.
+    par_data: dict = {}
+    for p in norm["parameters"]:
+        par_data[p["name"]] = {
+            "parval1": p["initial"],
+            "parlbnd": p["lower_bound"],
+            "parubnd": p["upper_bound"],
+            "partrans": p["partrans"],
+            "pargp": "gwmcp",
+        }
+    pestpp_options: dict = {"noptmax": int(noptmax)}
+    if output_files:
+        pestpp_options["output_files"] = output_files
+    if model_command is not None:
+        pestpp_options["model_command"] = model_command
+    setup = _impl_setup_pest_control(
+        model=model,
+        obs_data=obs_data,
+        par_data=par_data,
+        template_files=[str(tpl_path)],
+        instruction_files=ins_paths,
+        obs_source="explicit",
+        pestpp_options=pestpp_options,
+        _suppress_command_warning=model_command is not None,
+    )
+    if setup.get("error"):
+        return setup
+
+    # Apply the template with the initial parameter values so the on-disk
+    # array matches the PST's initial state.
+    initial_values = {p["name"]: p["initial"] for p in norm["parameters"]}
+    _tpl_substitute(tpl_path, Path(tpl["target"]), initial_values)
+
+    return {
+        "model": model,
+        "pst_file": setup["pst_file"],
+        "template_file": str(tpl_path),
+        "target_file": tpl["target"],
+        "instruction_file": ins_paths[0],
+        "external_array": str(ws / ext_file) if ext_file else None,
+        "forward_wrapper": wrapper,
+        "n_observations": setup["n_observations"],
+        "n_adjustable_parameters": setup["n_adjustable_parameters"],
+        "n_total_parameters": setup["n_total_parameters"],
+        "parameters": [
+            {
+                "name": p["name"],
+                "scope": p["scope"],
+                "initial": p["initial"],
+                "lower_bound": p["lower_bound"],
+                "upper_bound": p["upper_bound"],
+                "partrans": p["partrans"],
+            }
+            for p in norm["parameters"]
+        ],
+        "model_command": setup["model_command"],
+        "next_steps": (
+            "Run the calibration with run_pestpp_glm (or run_pestpp_ies for "
+            "many parameters), then summarise_calibration."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PEST++ tool implementations
+# ---------------------------------------------------------------------------
 
 
 def _impl_setup_pest_control(
@@ -206,6 +1185,8 @@ def _impl_setup_pest_control(
     template_files: list[str],
     instruction_files: list[str],
     pestpp_options: dict | None = None,
+    obs_source: str = "explicit",
+    _suppress_command_warning: bool = False,
 ) -> dict:
     """Build and write a PEST++ control file (.pst) for the model.
 
@@ -227,13 +1208,31 @@ def _impl_setup_pest_control(
         Paths to PEST++ template files (.tpl).  Each must already exist and
         start with a ``ptf``/``jtf`` header.  The corresponding model input
         file is derived by stripping the .tpl suffix (e.g. ``params.tpl`` →
-        ``params``).
+        ``params``).  **The derived name must exactly match the file the model
+        actually reads** — e.g. an NPF ``OPEN/CLOSE hk.dat`` needs a template
+        named ``hk.dat.tpl`` so the parameterised K array is written to
+        ``hk.dat``.  If the model input file has a different name, pass it
+        explicitly via ``pestpp_options["input_files"]`` (list parallel to
+        ``template_files``).
     instruction_files:
         Paths to PEST++ instruction files (.ins).  Each must already exist.
         The corresponding model output file is derived by stripping the .ins
         suffix (e.g. ``heads.ins`` → ``heads``).  If the model output file
         has a different name, pass it via ``pestpp_options["output_files"]``
         (list parallel to ``instruction_files``).
+
+        Instruction files may use classic PEST tokens (``!name!``) or pyemu's
+        pif/jif format.  When using pif, the header must be ``pif @`` (or
+        ``jif @``) and each line follows pyemu's fixed-width reader syntax,
+        e.g. ``l1 !dum! !o0001!`` (skip the first token, read ``o0001``).
+        The ``[l1]…@o0001@`` PEST style is NOT accepted by pyemu's pif
+        parser — use ``l1 !dum! !o0001!`` instead.
+    obs_source:
+        ``"explicit"`` (default) requires ``obs_data`` + ``instruction_files``
+        to be supplied.  ``"model"`` builds both from the observation targets
+        registered by ``import_obs_from_csv`` (7f-F1.5): an instruction file
+        is generated that reads the model's obs CSV (first output row), and
+        each site's observed value is the mean of its registered records.
     pestpp_options:
         Optional PEST++ options written to the ++options section.  Special
         keys handled here (not written to ++options):
@@ -244,6 +1243,9 @@ def _impl_setup_pest_control(
         - ``"output_files"`` (list): explicit model output file names,
           parallel to ``instruction_files`` (for when the output file is not
           the instruction file with ``.ins`` stripped).
+        - ``"input_files"`` (list): explicit model input file names, parallel
+          to ``template_files`` (for when the template's target differs from
+          the ``.tpl``-stripped name — e.g. ``hk.dat.tpl`` → ``hk.dat``).
         - ``"noptmax"``: native PEST control data (not a pestpp '++' arg).
 
         On Windows, the default model command resolves the MF6 binary
@@ -252,6 +1254,19 @@ def _impl_setup_pest_control(
     """
     ws = resolve_workspace(model)
     pestpp_options = dict(pestpp_options or {})
+
+    # Flush staged model changes: pestpp invokes the forward model (MF6) which
+    # reads the on-disk input set (7f-E1.2).
+    flush_model(model)
+
+    if obs_source == "model":
+        instruction_files, obs_data, output_files = _build_model_obs_interface(model, ws)
+        if output_files:
+            pestpp_options["output_files"] = output_files
+    elif obs_source != "explicit":
+        raise ValueError(
+            f"obs_source must be 'explicit' or 'model', got '{obs_source}'."
+        )
 
     # Resolve template/instruction paths relative to the workspace
     def _resolve(p: str) -> Path:
@@ -310,6 +1325,13 @@ def _impl_setup_pest_control(
                 "len(output_files) must equal len(instruction_files)"
             )
         out_files = [Path(o).name for o in output_files]
+    input_files = pestpp_options.pop("input_files", None)
+    if input_files is not None:
+        if len(input_files) != len(tpl_paths):
+            raise ValueError(
+                "len(input_files) must equal len(template_files)"
+            )
+        in_files = [Path(f).name for f in input_files]
 
     pst.model_input_data = pd.DataFrame(
         {"pest_file": [p.name for p in tpl_paths], "model_file": in_files},
@@ -376,15 +1398,15 @@ def _impl_setup_pest_control(
             unmatched_par.append(par_name)
             continue
         canonical = par_index[key]
-        par_df.loc[canonical, "parval1"] = float(
-            attrs.get("parval1", attrs.get("initial_value", 1.0))
-        )
-        par_df.loc[canonical, "parlbnd"] = float(
-            attrs.get("parlbnd", attrs.get("lower_bound", 0.01))
-        )
-        par_df.loc[canonical, "parubnd"] = float(
-            attrs.get("parubnd", attrs.get("upper_bound", 100.0))
-        )
+        parval1 = float(attrs.get("parval1", attrs.get("initial_value", 1.0)))
+        # Safe numeric defaults (7e-A2.5): base/10–base×10 rather than the
+        # old blanket 0.01–100, which stressed the Newton solve on real models
+        # (zenodo run 1) when the base was far from 1.
+        parlbnd = float(attrs.get("parlbnd", attrs.get("lower_bound", parval1 / 10.0)))
+        parubnd = float(attrs.get("parubnd", attrs.get("upper_bound", parval1 * 10.0)))
+        par_df.loc[canonical, "parval1"] = parval1
+        par_df.loc[canonical, "parlbnd"] = parlbnd
+        par_df.loc[canonical, "parubnd"] = parubnd
         if "pargp" in attrs:
             par_df.loc[canonical, "pargp"] = str(attrs["pargp"])
         if "partrans" in attrs:
@@ -407,12 +1429,20 @@ def _impl_setup_pest_control(
         else:
             pst.pestpp_options[key] = val
 
+    # Safe numeric defaults (7e-A2.5): derinclb defaults to 0.0 in pyemu's
+    # generic_pst, which makes pestpp compute a zero relative derivative
+    # increment (zero Jacobian) — the Mode B rerun-4 "calibration doesn't
+    # work" bug. rectify_pgroups first so newly-added groups (e.g. a custom
+    # pargp in par_data) exist, then set a nonzero increment on every group.
+    pst.rectify_pgroups()
+    pst.parameter_groups["derinclb"] = 0.01
+
     pst_path = ws / f"{model}.pst"
     pst.write(str(pst_path))
 
     n_adjustable = int((par_df["partrans"] != "fixed").sum())
 
-    return {
+    result: dict = {
         "model": model,
         "pst_file": str(pst_path),
         "n_observations": len(obs_df),
@@ -421,6 +1451,47 @@ def _impl_setup_pest_control(
         "n_total_parameters": len(par_df),
         "model_command": list(pst.model_command),
     }
+
+    # Warn on insensitive parameters when a sensitivity screen has run (7f-H3.2).
+    sens_meta = read_meta(model).get("sensitivity")
+    if sens_meta:
+        insensitive = set(sens_meta.get("insensitive", []))
+        matching = insensitive & set(par_df.index)
+        if matching:
+            result["warning"] = (
+                "Parameter(s) flagged insensitive by check_parameter_sensitivity "
+                f"(relative head change < {_SENSITIVITY_TOLERANCE}): "
+                f"{sorted(matching)}. Calibration may not constrain them."
+            )
+
+    # Windows forward-command guidance: pestpp cannot execute .bat/.cmd
+    # wrappers (it normalises /c → \\c and the process hangs) and cannot
+    # launch executables whose path contains spaces (GetExitCodeProcess
+    # failure). Surface a warning so the agent fixes the command before a
+    # confusing runtime failure. setup_calibration generates a known-good
+    # command itself, so it suppresses this advisory.
+    if platform.system() == "Windows" and not _suppress_command_warning:
+        for tok in pst.model_command or []:
+            lower = tok.lower()
+            if lower.endswith((".bat", ".cmd")):
+                result["warning"] = (
+                    "model_command points at a .bat/.cmd wrapper, which pestpp "
+                    "cannot execute on Windows (it hangs normalising 'cmd /c'). "
+                    "Use a direct executable or a space-free Python wrapper "
+                    "script, e.g. a copy of the wrapper at a path without spaces."
+                )
+                break
+            first = lower.split()[0].strip('"')
+            if " " in first:
+                result["warning"] = (
+                    "model_command contains a space in the executable path, "
+                    "which pestpp on Windows cannot launch (GetExitCodeProcess "
+                    "fails on quoted space paths). Copy the wrapper/executable "
+                    "to a space-free path and reference that."
+                )
+                break
+
+    return result
 
 
 def _impl_run_pestpp_glm(
@@ -444,6 +1515,10 @@ def _impl_run_pestpp_glm(
     ws = resolve_workspace(model)
     pst_path = _resolve_pst_path(model, pst_file)
 
+    # Flush staged model changes so the forward model reads the current input
+    # set (7f-E1.2).
+    flush_model(model)
+
     result = subprocess.run(
         [exe, pst_path.name],
         cwd=str(ws),
@@ -452,8 +1527,9 @@ def _impl_run_pestpp_glm(
     )
 
     base_name = pst_path.stem
-    phi_csv = ws / f"{base_name}.phi.actual.csv"
-    phi_progress, final_phi = _read_phi_csv(phi_csv) if phi_csv.exists() else ([], None)
+    # GLM writes its iteration history to <case>.iobj, not .phi.actual.csv
+    # (7e-B1.1); reading the wrong file silently empties phi_progress.
+    phi_progress, final_phi = _read_glm_phi(ws, base_name)
     iterations = len(phi_progress)
 
     converged = result.returncode == 0
@@ -491,6 +1567,10 @@ def _impl_run_pestpp_ies(
     exe = _find_pestpp_binary("pestpp-ies")
     ws = resolve_workspace(model)
     pst_path = _resolve_pst_path(model, pst_file)
+
+    # Flush staged model changes so the forward model reads the current input
+    # set (7f-E1.2).
+    flush_model(model)
 
     # Inject num_reals into the PST before running
     pst = pyemu.Pst(str(pst_path))
@@ -534,11 +1614,24 @@ def _impl_run_pestpp_ies(
     }
 
 
-def _impl_summarise_calibration(model: str, pst_file: str) -> dict:
+def _impl_summarise_calibration(
+    model: str,
+    pst_file: str,
+    measurement_error: float | None = None,
+    max_residuals: int = 500,
+) -> dict:
     """Summarise PEST++ calibration results.
 
     Reads the phi progress CSV, the optimal parameter file (.par), and the
-    residuals file (.rei) from the workspace.  Computes RMSE, bias, and R².
+    residuals file (.rei) from the workspace.  Computes RMSE, bias, and R²,
+    plus a calibration verdict (7f-H4.2): whether phi improved versus the
+    previous run, which parameters sit at their bounds, which parameters are
+    identifiable (from check_parameter_sensitivity), and whether the fit is
+    within a supplied measurement_error.
+
+    ``residuals`` is capped at ``max_residuals`` (default 500, 7e-A1.6); the
+    full residual table is always written to ``<model>_residuals.csv`` and
+    ``residual_statistics`` is computed over ALL observations.
 
     Parameters
     ----------
@@ -546,6 +1639,11 @@ def _impl_summarise_calibration(model: str, pst_file: str) -> dict:
         Registered model name.
     pst_file:
         Path to the PST control file used for the calibration run.
+    measurement_error:
+        Optional observation uncertainty (same units as heads); the verdict's
+        ``fit_within_measurement_error`` is ``rmse <= measurement_error``.
+    max_residuals:
+        Cap on the ``residuals`` list returned in the response.
     """
     ws = resolve_workspace(model)
     pst_path = _resolve_pst_path(model, pst_file)
@@ -555,10 +1653,14 @@ def _impl_summarise_calibration(model: str, pst_file: str) -> dict:
     base_name = pst_path.stem
 
     # --- Phi progress ---
-    phi_csv = ws / f"{base_name}.phi.actual.csv"
-    phi_progress, _ = _read_phi_csv(phi_csv) if phi_csv.exists() else ([], None)
+    # GLM writes <case>.iobj, IES writes <case>.phi.actual.csv (7e-B1.2).
+    phi_progress, _ = _read_glm_phi(ws, base_name)
 
     # --- Residuals ---
+    # A missing .rei means the PEST++ run died before writing residuals — the
+    # old behaviour silently reported `rmse: None, n_observations: 0` as a
+    # *success*, which an agent reads as "ran, zero observations" rather than
+    # "died before residuals". Fail loudly instead (7e-B2).
     residual_stats: dict = {
         "rmse": None,
         "bias": None,
@@ -567,18 +1669,27 @@ def _impl_summarise_calibration(model: str, pst_file: str) -> dict:
     }
     residuals: list[dict] = []
 
-    try:
-        res_df = pst.res  # reads {base}.rei automatically
-        if res_df is not None:
-            residual_stats = _compute_residual_stats(res_df)
-            residuals = (
-                res_df[["name", "measured", "modelled", "residual", "weight"]]
-                .rename(columns={"name": "obs_name"})
-                .astype({"measured": float, "modelled": float, "residual": float, "weight": float})
-                .to_dict("records")
-            )
-    except Exception:
-        pass
+    rei_candidates = [
+        ws / f"{base_name}.res",
+        ws / f"{base_name}.rei",
+        ws / f"{base_name}.base.rei",
+    ]
+    if not any(p.exists() for p in rei_candidates):
+        raise FileNotFoundError(
+            f"No residual file ({base_name}.res / .rei / .base.rei) found in "
+            f"{ws}. The PEST++ run died before writing residuals — check the "
+            "run log (the .pst stdout/stderr) for convergence or parameter-"
+            "bound issues, then re-run the calibration."
+        )
+    res_df = pst.res  # reads {base}.res/.rei automatically
+    if res_df is not None:
+        residual_stats = _compute_residual_stats(res_df)
+        residuals = (
+            res_df[["name", "measured", "modelled", "residual", "weight"]]
+            .rename(columns={"name": "obs_name"})
+            .astype({"measured": float, "modelled": float, "residual": float, "weight": float})
+            .to_dict("records")
+        )
 
     # --- Parameter estimates ---
     par_file = ws / f"{base_name}.par"
@@ -599,13 +1710,70 @@ def _impl_summarise_calibration(model: str, pst_file: str) -> dict:
             }
         )
 
+    # --- Verdict, not just numbers (7f-H4.2) ---
+    final_phi = phi_progress[-1]["phi"] if phi_progress else None
+    meta = read_meta(model)
+    prior_phi = (meta.get("calibration") or {}).get("last_phi")
+    improved = None
+    if final_phi is not None:
+        improved = prior_phi is None or final_phi < prior_phi
+
+    parameters_at_bounds: list[str] = []
+    for est in par_estimates:
+        est_val = est["estimated_value"]
+        if est_val is None:
+            continue
+        rng = est["upper_bound"] - est["lower_bound"]
+        if rng <= 0:
+            continue
+        tol = 0.01 * rng
+        if abs(est_val - est["lower_bound"]) <= tol or abs(est_val - est["upper_bound"]) <= tol:
+            parameters_at_bounds.append(est["name"])
+
+    sensitivity = meta.get("sensitivity")
+    if sensitivity:
+        identifiable = [
+            p for p in par_df.index
+            if p not in set(sensitivity.get("insensitive", []))
+        ]
+    else:
+        identifiable = None
+
+    fit_within_measurement_error = None
+    if measurement_error is not None and residual_stats.get("rmse") is not None:
+        fit_within_measurement_error = residual_stats["rmse"] <= measurement_error
+
+    verdict = {
+        "improved": improved,
+        "final_phi": final_phi,
+        "prior_phi": prior_phi,
+        "parameters_at_bounds": parameters_at_bounds,
+        "identifiable": identifiable,
+        "fit_within_measurement_error": fit_within_measurement_error,
+    }
+
+    # Record phi so the next run can report whether it improved.
+    if final_phi is not None:
+        meta.setdefault("calibration", {})["last_phi"] = final_phi
+        write_meta(model, meta)
+
+    # Residuals are capped in the response; the full table goes to a CSV and
+    # residual_statistics is always computed over all observations (7e-A1.6).
+    residuals_csv = ws / f"{model}_residuals.csv"
+    if residuals:
+        pd.DataFrame(residuals).to_csv(residuals_csv, index=False)
+    capped_residuals = residuals[:max_residuals]
+
     return {
         "model": model,
         "pst_file": str(pst_path),
         "phi_progress": phi_progress,
         "parameter_estimates": par_estimates,
         "residual_statistics": residual_stats,
-        "residuals": residuals,
+        "residuals": capped_residuals,
+        "residuals_csv": str(residuals_csv),
+        "n_residuals_total": len(residuals),
+        "verdict": verdict,
     }
 
 
@@ -679,9 +1847,58 @@ def _impl_run_ies_uncertainty(
 
 
 def register(mcp: FastMCP) -> None:
-    """Register calibration tools (PEST++ and UCODE) with the MCP server."""
+    """Register calibration tools (PEST++) with the MCP server."""
 
     # --- PEST++ tools ---
+
+    @mcp.tool()
+    def setup_calibration(
+        model: str,
+        parameterisation: dict,
+        obs_source: str = "model",
+        noptmax: int = 10,
+    ) -> dict:
+        """Automated calibration setup (7e-A2): generate the whole PEST interface
+        with zero hand-written files.
+
+        parameterisation maps a parameter name to a spec dict:
+
+          {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+
+        scope is "all" (whole array), "layer" (with "layer": N), or "cells"
+        (with "cells": [[layer,row,col], ...] — DIS — or [[layer,node], ...]
+        — DISV). Optional keys: lower_factor/upper_factor (default 0.1/10.0)
+        set the bounds from initial; partrans defaults to "log". Parameter
+        names are capped at 12 characters (PEST).
+
+        This call: (1) rewires NPF k to an external OPEN/CLOSE array,
+        (2) generates a wide-token template (>= 15 chars) over the
+        parameterised cells, (3) generates the instruction file from the
+        model's OBS CSV header, (4) writes a Python forward wrapper at a
+        space-free path when the default MF6 command would be unsafe on
+        Windows, and (5) assembles the .pst with safe numeric defaults
+        (derinclb > 0, bounds base/10–base×10).
+
+        obs_source must be "model": observation targets registered via
+        import_obs_from_csv provide the observed values and the instruction
+        file reads the model's obs CSV. Run the calibration afterwards with
+        run_pestpp_glm / run_pestpp_ies (or calibrate), then
+        summarise_calibration."""
+        try:
+            return _impl_setup_calibration(model, parameterisation, obs_source, noptmax)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "MODFLOW 6" in msg or "binary" in msg.lower():
+                return _err(
+                    "BINARY_NOT_FOUND", msg, "Install MODFLOW 6 with: get-modflow :"
+                )
+            return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
 
     @mcp.tool()
     def setup_pest_control(
@@ -691,6 +1908,7 @@ def register(mcp: FastMCP) -> None:
         template_files: list[str],
         instruction_files: list[str],
         pestpp_options: dict | None = None,
+        obs_source: str = "explicit",
     ) -> dict:
         """Generate a PEST++ control file (.pst) for the model.
 
@@ -704,15 +1922,42 @@ def register(mcp: FastMCP) -> None:
         match those tokens exactly (case-insensitive); a mismatch raises an
         error instead of silently dropping observations.
 
+        obs_source: "explicit" (default) requires obs_data + instruction_files.
+        "model" builds both from the observation targets registered by
+        import_obs_from_csv (7f-F1.5): an instruction file is generated that
+        reads the model's obs CSV (first output row — the single row for the
+        steady-state models this targets) and each site's observed value is
+        the mean of its registered records. With obs_source="model" you still
+        supply par_data and template_files but may omit instruction_files and
+        obs_data.
+
+        Template files must start with a `ptf`/`jtf` header.  The model input
+        file a template writes is the .tpl filename with the suffix stripped
+        (e.g. `hk.dat.tpl` → `hk.dat`) — name templates so the derived target
+        matches the file the model actually reads, or override it with
+        `pestpp_options["input_files"]`.  Parameter tokens must be wide
+        fixed-width (e.g. `@          k          @`); narrow tokens truncate
+        substituted values and zero out the Jacobian.
+
         pestpp_options special keys: "model_command_line" (str) or
         "model_command" (str|list) sets the forward-model run command
         (default on Windows: the located MF6 binary); "output_files" (list,
         parallel to instruction_files) sets explicit model output filenames;
-        "noptmax" is native PEST control data.
+        "input_files" (list, parallel to template_files) sets explicit model
+        input filenames; "noptmax" is native PEST control data.  On Windows,
+        the model command must be a direct executable or a space-free Python
+        wrapper — pestpp cannot run .bat/.cmd wrappers or space-containing
+        paths.
         """
         try:
             return _impl_setup_pest_control(
-                model, obs_data, par_data, template_files, instruction_files, pestpp_options
+                model,
+                obs_data,
+                par_data,
+                template_files,
+                instruction_files,
+                pestpp_options,
+                obs_source,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -722,6 +1967,45 @@ def register(mcp: FastMCP) -> None:
                 str(exc),
                 "Ensure template and instruction files exist in the workspace.",
             )
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def start_calibration(
+        model: str,
+        pst_file: str,
+        method: str = "glm",
+        num_reals: int = 50,
+    ) -> dict:
+        """Start PEST++ calibration (GLM or IES) in the background and return
+        a job id immediately (7e-A3).
+
+        method is "glm" (pestpp-glm, default) or "ies" (pestpp-ies); for IES,
+        num_reals sets the ensemble size. The calibration runs in a worker
+        thread instead of blocking until the client timeout. Poll progress and
+        the final result with get_job_status(job_id) — while running it
+        reports live iteration + phi parsed from <case>.iobj (GLM) or
+        <case>.phi.actual.csv (IES) — and stop it with cancel_job(job_id).
+        The finished job's result matches run_pestpp_glm / run_pestpp_ies."""
+        try:
+            return _impl_start_calibration(model, pst_file, method, num_reals)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except FileNotFoundError as exc:
+            return _err(
+                "PEST_ERROR",
+                str(exc),
+                "Ensure the PST control file exists in the workspace.",
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "not found" in msg.lower() or "binary" in msg.lower():
+                return _err(
+                    "BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :"
+                )
+            return _err("PEST_ERROR", msg)
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
 
@@ -769,10 +2053,19 @@ def register(mcp: FastMCP) -> None:
             return _err("PEST_ERROR", str(exc))
 
     @mcp.tool()
-    def summarise_calibration(model: str, pst_file: str) -> dict:
-        """Summarise PEST++ calibration results: phi progress, parameter estimates, residuals."""
+    def summarise_calibration(
+        model: str,
+        pst_file: str,
+        measurement_error: float | None = None,
+        max_residuals: int = 500,
+    ) -> dict:
+        """Summarise PEST++ calibration results: phi progress, parameter
+        estimates, residuals (capped at max_residuals; full table to CSV),
+        and a verdict (7f-H4.2) — whether phi improved
+        versus the previous run, parameters at their bounds, identifiability,
+        and fit within a supplied measurement_error."""
         try:
-            return _impl_summarise_calibration(model, pst_file)
+            return _impl_summarise_calibration(model, pst_file, measurement_error, max_residuals)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except FileNotFoundError as exc:
@@ -783,6 +2076,64 @@ def register(mcp: FastMCP) -> None:
             )
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def check_parameter_sensitivity(
+        model: str,
+        parameters: dict[str, float],
+        template_files: list[str],
+        delta: float = 0.1,
+    ) -> dict:
+        """Run a cheap n+1 forward-run sensitivity screen (7f-H3.1).
+
+        parameters maps parameter name → base value, one per template file.
+        Each template's target file must be one the model actually reads (e.g.
+        an NPF ``k`` array via OPEN/CLOSE with template ``hk.dat.tpl``).
+        Returns per-parameter sensitivity (mean relative change of the
+        simulated observations) and records it so setup_pest_control warns on
+        insensitive parameters. Run this before committing to calibration."""
+        try:
+            return _impl_check_parameter_sensitivity(model, parameters, template_files, delta)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("PEST_ERROR", str(exc), "Ensure template files exist in the workspace.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("SENSITIVITY_FAILED", str(exc))
+
+    @mcp.tool()
+    def calibrate(
+        model: str,
+        par_data: dict,
+        template_files: list[str],
+        time_budget_minutes: float = 30.0,
+        noptmax: int = 10,
+        num_reals: int = 50,
+    ) -> dict:
+        """Choose and run the calibration method (7f-H4.1).
+
+        Builds the PEST interface from the registered observation targets
+        (obs_source="model"), chooses GLM vs IES from the adjustable-parameter
+        count, observation count and time_budget_minutes, and runs the chosen
+        engine. The method and its rationale appear in the result."""
+        try:
+            return _impl_calibrate(
+                model, par_data, template_files, time_budget_minutes, noptmax, num_reals
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("PEST_ERROR", str(exc), "Ensure template files exist in the workspace.")
+        except RuntimeError as exc:
+            return _err(
+                "BINARY_NOT_FOUND",
+                str(exc),
+                "Install PEST++ with: get-pestpp :",
+            )
+        except Exception as exc:
+            return _err("CALIBRATE_FAILED", str(exc))
 
     @mcp.tool()
     def run_ies_uncertainty(
@@ -802,46 +2153,10 @@ def register(mcp: FastMCP) -> None:
                 "Run pestpp-ies first with forecast observations defined.",
             )
         except ValueError as exc:
-            return _err("PEST_ERROR", str(exc), "Check forecast_names match observation names in the PST.")
+            return _err(
+                "PEST_ERROR",
+                str(exc),
+                "Check forecast_names match observation names in the PST.",
+            )
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
-
-    # --- UCODE tools (Phase 5b stubs) ---
-
-    @mcp.tool()
-    def setup_ucode_control(
-        model: str,
-        obs_data: dict,
-        par_data: dict,
-        template_files: list[str],
-        instruction_files: list[str],
-        ucode_options: dict | None = None,
-    ) -> dict:
-        """Generate a UCODE_2014 main input file (.#ucode) and associated data files."""
-        raise NotImplementedError(
-            "setup_ucode_control is not yet implemented (Phase 5b)"
-        )
-
-    @mcp.tool()
-    def run_ucode(model: str, ucode_file: str) -> dict:
-        """Run UCODE_2014 parameter estimation and return SSR, convergence, and estimates."""
-        raise NotImplementedError("run_ucode is not yet implemented (Phase 5b)")
-
-    @mcp.tool()
-    def summarise_ucode_calibration(model: str, ucode_file: str) -> dict:
-        """Summarise UCODE calibration results: SSR progress, estimates, sensitivity, residuals."""
-        raise NotImplementedError(
-            "summarise_ucode_calibration is not yet implemented (Phase 5b)"
-        )
-
-    @mcp.tool()
-    def run_ucode_uncertainty(
-        model: str,
-        ucode_file: str,
-        forecast_names: list[str],
-        method: str = "linear",
-    ) -> dict:
-        """Compute predictive uncertainty bounds using UCODE linear or MCMC analysis."""
-        raise NotImplementedError(
-            "run_ucode_uncertainty is not yet implemented (Phase 5b)"
-        )

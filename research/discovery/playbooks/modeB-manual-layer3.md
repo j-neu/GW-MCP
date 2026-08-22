@@ -14,13 +14,20 @@ tool names; it must discover them from the tool descriptions.
 - Known-limitation gate: if the assistant proposes a GAP capability (UZF, MAW,
   STO, DISU, GWT…), it must discover the limitation cleanly and proceed with
   what exists — count as a note, not a failure, unless it derails the journey
+- **MCP-only gate (added 2026-08-22):** every build/run/postprocess/calibrate
+  action goes through a groundwater-mcp tool call — no raw `flopy`/`pyemu`
+  Python and no hand-edited model/PEST files. This is enforced the same way
+  as the closed-book rule: a violation is a protocol deviation and the run
+  is invalid for validating the tool it routed around (though the underlying
+  tool gap that prompted it is still a valid finding — see below)
 
 ## Setup (once)
 
 1. MCP server registered globally in `C:\Users\jakob\.config\kilo\kilo.jsonc`
    (`groundwater-mcp` → `.venv\Scripts\groundwater-mcp.exe serve`,
    `groundwater-mcp_*` auto-allowed). Any Kilo session in any folder can now
-    use the 38 groundwater-mcp tools.
+    use the current groundwater-mcp tool set (63 tools as of 2026-08-22 —
+    check README.md for the current count, it grows between sessions).
 2. Restart Kilo so the server loads.
 3. **Closed-book data folder** (self-contained, no answers inside):
    `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\modeB\tutorial05\data\`
@@ -58,7 +65,7 @@ Before building, the assistant should:
 
 1. Call the MCP `check_environment` tool once — it reports the server's own
    Python, the installed packages (flopy/pyemu/geopandas/rasterio) with
-   versions, the MODFLOW 6 / PEST++ / UCODE executable paths, docs index
+   versions, the MODFLOW 6 / PEST++ executable paths, docs index
    state, and the default workspace root. If anything is missing, report it
    and stop; do not guess with shell commands.
 2. Create the model workspace **inside the session folder** (e.g. a `model\`
@@ -82,6 +89,34 @@ All of those are now moved/staged out of reach:
   recorded as a protocol deviation and the run is invalid.
 - Data prep is complete in the staging folder; no PDFs, no repo references,
   no reference models are reachable from it.
+
+## MCP-only rule (added 2026-08-22, after the 7e Tier-C work)
+
+The recurring failure mode across **every** prior validation session (Mode B
+rerun-2/3/4, the transient run, and — most severely — zenodo run 1, which
+bypassed the MCP entirely for a 94-minute calibration) was the agent dropping
+to raw `flopy`/`pyemu` Python or hand-edited model/PEST files whenever a tool
+felt slow, unclear, or insufficient. That defeats the point of this test:
+it's meant to validate whether the MCP tools are *sufficient on their own*,
+not whether the agent can write flopy. The prompt below now states this as an
+explicit, non-negotiable constraint (see the "MCP-ONLY CONSTRAINT" paragraph)
+and it is enforced the same way the closed-book rule is: **using flopy/pyemu
+directly, or hand-editing a model/PEST file, is a protocol deviation that
+invalidates the run.** If it happens, stop, record exactly what tool gap
+forced it (that gap is itself a valid, valuable finding — file it as a
+backlog item — the deviation is only about *how* the agent responded to the
+gap, not the gap's existence), and either restart after a fix or continue
+with the deviation logged.
+
+Do not name specific groundwater-mcp tools (`diagnose_convergence`,
+`model_status`, etc.) to the agent — discovering them from their descriptions
+is still the point (see the header note above). If the MCP client (Kilo)
+exposes `groundwater-mcp`'s registered *prompts* as selectable starting
+templates, use `build_model_from_data` as the session's opening message
+instead of pasting the prompt below by hand, and note in the session log that
+this run started from the MCP prompt — that is itself the C6 verification
+this playbook now also covers. If the client does not expose MCP prompts as
+a UI feature, paste the prompt below as before.
 
 ## Prep: observation CSV (already staged)
 
@@ -134,6 +169,21 @@ all model files in a new subfolder "model" of this folder.
 You must work CLOSED-BOOK: do not read the groundwater-mcp source code, its
 tests, the tutorial PDFs, or any reference model files. Build everything from
 the data files in this folder and the available MCP tools only.
+
+MCP-ONLY CONSTRAINT: every action that builds, runs, or post-processes the
+MF6 MODEL ITSELF must go through the groundwater-mcp tools — do NOT call
+flopy/pyemu MODFLOW or PEST classes directly, and do NOT hand-edit MODFLOW
+or PEST input files (.dis, .npf, .ic, .nam, .tdis, .ims, .pst, .tpl, .ins,
+etc.) with a text editor or shell command. Ordinary Python for reading/
+transforming the shapefile or CSV data before passing it to a tool is fine.
+If a groundwater-mcp tool cannot do something you need, STOP and report
+exactly what capability is missing and why — do not work around the gap by
+building/running/post-processing the model with raw flopy/pyemu instead.
+When something goes wrong (a build error, a non-converging run, an
+unbalanced water budget), look for a groundwater-mcp tool that diagnoses it
+before writing your own analysis code or reading raw output files by hand.
+A workaround invalidates this run: it is testing whether the MCP tools are
+sufficient on their own, not your general Python ability.
 ```
 
 ## Session log template
@@ -148,6 +198,8 @@ the data files in this folder and the available MCP tools only.
 - Reprompts: N (describe each)
 - Outcome vs criteria: build/check/run/postprocess/calibrate (pass/partial/fail + evidence)
 - Known-limitation notes: (e.g., assistant proposed UZF/STO → clean discovery)
+- MCP-only violations: N (each: what forced it, the underlying tool gap, whether it derailed the run)
+- Started from the build_model_from_data MCP prompt? yes/no (C6 verification)
 - Time: total minutes
 ```
 

@@ -140,6 +140,11 @@ def tut05_with_riv(tut05_with_dem):
         cond_field=None,
         depth_field=None,
         stress_periods=None,
+        # Conductance derived from bed properties (7f-H1.2); the old
+        # reach-length-as-conductance default is dimensionally wrong.
+        bed_k=1e-4,
+        bed_thickness=1.0,
+        channel_width=20.0,
     )
     assert "error" not in riv, f"import_river_from_shapefile failed: {riv}"
     return model, grid, riv
@@ -365,7 +370,11 @@ def test_obs_type_is_head(tut05_with_obs):
 
 
 def test_obs_file_created(tut05_with_obs):
-    _, obs = tut05_with_obs
+    """The OBS package input file is written on flush (deferred writes, 7f-E1.2)."""
+    from groundwater_mcp.utils.model_store import flush_model
+
+    model, obs = tut05_with_obs
+    flush_model(model)
     assert Path(obs["obs_file"]).exists()
 
 

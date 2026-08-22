@@ -5,10 +5,17 @@ Used by tools/parameterise.py. Requires geopandas and rasterio.
 
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 
 import numpy as np
+
+
+class CRSError(ValueError):
+    """Raised when the model CRS is unknown but the spatial data declares one.
+
+    The caller must not guess the coordinate space: sampling in the wrong CRS
+    returns plausible-looking numbers that are silently wrong.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -16,11 +23,49 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 
+def _bilinear_sample(
+    band: np.ndarray, transform, x: np.ndarray, y: np.ndarray, nodata
+) -> np.ndarray:
+    """Bilinear interpolation of *band* at (x, y) (rasterio 1.5 lacks a
+    resampling argument on ``sample_gen``, so this is computed directly).
+
+    Continuous pixel indices use the rasterio convention: pixel *i*'s centre
+    is at integer ``i + 0.5``, so the interpolation anchors are the pixel
+    centres. Points outside the band or on nodata pixels return NaN.
+    """
+    rows, cols = band.shape
+    col_f = (np.asarray(x, dtype=float) - transform.c) / transform.a - 0.5
+    row_f = (np.asarray(y, dtype=float) - transform.f) / transform.e - 0.5
+    col0 = np.floor(col_f).astype(int)
+    row0 = np.floor(row_f).astype(int)
+    fx = col_f - col0
+    fy = row_f - row0
+
+    out = np.full(len(x), np.nan, dtype=float)
+    valid = (col0 >= 0) & (col0 + 1 < cols) & (row0 >= 0) & (row0 + 1 < rows)
+    idx = np.flatnonzero(valid)
+    if idx.size == 0:
+        return out
+    c0, r0 = col0[idx], row0[idx]
+    band_f = band.astype(float)
+    v00 = band_f[r0, c0]
+    v10 = band_f[r0, c0 + 1]
+    v01 = band_f[r0 + 1, c0]
+    v11 = band_f[r0 + 1, c0 + 1]
+    top = v00 * (1 - fx[idx]) + v10 * fx[idx]
+    bot = v01 * (1 - fx[idx]) + v11 * fx[idx]
+    out[idx] = top * (1 - fy[idx]) + bot * fy[idx]
+    if nodata is not None:
+        out[out == nodata] = np.nan
+    return out
+
+
 def sample_raster_at_points(
     raster_path: str | Path,
     x: np.ndarray,
     y: np.ndarray,
     src_crs: str | None = None,
+    resampling: str = "nearest",
 ) -> np.ndarray:
     """Sample a GeoTIFF raster at (x, y) coordinates.
 
@@ -33,6 +78,8 @@ def sample_raster_at_points(
     src_crs:
         CRS of the input coordinates as a proj string, EPSG code, or WKT.
         If None, assumed to match the raster CRS.
+    resampling:
+        ``"nearest"`` (default) or ``"bilinear"`` (7e-B5).
 
     Returns
     -------
@@ -58,13 +105,30 @@ def sample_raster_at_points(
                 transformer = Transformer.from_crs(in_crs, raster_crs, always_xy=True)
                 x, y = transformer.transform(x, y)
 
-        coords = list(zip(x.tolist(), y.tolist()))
-        sampled = np.array(list(src.sample(coords, indexes=1)), dtype=float).ravel()
+        if resampling == "bilinear":
+            sampled = _bilinear_sample(src.read(1), src.transform, x, y, src.nodata)
+        else:
+            coords = list(zip(x.tolist(), y.tolist()))
+            sampled = np.array(
+                list(src.sample(coords, indexes=1)), dtype=float
+            ).ravel()
+            # Replace nodata with NaN
+            if src.nodata is not None:
+                sampled[sampled == src.nodata] = np.nan
 
-        # Replace nodata with NaN
-        nodata = src.nodata
-        if nodata is not None:
-            sampled[sampled == nodata] = np.nan
+        # Explicitly mask out-of-bounds points. rasterio returns the nodata
+        # value when one is set, but 0.0 when it is not — a plausible-looking
+        # wrong value that would silently corrupt stage/elevation sampling
+        # (7f-D1.2). Anything outside the raster bounds is NaN.
+        b = src.bounds
+        tol = 1e-9
+        inside = (
+            (x >= b.left - tol)
+            & (x <= b.right + tol)
+            & (y >= b.bottom - tol)
+            & (y <= b.top + tol)
+        )
+        sampled[~inside] = np.nan
 
     return sampled
 
@@ -100,7 +164,6 @@ def intersect_points_with_polygons(
         One array per value column. Points outside all polygons have NaN.
     """
     import geopandas as gpd
-    from shapely.geometry import Point
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -211,7 +274,6 @@ def disv_grid_props_from_shapefile(
     """
     import geopandas as gpd
     from flopy.utils.voronoi import VoronoiGrid
-    from shapely.geometry import Point
 
     gdf = gpd.read_file(shapefile)
     if target_crs:
@@ -266,6 +328,11 @@ def intersect_lines_with_dis_grid(
     For each intersecting cell, returns the cell ID (layer 0), intersection
     length, and any requested attribute values from the shapefile.
 
+    The grid's own CRS (``modelgrid.crs``) is authoritative: the line is
+    reprojected into it when the two differ. When the grid has no CRS but the
+    shapefile declares one, :class:`CRSError` is raised — the caller must not
+    guess the coordinate space (7f-D2).
+
     Returns a list of dicts with keys: cellid, length_m, and one key per
     attribute column.
     """
@@ -277,8 +344,17 @@ def intersect_lines_with_dis_grid(
     # Build a GeoDataFrame of model grid cells
     nrow = modelgrid.nrow
     ncol = modelgrid.ncol
-    xyzv = modelgrid.xyzvertices  # ((nrow+1, ncol+1) arrays for x and y)
     xv, yv = modelgrid.xvertices, modelgrid.yvertices  # shape (nrow+1, ncol+1)
+
+    model_crs = modelgrid.crs
+    if model_crs is None and gdf.crs is not None:
+        raise CRSError(
+            "The model grid has no CRS but the river shapefile declares "
+            f"'{gdf.crs}'. Set a CRS on the model grid first "
+            "(e.g. import_grid_from_shapefile with target_crs) so coordinates "
+            "are compared in a known space — silently assuming a match can "
+            "corrupt the river boundary."
+        )
 
     cells = []
     for r in range(nrow):
@@ -291,9 +367,9 @@ def intersect_lines_with_dis_grid(
             )
             cells.append({"row": r, "col": c, "geometry": cell_box})
 
-    grid_gdf = gpd.GeoDataFrame(cells, crs=gdf.crs if gdf.crs else None)
+    grid_gdf = gpd.GeoDataFrame(cells, crs=model_crs if model_crs else None)
 
-    # Reproject lines if needed
+    # Reproject lines into the grid's CRS if needed
     if gdf.crs and grid_gdf.crs and not gdf.crs.equals(grid_gdf.crs):
         gdf = gdf.to_crs(grid_gdf.crs)
 

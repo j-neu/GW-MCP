@@ -1,12 +1,12 @@
 # groundwater-mcp — Architecture
 
-An open-source Python MCP server for AI-assisted groundwater modelling with MODFLOW 6, FloPy, PEST++, pyEMU, and UCODE.
+An open-source Python MCP server for AI-assisted groundwater modelling with MODFLOW 6, FloPy, PEST++, and pyEMU.
 
 ---
 
 ## Overview
 
-The server exposes 39 tools across 7 modules, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 63 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -25,8 +25,8 @@ The server exposes 39 tools across 7 modules, running locally over stdio transpo
                           ┌───────────────┼──────────────┐
                           │               │              │
                    geopandas /        flopy.utils    pyEMU /
-                   rasterio /         (heads, plots) PEST++ /
-                   FloPy + MF6                       UCODE
+                   rasterio /         (heads, plots) PEST++
+                   FloPy + MF6
                           │               │              │
                           └───────────────┴──────────────┘
                                           │
@@ -39,7 +39,7 @@ The server exposes 39 tools across 7 modules, running locally over stdio transpo
 ## Module responsibilities
 
 ### environment
-Preflight checks for a hands-free session. `check_environment` reports the server's own Python interpreter, the installed packages (flopy, pyemu, geopandas, rasterio) with versions, the paths to the MODFLOW 6 / PEST++ / UCODE executables, the local docs index state, and the default workspace root — so an agent verifies the stack in one call instead of probing with shell commands (which commonly hit the wrong interpreter).
+Preflight checks for a hands-free session. `check_environment` reports the server's own Python interpreter, the installed packages (flopy, pyemu, geopandas, rasterio) with versions, the paths to the MODFLOW 6 / PEST++ executables, the local docs index state, and the default workspace root — so an agent verifies the stack in one call instead of probing with shell commands (which commonly hit the wrong interpreter).
 
 ### docs
 Builds a local full-text + semantic search index from the public MODFLOW 6, FloPy, and PEST++ GitHub repositories at install time. Works fully offline. No external API required.
@@ -57,7 +57,7 @@ Invokes the MODFLOW 6 binary via FloPy's `run_model()`, streams stdout/stderr, a
 Reads binary output files (`.hds`, `.cbb`) via `flopy.utils`, computes derived quantities (drawdown, water balance), and generates plan-view and cross-section plots as PNG files.
 
 ### calibration
-Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter estimation and uncertainty analysis. Also supports UCODE_2014 for model-agnostic calibration via SVD-based parameter estimation, sensitivity analysis, and MCMC/linear uncertainty quantification. Both backends are invoked as subprocesses with file-based I/O. Returns phi/SSR progress, residual statistics, and predictive uncertainty bounds.
+Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter estimation and uncertainty analysis. Invoked as a subprocess with file-based I/O. Returns phi progress, residual statistics, and predictive uncertainty bounds.
 
 ---
 
@@ -71,10 +71,10 @@ groundwater-mcp/
 │       ├── tools/
 │       │   ├── docs.py         ← search_docs, search_tutorials, get_doc_file
 │       │   ├── parameterise.py ← import_grid_from_shapefile, assign_top_from_raster, assign_k_from_zones, import_river_from_shapefile, import_obs_from_csv
-│       │   ├── builder.py      ← create_model, add_*_package, summarise_model
+│       │   ├── builder.py      ← create_model, adopt_model, add_*_package, summarise_model
 │       │   ├── runner.py       ← run_simulation, check_model, get_run_log
 │       │   ├── postprocess.py  ← read_heads, read_budget, plot_*, compute_*
-│       │   ├── calibration.py  ← setup_pest_control, run_pestpp_*, setup_ucode_control, run_ucode_*, summarise_*
+│       │   ├── calibration.py  ← setup_pest_control, run_pestpp_*, summarise_*
 │       │   └── environment.py  ← check_environment (preflight stack check)
 │       └── utils/
 │           ├── workspace.py    ← model directory management
@@ -101,7 +101,7 @@ groundwater-mcp/
 | Groundwater modelling | `flopy` ≥ 3.7 |
 | MODFLOW binary | MODFLOW 6 (downloaded separately via `get-modflow`) |
 | Spatial parameterisation | `geopandas`, `rasterio`, `scipy` |
-| Calibration | `pyemu`, PEST++ binaries, UCODE_2014 binary |
+| Calibration | `pyemu`, PEST++ binaries |
 | Plotting | `matplotlib`, `flopy.plot` |
 | Docs index | `whoosh` (full-text) + `sentence-transformers` (semantic) |
 | Testing | `pytest` |
@@ -118,7 +118,8 @@ Three layers, each catching different failure modes:
 | **Pytest integration tests** (`tests/test_tutorial_*.py`) | Tool logic with real spatial data from the sealed dev set `tests/fixtures/tutorial_04` and `tutorial_05` | Every commit (CI) |
 | **MCP protocol tests** (`tests/test_mcp_protocol.py`) | JSON-RPC message handling, tool registration, error envelope schema | Every commit (CI) |
 | **Holdout replay (Mode A)** (`tests/test_holdout_replay.py`) | Automated build→run→postprocess replay of sealed projects (test051, test020) + GAP clean-failure gates | Dry-run green; official run at the v0.1.0 freeze |
-| **Mode B manual Layer-3** | Natural-language usability, tool-description quality, full user journey on a closed-book held-out tutorial | Completed (dry-run 1 + rerun-2, 0 reprompts); post-fix re-run pending |
+| **Mode B manual Layer-3** | Natural-language usability, tool-description quality, full user journey on a closed-book held-out tutorial | Complete (dry-run + rerun-2/3/4, 0 reprompts each; rerun-4 = set-and-forget, zero permission prompts; separate transient-run session) |
+| **6d regional-model validation** | Closed-book rerun-improvement loop on real regional models (mf6brabant, zenodo-21381071, aare-valley, GMS pest_obs_ss, freyberg, neversink, CSUB, EnKF-DISU) | Run 1 green for zenodo-21381071 (2026-08-17); **all reruns held until the promoted 7e+7f v0.1.0 gate work is done** (owner decision 2026-08-17d) |
 | **Manual Claude Desktop walkthrough** | Natural-language usability, tool description quality, full user journey | Before each release (optional — Mode B is the recorded protocol) |
 
 The tutorial datasets used are:
@@ -144,3 +145,73 @@ See `TASKS.md` Phase 6 for the full test checklist.
 - **MODFLOW 6 only (v1).** Supporting the modern standard first; legacy versions can be added later.
 - **Fail loudly.** Tool errors return structured error objects with actionable messages, not silent failures.
 - **Clear scope boundary.** This MCP covers model parameterisation from processed data through to calibrated results. Raw spatial preprocessing (CRS reprojection, DEM hydrological conditioning, borehole kriging, climate data processing) belongs in a companion `geodata-mcp`. The handoff format is standard files: GeoTIFF, GeoPackage/Shapefile, CSV.
+
+### Known deviations from these principles (audit 2026-08-17b)
+
+Recorded here so the document describes the code as it is, not only as
+intended. Each has atomic remediation tasks in `TASKS.md` § 7e.
+
+**Fixed by the 7f-D gate work (2026-08-17e):** the "fail loudly" principle is
+now enforced on the spatial/data layer. `stage_raster` sampling fails with
+`STAGE_RASTER_NO_COVERAGE` instead of silently guessing stages (D1); the river
+importer errors `CRS_UNKNOWN` rather than comparing coordinates in an assumed
+space (D2); layer indices are validated against `nlay` (`INVALID_INPUT`) (D3);
+adopted models are read-only by default so a stray builder call cannot rewrite
+a real published model, and the cache reloads from disk when package files
+change externally (D4).
+
+Remaining deviations:
+
+- **Composability is limited by response size, not by module boundaries.**
+  Post-processing tools serialise whole grid arrays into the response
+  (~38 MB for a 1600×1252 domain), so the modules compose in Python but not
+  over MCP at regional scale (7e-A1). *(A1 done 2026-08-17: `read_heads`/
+  `compute_drawdown` return stats + `.npy` by default, `read_budget` returns
+  aggregates with a record cap, `summarise_calibration` caps residuals —
+  the remaining A1.7 regional verification is a 6d-replay item.)*
+- **No long-job story.** All execution is blocking `subprocess` with no
+  timeout, polling, or cancellation, so runs exceeding the client timeout
+  push callers out of the MCP entirely (7e-A3). *(fixed 2026-08-18 by 7e-A3:
+  `start_run`/`start_calibration` run in a background thread and return a job
+  id; `get_job_status` reports live progress; `cancel_job` terminates the
+  process.)*
+- **The tool layer is currently a 1:1 FloPy transcription.** It exposes the
+  library rather than the expertise; diagnostic/validation/export tools that
+  would justify the layer are catalogued as 7e Tier C. *(C1 done 2026-08-22:
+  `diagnose_convergence` classifies a non-converged run — closure tolerance,
+  idomain connectivity, Newton/dry-cell risk, K contrast — from the model
+  configuration rather than 20 lines of raw `.lst` tail. C2 done 2026-08-22:
+  `validate_model` aggregates physical-plausibility defects (heads above
+  top/below bottom, K contrast, disconnected active cells, boundaries on
+  inactive cells) into one finding per type instead of the 569,796 individual
+  warnings a real regional model produced. C3 done 2026-08-22:
+  `diagnose_water_balance` reports the same percent-discrepancy MODFLOW
+  itself computes, a `balanced` verdict, and whether one boundary type is
+  absorbing most of the flow — instead of the raw inflow/outflow table
+  `compute_water_balance` already returned. C4 is superseded by the
+  already-shipped `compare_to_observed` (ticked, bookkeeping only). C5 done
+  2026-08-22: `export_heads_to_raster` (georeferenced GeoTIFF, delegating to
+  flopy's own `export_array`), `export_boundaries_to_shapefile` (one feature
+  per boundary stress-period cell), and `export_water_balance_csv` — the
+  finished-model-back-to-GIS path this deviation named as missing. C6 done
+  2026-08-22: two MCP prompts (`build_model_from_data`, `calibrate_model`)
+  encode the ordering an agent otherwise infers by trial and error. C7 done
+  2026-08-22: three MCP resource templates (`gwmcp://models/{model}/lst`
+  /`pst`/`files`) expose per-model files as readable URIs. C8 done
+  2026-08-22: `model_status` plus a `next_steps` list auto-attached to every
+  builder/parameterise tool's result — the ordering constraints this
+  deviation named (`add_sto_package` needs TDIS, `assign_k_from_zones` needs
+  NPF, `import_grid_from_shapefile`'s undocumented `set_simulation`
+  prerequisite) now surface proactively instead of only as the next call's
+  error. All of 7e Tier C is done except the `[human]` closed-book
+  verification criteria on C1/C6/C8, which need a live agent session to
+  confirm — not yet run.)*
+
+**Fixed by the 7e-B gate work (2026-08-18):** the "fail loudly" principle is
+now enforced on the calibration path too. `summarise_calibration` returns
+`OUTPUT_FILE_MISSING` when a run died before writing residuals instead of a
+successful-looking empty result (B2), and the broad `except Exception`
+swallows on the calibration hot path are narrowed to the specific
+data-errors expected, so corrupt `.par`/phi files surface as errors (B3).
+Tool results are additionally sanitised of NaN/Inf before JSON serialisation
+(B12).

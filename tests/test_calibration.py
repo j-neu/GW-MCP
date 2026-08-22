@@ -18,6 +18,8 @@ from groundwater_mcp.tools.calibration import (
     _impl_setup_pest_control,
     _impl_summarise_calibration,
     _parse_par_file,
+    _read_glm_phi,
+    _read_iobj_phi,
     _read_phi_csv,
 )
 from groundwater_mcp.utils.workspace import create_workspace, resolve_workspace
@@ -70,6 +72,25 @@ def _write_minimal_in(path: Path, par_names: list[str], values: list[float]) -> 
 def _write_minimal_out(path: Path, obs_names: list[str], values: list[float]) -> None:
     """Write a model output file with one observation value per line."""
     lines = [str(v) for v in values]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _write_minimal_rei(path: Path, obs_names: list[str], obs_vals: list[float] | None = None) -> None:
+    """Write a minimal PEST-style residual (.rei) file readable by pyemu.
+
+    pyemu's ``read_resfile`` scans for the header line containing "name" and
+    parses the remaining rows with whitespace separators.
+    """
+    lines = [
+        "PEST++ - GLM",
+        "   name     group     measured   modelled    residual    weight",
+    ]
+    for i, obs in enumerate(obs_names):
+        measured = obs_vals[i] if obs_vals else 5.0 - 0.2 * i
+        modelled = measured - 0.1
+        lines.append(
+            f"{obs}  heads  {measured:.6f}  {modelled:.6f}  {measured - modelled:.6f}  1.0"
+        )
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -130,6 +151,14 @@ def pst_model(calib_workspace) -> tuple[str, str]:
         instruction_files=[str(ws / "heads.ins")],
         pestpp_options={"noptmax": 5},
     )
+    # Write the artifacts a completed pestpp-glm run leaves behind (7e-B2/B3):
+    # a .par (parameter estimates) and a .rei (residuals). The no-file error
+    # paths are tested explicitly.
+    pst_base = Path(result["pst_file"]).stem
+    (ws / f"{pst_base}.par").write_text(
+        "single point\nk        42.0  1.0  0\nss       0.005  1.0  0\n"
+    )
+    _write_minimal_rei(ws / f"{pst_base}.rei", ["h1", "h2", "h3", "h4", "h5"])
     return model, result["pst_file"]
 
 
@@ -176,14 +205,54 @@ def test_read_phi_csv_parses_correctly(tmp_path):
     assert final == pytest.approx(25.0)
 
 
+# --- 7e-B1: GLM phi comes from <case>.iobj, not .phi.actual.csv ---
+
+
+def test_read_iobj_phi_parses_real_glm_output(tmp_path):
+    """Real pestpp-glm .iobj output shape (captured from a live GLM run)."""
+    iobj = tmp_path / "m.iobj"
+    iobj.write_text(
+        "iteration,model_runs_completed,total_phi,measurement_phi,"
+        "regularization_phi,head_obs\n"
+        "0,0,214.452,214.452,0,214.452\n"
+        "1,12,182.609,182.609,0,182.609\n"
+    )
+    progress, final = _read_iobj_phi(iobj)
+    assert len(progress) == 2
+    assert progress[1]["iteration"] == 1
+    assert progress[1]["phi"] == pytest.approx(182.609)
+    assert final == pytest.approx(182.609)
+
+
+def test_read_glm_phi_prefers_iobj_over_phi_csv(tmp_path):
+    """When both exist, the GLM .iobj wins (the .phi.actual.csv is IES
+    output and must not be used for GLM)."""
+    (tmp_path / "m.iobj").write_text(
+        "iteration,model_runs_completed,total_phi\n0,0,100.0\n1,1,50.0\n"
+    )
+    (tmp_path / "m.phi.actual.csv").write_text("heads\n200.0\n")
+    progress, final = _read_glm_phi(tmp_path, "m")
+    assert final == pytest.approx(50.0)
+    assert len(progress) == 2
+
+
+def test_read_glm_phi_falls_back_to_phi_csv(tmp_path):
+    (tmp_path / "m.phi.actual.csv").write_text(",heads\n0,200.0\n1,100.0\n")
+    progress, final = _read_glm_phi(tmp_path, "m")
+    assert len(progress) == 2
+    assert final == pytest.approx(100.0)
+
+
 # ---------------------------------------------------------------------------
 # _parse_par_file
 # ---------------------------------------------------------------------------
 
 
-def test_parse_par_file_returns_empty_for_missing_file(tmp_path):
-    result = _parse_par_file(tmp_path / "nonexistent.par")
-    assert result == {}
+def test_parse_par_file_raises_on_missing_file(tmp_path):
+    """A missing/unreadable .par must fail loudly, not silently return {}
+    (7e-B3 — the old bare except turned malformed files into success)."""
+    with pytest.raises(OSError):
+        _parse_par_file(tmp_path / "nonexistent.par")
 
 
 def test_parse_par_file_reads_values(tmp_path):
@@ -227,7 +296,9 @@ def test_setup_pest_control_returns_expected_keys(pst_model):
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
     )
-    for key in ("model", "pst_file", "n_observations", "n_adjustable_parameters", "n_total_parameters"):
+    keys = ("model", "pst_file", "n_observations", "n_adjustable_parameters",
+            "n_total_parameters")
+    for key in keys:
         assert key in result, f"Missing key: {key}"
 
 
@@ -315,6 +386,62 @@ def test_setup_pest_control_model_command_written_as_list(calib_workspace):
     assert pst.model_command == ["mf6 mfsim.nam"]
     # and it must not leak into the pestpp options section
     assert "model_command_line" not in pst.pestpp_options
+
+
+def test_setup_pest_control_input_files_override(calib_workspace):
+    """input_files must override the .tpl-stripped model file name.
+
+    Regression for the 6d zenodo run: template `hk.dat.tpl` derives target
+    `hk.dat`, but an agent may name a template differently and rely on an
+    explicit target (e.g. the file the NPF OPEN/CLOSE actually reads).
+    """
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    result = _impl_setup_pest_control(
+        model=model,
+        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
+        par_data={"k": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        pestpp_options={"input_files": ["hk.dat"]},
+    )
+    pst = pyemu.Pst(result["pst_file"])
+    in_data = pst.model_input_data
+    assert in_data.iloc[0]["pest_file"] == "params.tpl"
+    assert in_data.iloc[0]["model_file"] == "hk.dat"
+
+
+def test_setup_pest_control_input_files_len_mismatch(calib_workspace):
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    with pytest.raises(ValueError, match="len\\(input_files\\)"):
+        _impl_setup_pest_control(
+            model=model,
+            obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
+            par_data={"k": {"parval1": 10.0}},
+            template_files=[str(ws / "params.tpl")],
+            instruction_files=[str(ws / "heads.ins")],
+            pestpp_options={"input_files": ["a", "b"]},
+        )
+
+
+def test_setup_pest_control_warns_on_windows_bat_command(calib_workspace, monkeypatch):
+    """On Windows, a .bat/.cmd model command must surface a warning so the
+    agent fixes it before a confusing pestpp runtime failure."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    monkeypatch.setattr("groundwater_mcp.tools.calibration.platform.system",
+                        lambda: "Windows")
+    result = _impl_setup_pest_control(
+        model=model,
+        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
+        par_data={"k": {"parval1": 10.0}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        pestpp_options={"model_command": ["run_model.bat"]},
+    )
+    assert "warning" in result
+    assert ".bat/.cmd" in result["warning"]
 
 
 def test_setup_pest_control_model_command_list_form(calib_workspace):
@@ -494,8 +621,10 @@ def test_run_pestpp_glm_not_converged_on_nonzero_returncode(pst_model, monkeypat
     assert result["converged"] is False
 
 
-def test_run_pestpp_glm_reads_phi_csv(pst_model, monkeypatch):
-    """If a phi CSV exists after the run, its values should be reflected."""
+def test_run_pestpp_glm_reads_iobj(pst_model, monkeypatch):
+    """GLM phi/iterations come from <case>.iobj (7e-B1.1), not the
+    .phi.actual.csv that pestpp-ies writes. Regression: the old reader read
+    the IES file and GLM always reported iterations: 0 / phi: None."""
     import groundwater_mcp.tools.calibration as cal_module
 
     monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-glm")
@@ -504,9 +633,14 @@ def test_run_pestpp_glm_reads_phi_csv(pst_model, monkeypatch):
     ws = resolve_workspace(model)
     pst_stem = Path(pst_file).stem
 
-    # Write a synthetic phi CSV before the "run"
-    phi_csv = ws / f"{pst_stem}.phi.actual.csv"
-    pd.DataFrame({"heads": [200.0, 50.0, 10.0]}).to_csv(phi_csv)
+    # Real pestpp-glm .iobj output shape (not a fabricated .phi.actual.csv).
+    (ws / f"{pst_stem}.iobj").write_text(
+        "iteration,model_runs_completed,total_phi,measurement_phi,"
+        "regularization_phi,head_obs\n"
+        "0,0,214.452,214.452,0,214.452\n"
+        "1,12,182.609,182.609,0,182.609\n"
+        "2,25,150.001,150.001,0,150.001\n"
+    )
 
     monkeypatch.setattr(
         subprocess,
@@ -516,7 +650,7 @@ def test_run_pestpp_glm_reads_phi_csv(pst_model, monkeypatch):
 
     result = _impl_run_pestpp_glm(model, pst_file)
     assert result["iterations"] == 3
-    assert result["final_phi"] == pytest.approx(10.0)
+    assert result["final_phi"] == pytest.approx(150.001)
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +671,9 @@ def test_run_pestpp_ies_returns_expected_keys(pst_model, monkeypatch):
     model, pst_file = pst_model
     result = _impl_run_pestpp_ies(model, pst_file, num_reals=10)
 
-    for key in ("model", "pst_file", "converged", "final_phi_mean", "final_phi_std", "iterations", "num_reals"):
+    keys = ("model", "pst_file", "converged", "final_phi_mean",
+            "final_phi_std", "iterations", "num_reals")
+    for key in keys:
         assert key in result, f"Missing key: {key}"
     assert result["num_reals"] == 10
 
@@ -570,7 +706,9 @@ def test_summarise_calibration_returns_expected_keys(pst_model):
     model, pst_file = pst_model
     result = _impl_summarise_calibration(model, pst_file)
 
-    for key in ("model", "pst_file", "phi_progress", "parameter_estimates", "residual_statistics", "residuals"):
+    keys = ("model", "pst_file", "phi_progress", "parameter_estimates",
+            "residual_statistics", "residuals")
+    for key in keys:
         assert key in result, f"Missing key: {key}"
 
 
@@ -586,17 +724,24 @@ def test_summarise_calibration_parameter_estimates_shape(pst_model):
     assert "ss" in names
 
 
-def test_summarise_calibration_reads_phi_csv(pst_model):
+def test_summarise_calibration_reads_iobj(pst_model):
+    """summarise_calibration reads GLM phi progress from <case>.iobj (7e-B1.2)
+    rather than the IES-only .phi.actual.csv."""
     model, pst_file = pst_model
     ws = resolve_workspace(model)
     pst_stem = Path(pst_file).stem
 
-    phi_csv = ws / f"{pst_stem}.phi.actual.csv"
-    pd.DataFrame({"heads": [150.0, 60.0, 18.0]}).to_csv(phi_csv)
+    (ws / f"{pst_stem}.iobj").write_text(
+        "iteration,model_runs_completed,total_phi,measurement_phi\n"
+        "0,0,150.0,150.0\n"
+        "1,10,60.0,60.0\n"
+        "2,20,18.0,18.0\n"
+    )
 
     result = _impl_summarise_calibration(model, pst_file)
     assert len(result["phi_progress"]) == 3
     assert result["phi_progress"][-1]["phi"] == pytest.approx(18.0)
+    assert result["verdict"]["final_phi"] == pytest.approx(18.0)
 
 
 def test_summarise_calibration_reads_par_file(pst_model):
@@ -612,14 +757,26 @@ def test_summarise_calibration_reads_par_file(pst_model):
     assert k_est["estimated_value"] == pytest.approx(42.0)
 
 
-def test_summarise_calibration_residual_stats_no_rei(pst_model):
-    """With no .rei file present, residual_statistics should have None values gracefully."""
+def test_summarise_calibration_missing_rei_raises(pst_model):
+    """With no .rei file present, summarise_calibration must fail loudly
+    (7e-B2) rather than report a successful-looking empty residual result."""
+    model, pst_file = pst_model
+    ws = resolve_workspace(model)
+    pst_stem = Path(pst_file).stem
+    (ws / f"{pst_stem}.rei").unlink()
+    with pytest.raises(FileNotFoundError, match="\\.rei"):
+        _impl_summarise_calibration(model, pst_file)
+
+
+def test_summarise_calibration_reads_residuals(pst_model):
+    """The happy path computes residual statistics from the .rei file."""
     model, pst_file = pst_model
     result = _impl_summarise_calibration(model, pst_file)
     stats = result["residual_statistics"]
-    assert "rmse" in stats
-    assert "bias" in stats
-    assert "r_squared" in stats
+    assert stats["n_observations"] == 5
+    assert stats["rmse"] is not None
+    assert stats["rmse"] > 0
+    assert len(result["residuals"]) == 5
 
 
 def test_summarise_calibration_unknown_model_raises():
@@ -810,14 +967,15 @@ def test_integration_run_pestpp_glm_produces_par_file(simple_pst):
 
 @requires_pestpp
 def test_integration_summarise_calibration_after_glm(simple_pst):
+    """After a GLM run that died before writing residuals (the synthetic-obs
+    forward model gives a zero Jacobian, so only .par exists), summarise must
+    fail loudly rather than report a success with empty residuals (7e-B2)."""
     model, pst_file = simple_pst
     _impl_run_pestpp_glm(model, pst_file)
-    result = _impl_summarise_calibration(model, pst_file)
-    assert "error" not in result
-    assert len(result["parameter_estimates"]) == 1
-    km = result["parameter_estimates"][0]
-    assert km["name"] == "kmult"
-    assert km["initial_value"] == pytest.approx(1.0)
+    ws = resolve_workspace(model)
+    assert list(ws.glob("*.par")), "expected a .par after the GLM run"
+    with pytest.raises(FileNotFoundError, match="residual"):
+        _impl_summarise_calibration(model, pst_file)
 
 
 @requires_pestpp

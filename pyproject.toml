@@ -1,7 +1,7 @@
 [project]
 name = "groundwater-mcp"
 version = "0.1.0"
-description = "An open-source MCP server for AI-assisted groundwater modelling with MODFLOW 6, FloPy, PEST++, pyEMU, and UCODE."
+description = "An open-source MCP server for AI-assisted groundwater modelling with MODFLOW 6, FloPy, PEST++, and pyEMU."
 authors = [
     { name = "j-neu", email = "jakob.fa.neumann@outlook.com" }
 ]
@@ -17,19 +17,22 @@ dependencies = [
     "scipy>=1.12",
     "matplotlib>=3.8",
     "whoosh>=2.7",
-    "sentence-transformers>=3.0",
+    "openpyxl>=3.1",
 ]
 
-[project.scripts]
-groundwater-mcp = "groundwater_mcp.server:main"
-
 [project.optional-dependencies]
+semantic = [
+    "sentence-transformers>=3.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+
+[project.scripts]
+groundwater-mcp = "groundwater_mcp.server:main"
 
 [build-system]
 requires = ["uv_build>=0.10.6,<0.11.0"]

@@ -91,8 +91,8 @@ def test_transient_heads_evolve_across_time(transient_model):
     from groundwater_mcp.tools.postprocess import _impl_read_heads
 
     _impl_run_simulation(transient_model, silent=True)
-    h0 = _impl_read_heads(transient_model, kstpkper=[0, 0], layer=0)
-    h2 = _impl_read_heads(transient_model, kstpkper=[2, 2], layer=0)
+    h0 = _impl_read_heads(transient_model, kstpkper=[0, 0], layer=0, include_values=True)
+    h2 = _impl_read_heads(transient_model, kstpkper=[2, 2], layer=0, include_values=True)
     flat0 = [v for row in h0["values"] for v in row]
     flat2 = [v for row in h2["values"] for v in row]
     max_diff = max(abs(x - y) for x, y in zip(flat0, flat2))
@@ -172,7 +172,9 @@ def test_transient_calibration_chain(transient_model):
     assert "error" not in run
     assert run["iterations"] >= 0
 
-    summ = _impl_summarise_calibration(model, setup["pst_file"])
-    assert "error" not in summ
-    assert len(summ["parameter_estimates"]) == 1
-    assert summ["parameter_estimates"][0]["name"] == "kmult"
+    # The synthetic obs file is static (the forward model never regenerates
+    # it), so GLM cannot build a Jacobian and dies before writing residuals.
+    # 7e-B2: summarise_calibration must fail loudly rather than report a
+    # successful-looking empty result.
+    with pytest.raises(FileNotFoundError, match="residual"):
+        _impl_summarise_calibration(model, setup["pst_file"])

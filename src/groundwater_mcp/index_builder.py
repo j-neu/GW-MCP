@@ -167,6 +167,8 @@ def _get_repo_tree(
     """Return the full recursive file tree for a repo."""
     url = f"{_GITHUB_API}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     data = _api_get(url, token)
+    if not isinstance(data, dict):
+        return []
     return [item for item in data.get("tree", []) if item["type"] == "blob"]
 
 
