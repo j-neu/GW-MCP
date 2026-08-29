@@ -6,3 +6,17 @@
 __pycache__/
 *.py[cod]
 
+# MODFLOW 6 model outputs and large binaries created in Agent Manager
+# worktrees during 6d/validation runs. Never commit these: model input files
+# belong in the holdout folder, and binary outputs (.grb/.hds/.cbb/.npy) can
+# be hundreds of MB each — a single accidental commit bloats the shared git
+# object store permanently. Clean them up when a worktree session closes.
+*.grb
+*.hds
+*.cbb
+*.cbc
+*.npy
+*.ucn
+*.png
+*.csv
+

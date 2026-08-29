@@ -82,6 +82,33 @@ removed) — every target in this playbook calibrates via PEST++ only.
    `adopt_model` points at the (read-only) holdout model directory — the holdout
    folder is permission allow-listed.
 
+## Worktree hygiene (added 2026-08-23 after the 12 GB bloat)
+
+The first wave of worktrees consumed ~12 GB because they branched from a
+pre-deletion commit (`08103b5`) that still tracked the tutorial/GMS archives
+(~708 MB of zips + PDFs per checkout, 10x duplicated) plus model run outputs
+(.grb/.hds/.cbb/.npy, up to ~2.5 GB per regional run). Rules going forward:
+
+1. **Base is now clean** — current `main` tracks no archives or large files, so
+   worktrees created from it start lean. Do not branch validation worktrees
+   from old commits; always create them from current `main` (Agent Manager does
+   this by default).
+2. **Never commit large binaries.** `.gitignore` now excludes `.grb/.hds/.cbb/
+   .cbc/.npy/.ucn/*.png/*.csv` — model outputs are validation artifacts, not
+   repo content. A committed 829 MB `.grb` would bloat the shared git object
+   store permanently.
+3. **When a session closes**: extract the raw `run-log.md`/report into
+   `research/discovery/sessions/` first (copy it), then stop/remove the
+   worktree via Agent Manager (`stop` removes the session; then remove the git
+   worktree with `git worktree remove --force .kilo/worktrees/<name>`, retrying
+   if a file is briefly locked). Model outputs do not need preserving once the
+   session log is written. **Then delete the branch** (`git branch -D <name>`)
+   — otherwise committed model inputs keep the objects alive in the shared git
+   store forever. The session log is the record; the branch is not a backup.
+4. **Keep the model workspace inside the worktree** (unchanged) — the
+   ~100 MB fixture data stays in the holdout folder, never copied into
+   worktrees.
+
 ## Rerun-improvement loop (per target)
 
 1. **Run 1 (closed-book):** attempt the full journey; log tool-call sequence,
