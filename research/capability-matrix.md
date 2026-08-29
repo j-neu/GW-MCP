@@ -194,7 +194,7 @@ No capability-coverage rows changed.
 
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
 |---|---|---|---|---|
-| PEST++ GLM / IES | covered | `setup_calibration`, `run_pestpp_glm`, `run_pestpp_ies` | | `setup_calibration` emits the whole interface (external-array rewire, wide-token template, ins from the OBS CSV, Windows-safe forward wrapper, safe `.pst` defaults); GLM phi from `.iobj` |
+| PEST++ GLM / IES | covered | `setup_calibration`, `run_pestpp_glm`, `run_pestpp_ies` | | `setup_calibration` emits the whole interface (external-array rewire, wide-token template, ins from the OBS CSV, Windows-safe forward wrapper, safe `.pst` defaults); GLM phi from `.iobj`; `summarise_calibration` auto-detects the engine and summarises IES runs too (2026-08-29) — phi from the `.phi.actual.csv` mean column, parameter estimates from the final ensemble `par.csv` (mean + spread), residuals from `.rei` or the obs ensemble |
 | PEST++ PPU (prediction uncertainty) | covered | `run_ies_uncertainty` | | Ensemble percentiles |
 | PEST++ SEN (sensitivities) | **gap** | — | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_run_sen.pst), neversink_workflow | |
 | PEST++ Pareto / SWP (sweep) | **gap** | — | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_sweep.pst, run_opt.pst) | |

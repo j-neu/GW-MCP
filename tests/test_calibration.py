@@ -75,7 +75,9 @@ def _write_minimal_out(path: Path, obs_names: list[str], values: list[float]) ->
     path.write_text("\n".join(lines) + "\n")
 
 
-def _write_minimal_rei(path: Path, obs_names: list[str], obs_vals: list[float] | None = None) -> None:
+def _write_minimal_rei(
+    path: Path, obs_names: list[str], obs_vals: list[float] | None = None
+) -> None:
     """Write a minimal PEST-style residual (.rei) file readable by pyemu.
 
     pyemu's ``read_resfile`` scans for the header line containing "name" and
@@ -257,11 +259,7 @@ def test_parse_par_file_raises_on_missing_file(tmp_path):
 
 def test_parse_par_file_reads_values(tmp_path):
     par_file = tmp_path / "model.par"
-    par_file.write_text(
-        "single point\n"
-        "k        12.345    1.0   0\n"
-        "ss       0.00234   1.0   0\n"
-    )
+    par_file.write_text("single point\nk        12.345    1.0   0\nss       0.00234   1.0   0\n")
     result = _parse_par_file(par_file)
     assert result["k"] == pytest.approx(12.345)
     assert result["ss"] == pytest.approx(0.00234)
@@ -296,8 +294,7 @@ def test_setup_pest_control_returns_expected_keys(pst_model):
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
     )
-    keys = ("model", "pst_file", "n_observations", "n_adjustable_parameters",
-            "n_total_parameters")
+    keys = ("model", "pst_file", "n_observations", "n_adjustable_parameters", "n_total_parameters")
     for key in keys:
         assert key in result, f"Missing key: {key}"
 
@@ -340,9 +337,7 @@ def test_setup_pest_control_pestpp_options_written(pst_model):
 
 def test_setup_pest_control_unknown_model_raises():
     with pytest.raises(KeyError):
-        _impl_setup_pest_control(
-            "no_such_model_xyz", {}, {}, [], []
-        )
+        _impl_setup_pest_control("no_such_model_xyz", {}, {}, [], [])
 
 
 def test_setup_pest_control_writes_relative_io_paths(calib_workspace):
@@ -430,8 +425,7 @@ def test_setup_pest_control_warns_on_windows_bat_command(calib_workspace, monkey
     agent fixes it before a confusing pestpp runtime failure."""
     model = calib_workspace
     ws = resolve_workspace(model)
-    monkeypatch.setattr("groundwater_mcp.tools.calibration.platform.system",
-                        lambda: "Windows")
+    monkeypatch.setattr("groundwater_mcp.tools.calibration.platform.system", lambda: "Windows")
     result = _impl_setup_pest_control(
         model=model,
         obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
@@ -565,9 +559,11 @@ def test_setup_pest_control_output_files_override(tmp_path, model_name):
 def test_run_pestpp_glm_binary_not_found_raises(pst_model, monkeypatch):
     import groundwater_mcp.tools.calibration as cal_module
 
-    monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: (_ for _ in ()).throw(
-        RuntimeError("PEST++ binary 'pestpp-glm' not found")
-    ))
+    monkeypatch.setattr(
+        cal_module,
+        "_find_pestpp_binary",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("PEST++ binary 'pestpp-glm' not found")),
+    )
 
     with pytest.raises(RuntimeError, match="PEST\\+\\+"):
         _impl_run_pestpp_glm(*pst_model)
@@ -671,8 +667,15 @@ def test_run_pestpp_ies_returns_expected_keys(pst_model, monkeypatch):
     model, pst_file = pst_model
     result = _impl_run_pestpp_ies(model, pst_file, num_reals=10)
 
-    keys = ("model", "pst_file", "converged", "final_phi_mean",
-            "final_phi_std", "iterations", "num_reals")
+    keys = (
+        "model",
+        "pst_file",
+        "converged",
+        "final_phi_mean",
+        "final_phi_std",
+        "iterations",
+        "num_reals",
+    )
     for key in keys:
         assert key in result, f"Missing key: {key}"
     assert result["num_reals"] == 10
@@ -706,8 +709,14 @@ def test_summarise_calibration_returns_expected_keys(pst_model):
     model, pst_file = pst_model
     result = _impl_summarise_calibration(model, pst_file)
 
-    keys = ("model", "pst_file", "phi_progress", "parameter_estimates",
-            "residual_statistics", "residuals")
+    keys = (
+        "model",
+        "pst_file",
+        "phi_progress",
+        "parameter_estimates",
+        "residual_statistics",
+        "residuals",
+    )
     for key in keys:
         assert key in result, f"Missing key: {key}"
 
@@ -779,6 +788,187 @@ def test_summarise_calibration_reads_residuals(pst_model):
     assert len(result["residuals"]) == 5
 
 
+# ---------------------------------------------------------------------------
+# _impl_summarise_calibration — pestpp-ies (ensemble) support
+# ---------------------------------------------------------------------------
+# pestpp-ies never writes the GLM artifacts (.par, .iobj): it writes
+# {base}.phi.actual.csv, {base}.{N}.par.csv and {base}.{N}.obs.csv per
+# iteration. Before this work summarise_calibration looked for {base}.par
+# (a GLM artifact) and failed with OUTPUT_FILE_MISSING on every IES run
+# (6d zenodo-21381071 rerun-3 finding, filed 2026-08-29).
+
+
+def _write_ies_artifacts(
+    ws: Path,
+    base: str,
+    *,
+    n_reals: int = 3,
+    with_rei: bool = False,
+) -> None:
+    """Write the artifacts a completed pestpp-ies run leaves behind:
+    {base}.phi.actual.csv (iteration ensemble-mean phi), {base}.1.par.csv
+    (final parameter ensemble) and {base}.1.obs.csv (final observation
+    ensemble), plus optionally a .rei residual file.
+
+    The ensemble columns are chosen so the hand-computed expectations in the
+    tests are exact: k mean 3.0, ss mean 0.002; obs ensemble means
+    [5.0, 4.7, 4.6, 4.4, 4.2] against PST obsvals [5.0, 4.8, 4.6, 4.4, 4.2]
+    give residuals [0, 0.1, 0, 0, 0].
+    """
+    (ws / f"{base}.phi.actual.csv").write_text(
+        "iteration,total_runs,mean,standard_deviation,min,max,0,1,2,base\n"
+        "0,3,10.0,1.0,9.0,11.0,9.5,10.5,10.0,0\n"
+        "1,6,4.0,1.0,3.0,5.0,3.5,4.5,4.0,0\n"
+    )
+    (ws / f"{base}.1.par.csv").write_text(
+        "realization,k,ss\n0,2.0,0.001\n1,3.0,0.002\n2,4.0,0.003\n"
+    )
+    (ws / f"{base}.1.obs.csv").write_text(
+        "realization,h1,h2,h3,h4,h5\n"
+        "0,5.0,4.7,4.6,4.4,4.2\n"
+        "1,5.0,4.7,4.6,4.4,4.2\n"
+        "2,5.0,4.7,4.6,4.4,4.2\n"
+    )
+    if with_rei:
+        _write_minimal_rei(ws / f"{base}.rei", ["h1", "h2", "h3", "h4", "h5"])
+
+
+def _setup_pst_no_glm_artifacts(calib_workspace) -> tuple[str, str]:
+    """calib_workspace plus a written .pst, but none of the artifacts a
+    pestpp run leaves behind (so each test writes its own)."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    obs_data = {
+        f"h{i}": {"obsval": 5.0 - 0.2 * (i - 1), "weight": 1.0, "obgnme": "heads"}
+        for i in range(1, 6)
+    }
+    par_data = {
+        "k": {"parval1": 10.0, "parlbnd": 0.1, "parubnd": 1000.0, "pargp": "hk"},
+        "ss": {"parval1": 0.001, "parlbnd": 1e-6, "parubnd": 0.1, "pargp": "ss"},
+    }
+    setup = _impl_setup_pest_control(
+        model=model,
+        obs_data=obs_data,
+        par_data=par_data,
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        pestpp_options={"noptmax": 5},
+    )
+    return model, setup["pst_file"]
+
+
+def test_summarise_calibration_ies_phi_and_parameter_ensemble(calib_workspace):
+    """An IES run is summarised from its own artifacts: phi from the
+    .phi.actual.csv mean column, parameter estimates from the final ensemble
+    par.csv (ensemble mean/std/min/max), with no .par file present."""
+    model, pst_file = _setup_pst_no_glm_artifacts(calib_workspace)
+    ws = resolve_workspace(model)
+    _write_ies_artifacts(ws, Path(pst_file).stem)
+
+    result = _impl_summarise_calibration(model, pst_file)
+
+    # phi from the IES phi.actual.csv mean column, not a sum of every column
+    assert result["phi_progress"] == [
+        {"iteration": 0, "phi": 10.0},
+        {"iteration": 1, "phi": 4.0},
+    ]
+    assert result["verdict"]["final_phi"] == pytest.approx(4.0)
+
+    # parameter estimates from the ensemble: estimated_value = ensemble mean
+    est = {e["name"]: e for e in result["parameter_estimates"]}
+    assert est["k"]["estimated_value"] == pytest.approx(3.0)
+    assert est["k"]["ensemble_std"] == pytest.approx(float(np.std([2.0, 3.0, 4.0])))
+    assert est["k"]["ensemble_min"] == pytest.approx(2.0)
+    assert est["k"]["ensemble_max"] == pytest.approx(4.0)
+    assert est["k"]["n_realizations"] == 3
+    assert est["ss"]["estimated_value"] == pytest.approx(0.002)
+
+
+def test_summarise_calibration_ies_residuals_from_obs_ensemble(calib_workspace):
+    """Without a .rei, an IES run's residuals come from the final observation
+    ensemble ({base}.{N}.obs.csv) compared against the PST measured values."""
+    model, pst_file = _setup_pst_no_glm_artifacts(calib_workspace)
+    ws = resolve_workspace(model)
+    _write_ies_artifacts(ws, Path(pst_file).stem)
+
+    result = _impl_summarise_calibration(model, pst_file)
+
+    stats = result["residual_statistics"]
+    assert stats["n_observations"] == 5
+    assert stats["rmse"] == pytest.approx(float(np.sqrt(0.1**2 / 5)))
+    assert stats["bias"] == pytest.approx(0.02)
+    assert len(result["residuals"]) == 5
+    assert result["n_residuals_total"] == 5
+
+
+def test_summarise_calibration_ies_uses_rei_when_present(calib_workspace):
+    """When an IES run does leave a .rei, the existing .rei residual path is
+    used (identical to the GLM path)."""
+    model, pst_file = _setup_pst_no_glm_artifacts(calib_workspace)
+    ws = resolve_workspace(model)
+    _write_ies_artifacts(ws, Path(pst_file).stem, with_rei=True)
+
+    result = _impl_summarise_calibration(model, pst_file)
+
+    stats = result["residual_statistics"]
+    assert stats["n_observations"] == 5
+    assert stats["rmse"] is not None
+    assert len(result["residuals"]) == 5
+
+
+def test_summarise_calibration_ies_glm_artifacts_still_win_when_both(calib_workspace):
+    """A workspace holding both a GLM .par/.iobj/.rei and IES ensemble files is
+    summarised as GLM — the .par file wins (a real run produces one or the
+    other, never both)."""
+    model, pst_file = _setup_pst_no_glm_artifacts(calib_workspace)
+    ws = resolve_workspace(model)
+    base = Path(pst_file).stem
+    _write_ies_artifacts(ws, base)
+    (ws / f"{base}.par").write_text("single point\nk        42.0  1.0  0\nss       0.005  1.0  0\n")
+    (ws / f"{base}.iobj").write_text(
+        "iteration,model_runs_completed,total_phi,measurement_phi\n"
+        "0,0,150.0,150.0\n"
+        "1,10,60.0,60.0\n"
+    )
+    _write_minimal_rei(ws / f"{base}.rei", ["h1", "h2", "h3", "h4", "h5"])
+
+    result = _impl_summarise_calibration(model, pst_file)
+
+    assert result["engine"] == "glm"
+    k_est = next(e for e in result["parameter_estimates"] if e["name"] == "k")
+    assert k_est["estimated_value"] == pytest.approx(42.0)
+    assert result["phi_progress"][-1]["phi"] == pytest.approx(60.0)
+    assert result["residual_statistics"]["n_observations"] == 5
+
+
+def test_summarise_calibration_ies_mcp_envelope(calib_workspace):
+    """An IES workspace returns a successful result through the MCP protocol
+    layer — the old behaviour raised OUTPUT_FILE_MISSING on the missing
+    {base}.par."""
+    import asyncio
+    import json
+
+    from groundwater_mcp.server import mcp
+
+    model, pst_file = _setup_pst_no_glm_artifacts(calib_workspace)
+    ws = resolve_workspace(model)
+    _write_ies_artifacts(ws, Path(pst_file).stem)
+
+    result = asyncio.run(
+        mcp.call_tool(
+            "summarise_calibration",
+            {
+                "model": model,
+                "pst_file": pst_file,
+            },
+        )
+    )
+    data = json.loads(result[0].text)
+    assert data.get("error") is not True
+    assert data["verdict"]["final_phi"] == pytest.approx(4.0)
+    assert data["residual_statistics"]["n_observations"] == 5
+
+
 def test_summarise_calibration_unknown_model_raises():
     with pytest.raises(KeyError):
         _impl_summarise_calibration("no_such_model_xyz", "fake.pst")
@@ -815,10 +1005,12 @@ def test_run_ies_uncertainty_returns_expected_keys(pst_model):
 
     rng = np.random.default_rng(42)
     obs_csv = ws / f"{pst_stem}.3.obs.csv"
-    pd.DataFrame({
-        "h1": rng.normal(5.0, 0.2, 50),
-        "h2": rng.normal(4.8, 0.15, 50),
-    }).to_csv(obs_csv)
+    pd.DataFrame(
+        {
+            "h1": rng.normal(5.0, 0.2, 50),
+            "h2": rng.normal(4.8, 0.15, 50),
+        }
+    ).to_csv(obs_csv)
 
     result = _impl_run_ies_uncertainty(model, pst_file, ["h1", "h2"])
 
@@ -1029,8 +1221,7 @@ def test_integration_full_calibration_chain_windows(tmp_path, model_name):
     )
 
     obs_data = {
-        f"h{i}": {"obsval": v, "weight": 1.0}
-        for i, v in enumerate([7.0, 6.5, 5.5, 4.5, 4.0], 1)
+        f"h{i}": {"obsval": v, "weight": 1.0} for i, v in enumerate([7.0, 6.5, 5.5, 4.5, 4.0], 1)
     }
     par_data = {"kmult": {"parval1": 1.0, "parlbnd": 0.01, "parubnd": 100.0, "pargp": "hk"}}
 

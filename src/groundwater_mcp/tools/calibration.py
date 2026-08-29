@@ -84,6 +84,7 @@ def _find_pestpp_binary(exe_name: str) -> str:
     # 3. FloPy package bin directory (some get-pestpp invocations write here)
     try:
         import flopy
+
         candidates.append(Path(flopy.__file__).parent / "bin" / exe_name)
     except Exception:
         pass
@@ -125,9 +126,7 @@ def _read_phi_csv(phi_csv: Path) -> tuple[list[dict], float | None]:
         numeric = phi_df.select_dtypes(include="number")
         phi_totals = numeric.sum(axis=1)
 
-        phi_progress = [
-            {"iteration": i, "phi": float(v)} for i, v in enumerate(phi_totals)
-        ]
+        phi_progress = [{"iteration": i, "phi": float(v)} for i, v in enumerate(phi_totals)]
         final_phi = float(phi_totals.iloc[-1]) if len(phi_totals) > 0 else None
         return phi_progress, final_phi
     except OSError:
@@ -150,9 +149,7 @@ def _read_iobj_phi(iobj_path: Path) -> tuple[list[dict], float | None]:
             if "total_phi" in df.columns
             else df.select_dtypes(include="number").iloc[:, 0]
         )
-        phi_progress = [
-            {"iteration": int(i), "phi": float(v)} for i, v in enumerate(total)
-        ]
+        phi_progress = [{"iteration": int(i), "phi": float(v)} for i, v in enumerate(total)]
         final_phi = float(total.iloc[-1]) if len(total) > 0 else None
         return phi_progress, final_phi
     except OSError:
@@ -209,6 +206,101 @@ def _read_ies_phi(ws: Path, base_name: str) -> tuple[list[dict], float | None]:
         progress.append({"iteration": int(row["iteration"]), "phi": phi})
     final_phi = progress[-1]["phi"] if progress else None
     return progress, final_phi
+
+
+def _latest_ensemble_file(ws: Path, base_name: str, suffix: str) -> Path | None:
+    """Return the highest-iteration pestpp-ies ensemble file ``<case>.<N>.csv``.
+
+    ``suffix`` is ``"par"`` or ``"obs"``. The iteration number is sorted
+    numerically (a lexicographic sort would misorder iteration 10 before 9).
+    """
+    pattern = re.compile(rf"\.(\d+)\.{re.escape(suffix)}\.csv$")
+    files = []
+    for p in ws.glob(f"{base_name}.*.{suffix}.csv"):
+        m = pattern.search(p.name)
+        if m is not None:
+            files.append((int(m.group(1)), p))
+    if not files:
+        return None
+    return max(files, key=lambda t: t[0])[1]
+
+
+def _read_ies_parameter_ensemble(ws: Path, base_name: str) -> dict[str, dict]:
+    """Read the final pestpp-ies parameter ensemble ``<case>.<N>.par.csv``.
+
+    Columns are parameter names, rows are realisations (a non-numeric leading
+    index column holds the realisation id). Returns a dict keyed by lower-case
+    parameter name with ``mean``/``std``/``min``/``max``/``n``. ``{}`` when no
+    ensemble file exists.
+    """
+    par_csv = _latest_ensemble_file(ws, base_name, "par")
+    if par_csv is None:
+        return {}
+    df = pd.read_csv(par_csv)
+    ensemble: dict[str, dict] = {}
+    for col in df.select_dtypes(include="number").columns:
+        vals = df[col].dropna().astype(float)
+        if len(vals) == 0:
+            continue
+        ensemble[str(col).lower()] = {
+            "mean": float(vals.mean()),
+            "std": float(vals.std(ddof=0)),
+            "min": float(vals.min()),
+            "max": float(vals.max()),
+            "n": int(len(vals)),
+        }
+    return ensemble
+
+
+def _read_ies_obs_ensemble(ws: Path, base_name: str, pst) -> pd.DataFrame | None:
+    """Residuals for an IES run without a ``.rei``: from the final observation
+    ensemble ``<case>.<N>.obs.csv`` against the PST observed values.
+
+    Returns a DataFrame with the same columns ``pst.res`` exposes (name,
+    measured, modelled, residual, weight) so the shared residual-processing
+    path can consume it. The modelled value for each observation is the
+    ensemble mean across realisations. ``None`` when no ensemble file exists.
+    """
+    obs_csv = _latest_ensemble_file(ws, base_name, "obs")
+    if obs_csv is None:
+        return None
+    obs_df = pd.read_csv(obs_csv)
+    rows: list[dict] = []
+    for col in obs_df.select_dtypes(include="number").columns:
+        obs_name = str(col)
+        if obs_name not in pst.observation_data.index:
+            continue
+        obs_row = pst.observation_data.loc[obs_name]
+        measured = float(obs_row["obsval"])
+        weight = float(obs_row["weight"])
+        modelled = float(obs_df[col].dropna().astype(float).mean())
+        rows.append(
+            {
+                "name": obs_name,
+                "measured": measured,
+                "modelled": modelled,
+                "residual": measured - modelled,
+                "weight": weight,
+            }
+        )
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
+def _detect_pestpp_engine(ws: Path, base_name: str) -> str:
+    """Detect which PEST++ engine produced a run's artifacts.
+
+    pestpp-glm leaves ``<case>.par`` and ``<case>.iobj``; pestpp-ies leaves
+    per-iteration ensemble files ``<case>.<N>.par.csv`` / ``<case>.<N>.obs.csv``
+    and never a plain ``<case>.par``. A ``.par`` wins when both exist (a real
+    run produces one or the other, never both).
+    """
+    if (ws / f"{base_name}.par").exists():
+        return "glm"
+    if any(ws.glob(f"{base_name}.*.par.csv")):
+        return "ies"
+    return "glm"
 
 
 def _pestpp_progress(ws: Path, base_name: str, engine: str) -> dict:
@@ -337,7 +429,6 @@ def _impl_start_calibration(
         "status": "running",
         "note": "Poll progress with get_job_status; stop with cancel_job.",
     }
-
 
 
 def _parse_par_file(par_file: Path) -> dict[str, float]:
@@ -492,7 +583,7 @@ def _tpl_substitute(tpl: Path, target: Path, values: dict[str, float]) -> None:
                 token = m.group(0)
                 inner_len = len(token) - 2 * len(marker)
                 inner = f"{value!s}".center(inner_len)
-                new = new[: m.start()] + inner + new[m.end():]
+                new = new[: m.start()] + inner + new[m.end() :]
         out.append(new)
     target.write_text("\n".join(out) + "\n")
 
@@ -582,9 +673,9 @@ def _impl_check_parameter_sensitivity(
         "delta": delta,
         "parameters": results,
         "insensitive": [
-            k for k, r in results.items()
-            if r.get("sensitivity") is not None
-            and r["sensitivity"] < _SENSITIVITY_TOLERANCE
+            k
+            for k, r in results.items()
+            if r.get("sensitivity") is not None and r["sensitivity"] < _SENSITIVITY_TOLERANCE
         ],
     }
     write_meta(model, meta)
@@ -638,8 +729,7 @@ def _impl_calibrate(
     obs_meta = read_meta(model).get("observations")
     n_obs = len(obs_meta.get("sites", [])) if obs_meta else 0
     n_adjustable = sum(
-        1 for attrs in par_data.values()
-        if str(attrs.get("partrans", "log")).lower() != "fixed"
+        1 for attrs in par_data.values() if str(attrs.get("partrans", "log")).lower() != "fixed"
     )
     method, rationale = _choose_method(n_adjustable, n_obs, time_budget_minutes)
 
@@ -697,8 +787,7 @@ def _impl_rewire_npf_k_external(model: str, filename: str | None = None) -> dict
     npf = gwf.get_package("npf")
     if npf is None:
         raise ValueError(
-            "No NPF package found; run add_npf_package before rewiring k to "
-            "an external array."
+            "No NPF package found; run add_npf_package before rewiring k to an external array."
         )
     filename = filename or f"{gwf.name}_k.dat"
     k_arr = np.asarray(npf.k.array)
@@ -761,14 +850,10 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
 
         def cell_to_flat(cell) -> int:
             if len(cell) != 3:
-                raise ValueError(
-                    f"Cell {cell} must be [layer, row, col] on a DIS grid."
-                )
+                raise ValueError(f"Cell {cell} must be [layer, row, col] on a DIS grid.")
             lay, r, c = (int(v) for v in cell)
             if not (0 <= lay < nlay and 0 <= r < nrow and 0 <= c < ncol):
-                raise ValueError(
-                    f"Cell {cell} out of bounds on a {nlay}x{nrow}x{ncol} grid."
-                )
+                raise ValueError(f"Cell {cell} out of bounds on a {nlay}x{nrow}x{ncol} grid.")
             return lay * (nrow * ncol) + r * ncol + c
 
         grid = {"type": "DIS", "nlay": nlay, "nrow": nrow, "ncol": ncol, "ncell": ncell}
@@ -778,14 +863,10 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
 
         def cell_to_flat(cell) -> int:
             if len(cell) != 2:
-                raise ValueError(
-                    f"Cell {cell} must be [layer, node] on a DISV grid."
-                )
+                raise ValueError(f"Cell {cell} must be [layer, node] on a DISV grid.")
             lay, node = (int(v) for v in cell)
             if not (0 <= lay < nlay and 0 <= node < ncpl):
-                raise ValueError(
-                    f"Cell {cell} out of bounds on a {nlay}x{ncpl} DISV grid."
-                )
+                raise ValueError(f"Cell {cell} out of bounds on a {nlay}x{ncpl} DISV grid.")
             return lay * ncpl + node
 
         grid = {"type": "DISV", "nlay": nlay, "ncpl": ncpl, "ncell": ncell}
@@ -810,9 +891,7 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
             )
         scope = spec.get("scope", "all")
         if scope not in ("all", "layer", "cells"):
-            raise ValueError(
-                f"scope must be 'all', 'layer' or 'cells', got '{scope}'."
-            )
+            raise ValueError(f"scope must be 'all', 'layer' or 'cells', got '{scope}'.")
         if "initial" not in spec:
             raise ValueError(f"Parameter '{name}' is missing required 'initial'.")
         initial = float(spec["initial"])
@@ -821,9 +900,7 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
         lower_factor = float(spec.get("lower_factor", 0.1))
         upper_factor = float(spec.get("upper_factor", 10.0))
         if lower_factor >= 1.0 or upper_factor <= 1.0:
-            raise ValueError(
-                f"Parameter '{name}': lower_factor must be < 1 and upper_factor > 1."
-            )
+            raise ValueError(f"Parameter '{name}': lower_factor must be < 1 and upper_factor > 1.")
 
         cells: list[int] = []
         if scope == "all":
@@ -834,9 +911,7 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
                 raise ValueError(f"Parameter '{name}' scope=layer requires 'layer'.")
             layer = int(layer)
             if not (0 <= layer < nlay):
-                raise ValueError(
-                    f"Parameter '{name}' layer {layer} out of range (nlay={nlay})."
-                )
+                raise ValueError(f"Parameter '{name}' layer {layer} out of range (nlay={nlay}).")
             per_layer = ncell // nlay
             cells = list(range(layer * per_layer, (layer + 1) * per_layer))
         else:  # scope == "cells"
@@ -845,17 +920,19 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
                 raise ValueError(f"Parameter '{name}' scope=cells requires 'cells'.")
             cells = [cell_to_flat(c) for c in raw_cells]
 
-        params.append({
-            "name": name,
-            "target": target,
-            "scope": scope,
-            "layer": spec.get("layer"),
-            "cells": cells,
-            "initial": initial,
-            "lower_bound": initial * lower_factor,
-            "upper_bound": initial * upper_factor,
-            "partrans": str(spec.get("partrans", "log")).lower(),
-        })
+        params.append(
+            {
+                "name": name,
+                "target": target,
+                "scope": scope,
+                "layer": spec.get("layer"),
+                "cells": cells,
+                "initial": initial,
+                "lower_bound": initial * lower_factor,
+                "upper_bound": initial * upper_factor,
+                "partrans": str(spec.get("partrans", "log")).lower(),
+            }
+        )
 
     # Assign cells to parameters; every cell must be claimed exactly once.
     cell_param: dict[int, str] = {}
@@ -883,9 +960,7 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     }
 
 
-def _impl_generate_tpl(
-    model: str, parameterisation: dict, target_file: str | None = None
-) -> dict:
+def _impl_generate_tpl(model: str, parameterisation: dict, target_file: str | None = None) -> dict:
     """Generate a PEST template for the parameterised cells (7e-A2.2).
 
     One wide fixed-width token per array cell in the external file's layout
@@ -1089,9 +1164,7 @@ def _impl_setup_calibration(
 
     # 3. Observation interface from the registered targets (obs_source="model").
     if obs_source != "model":
-        raise ValueError(
-            f"setup_calibration supports obs_source='model', got '{obs_source}'."
-        )
+        raise ValueError(f"setup_calibration supports obs_source='model', got '{obs_source}'.")
     obs_meta = read_meta(model).get("observations")
     if not obs_meta or not obs_meta.get("sites"):
         raise ValueError(
@@ -1264,9 +1337,7 @@ def _impl_setup_pest_control(
         if output_files:
             pestpp_options["output_files"] = output_files
     elif obs_source != "explicit":
-        raise ValueError(
-            f"obs_source must be 'explicit' or 'model', got '{obs_source}'."
-        )
+        raise ValueError(f"obs_source must be 'explicit' or 'model', got '{obs_source}'.")
 
     # Resolve template/instruction paths relative to the workspace
     def _resolve(p: str) -> Path:
@@ -1310,27 +1381,17 @@ def _impl_setup_pest_control(
     # Derive paired in/out file names from tpl/ins paths (relative, so the
     # PST contains no absolute paths — pestpp-glm rejects absolute paths
     # with spaces as "wrong number of tokens").
-    in_files = [
-        p.name[:-4] if p.suffix.lower() == ".tpl" else p.name + ".in"
-        for p in tpl_paths
-    ]
-    out_files = [
-        p.name[:-4] if p.suffix.lower() == ".ins" else p.name + ".out"
-        for p in ins_paths
-    ]
+    in_files = [p.name[:-4] if p.suffix.lower() == ".tpl" else p.name + ".in" for p in tpl_paths]
+    out_files = [p.name[:-4] if p.suffix.lower() == ".ins" else p.name + ".out" for p in ins_paths]
     output_files = pestpp_options.pop("output_files", None)
     if output_files is not None:
         if len(output_files) != len(ins_paths):
-            raise ValueError(
-                "len(output_files) must equal len(instruction_files)"
-            )
+            raise ValueError("len(output_files) must equal len(instruction_files)")
         out_files = [Path(o).name for o in output_files]
     input_files = pestpp_options.pop("input_files", None)
     if input_files is not None:
         if len(input_files) != len(tpl_paths):
-            raise ValueError(
-                "len(input_files) must equal len(template_files)"
-            )
+            raise ValueError("len(input_files) must equal len(template_files)")
         in_files = [Path(f).name for f in input_files]
 
     pst.model_input_data = pd.DataFrame(
@@ -1373,9 +1434,7 @@ def _impl_setup_pest_control(
             unmatched.append(obs_name)
             continue
         canonical = obs_index[key]
-        obs_df.loc[canonical, "obsval"] = float(
-            attrs.get("obsval", attrs.get("value", 0.0))
-        )
+        obs_df.loc[canonical, "obsval"] = float(attrs.get("obsval", attrs.get("value", 0.0)))
         obs_df.loc[canonical, "weight"] = float(attrs.get("weight", 1.0))
         if "obgnme" in attrs:
             obs_df.loc[canonical, "obgnme"] = str(attrs["obgnme"])
@@ -1622,12 +1681,15 @@ def _impl_summarise_calibration(
 ) -> dict:
     """Summarise PEST++ calibration results.
 
-    Reads the phi progress CSV, the optimal parameter file (.par), and the
-    residuals file (.rei) from the workspace.  Computes RMSE, bias, and R²,
-    plus a calibration verdict (7f-H4.2): whether phi improved versus the
-    previous run, which parameters sit at their bounds, which parameters are
-    identifiable (from check_parameter_sensitivity), and whether the fit is
-    within a supplied measurement_error.
+    Auto-detects the engine from the run artifacts (GLM ``<case>.par``/``.iobj``
+    vs IES ``<case>.*.par.csv``/``.obs.csv``) and reads the matching outputs:
+    phi progress, parameter estimates (GLM: the optimal ``.par``; IES: the
+    final ensemble ``.par.csv`` mean + spread), and residuals (from the ``.rei``
+    or, for IES without one, the final observation ensemble).  Computes RMSE,
+    bias, and R², plus a calibration verdict (7f-H4.2): whether phi improved
+    versus the previous run, which parameters sit at their bounds, which
+    parameters are identifiable (from check_parameter_sensitivity), and whether
+    the fit is within a supplied measurement_error.
 
     ``residuals`` is capped at ``max_residuals`` (default 500, 7e-A1.6); the
     full residual table is always written to ``<model>_residuals.csv`` and
@@ -1651,16 +1713,25 @@ def _impl_summarise_calibration(
     pst = pyemu.Pst(str(pst_path))
     par_df = pst.parameter_data
     base_name = pst_path.stem
+    engine = _detect_pestpp_engine(ws, base_name)
 
     # --- Phi progress ---
-    # GLM writes <case>.iobj, IES writes <case>.phi.actual.csv (7e-B1.2).
-    phi_progress, _ = _read_glm_phi(ws, base_name)
+    # GLM writes <case>.iobj, IES writes <case>.phi.actual.csv. The IES file is
+    # read with the ensemble-mean reader (its iteration row has mean/std/min/max
+    # plus per-realisation columns — summing them is not a phi value).
+    if engine == "ies":
+        phi_progress, _ = _read_ies_phi(ws, base_name)
+    else:
+        phi_progress, _ = _read_glm_phi(ws, base_name)
 
     # --- Residuals ---
-    # A missing .rei means the PEST++ run died before writing residuals — the
-    # old behaviour silently reported `rmse: None, n_observations: 0` as a
-    # *success*, which an agent reads as "ran, zero observations" rather than
-    # "died before residuals". Fail loudly instead (7e-B2).
+    # A missing residual source means the PEST++ run died before writing
+    # residuals — the old behaviour silently reported
+    # `rmse: None, n_observations: 0` as a *success*, which an agent reads as
+    # "ran, zero observations" rather than "died before residuals". Fail loudly
+    # instead (7e-B2). pestpp-ies writes no .rei when the run is stopped early
+    # but does write a final observation ensemble, so the IES path falls back
+    # to that ({case}.{N}.obs.csv vs the PST measured values) before failing.
     residual_stats: dict = {
         "rmse": None,
         "bias": None,
@@ -1674,14 +1745,11 @@ def _impl_summarise_calibration(
         ws / f"{base_name}.rei",
         ws / f"{base_name}.base.rei",
     ]
-    if not any(p.exists() for p in rei_candidates):
-        raise FileNotFoundError(
-            f"No residual file ({base_name}.res / .rei / .base.rei) found in "
-            f"{ws}. The PEST++ run died before writing residuals — check the "
-            "run log (the .pst stdout/stderr) for convergence or parameter-"
-            "bound issues, then re-run the calibration."
-        )
-    res_df = pst.res  # reads {base}.res/.rei automatically
+    res_df = None
+    if any(p.exists() for p in rei_candidates):
+        res_df = pst.res  # reads {base}.res/.rei automatically
+    elif engine == "ies":
+        res_df = _read_ies_obs_ensemble(ws, base_name, pst)
     if res_df is not None:
         residual_stats = _compute_residual_stats(res_df)
         residuals = (
@@ -1690,25 +1758,53 @@ def _impl_summarise_calibration(
             .astype({"measured": float, "modelled": float, "residual": float, "weight": float})
             .to_dict("records")
         )
+    elif engine == "ies":
+        raise FileNotFoundError(
+            f"No residual file ({base_name}.res / .rei / .base.rei) and no "
+            f"ensemble observation file ({base_name}.*.obs.csv) found in {ws}. "
+            "The PEST++ run died before writing residuals — check the run log "
+            "(the .pst stdout/stderr) for convergence or parameter-bound issues, "
+            "then re-run the calibration."
+        )
+    else:
+        raise FileNotFoundError(
+            f"No residual file ({base_name}.res / .rei / .base.rei) found in "
+            f"{ws}. The PEST++ run died before writing residuals — check the "
+            "run log (the .pst stdout/stderr) for convergence or parameter-"
+            "bound issues, then re-run the calibration."
+        )
 
     # --- Parameter estimates ---
+    # GLM: {base}.par (single best-fit point). IES: the final parameter
+    # ensemble {base}.{N}.par.csv — the reported estimate is the ensemble mean,
+    # with the ensemble spread alongside.
+    if engine == "ies":
+        ensemble = _read_ies_parameter_ensemble(ws, base_name)
+    else:
+        ensemble = {}
     par_file = ws / f"{base_name}.par"
-    par_values = _parse_par_file(par_file)
+    par_values = _parse_par_file(par_file) if engine == "glm" else {}
 
     par_estimates = []
     for par_name in par_df.index:
         row = par_df.loc[par_name]
-        par_estimates.append(
-            {
-                "name": par_name,
-                "initial_value": float(row["parval1"]),
-                "estimated_value": par_values.get(par_name.lower()),
-                "lower_bound": float(row["parlbnd"]),
-                "upper_bound": float(row["parubnd"]),
-                "group": str(row["pargp"]),
-                "transform": str(row["partrans"]),
-            }
-        )
+        info = ensemble.get(par_name.lower())
+        est: dict = {
+            "name": par_name,
+            "initial_value": float(row["parval1"]),
+            "estimated_value": info["mean"] if info else par_values.get(par_name.lower()),
+            "lower_bound": float(row["parlbnd"]),
+            "upper_bound": float(row["parubnd"]),
+            "group": str(row["pargp"]),
+            "transform": str(row["partrans"]),
+        }
+        if info:
+            est["ensemble_mean"] = info["mean"]
+            est["ensemble_std"] = info["std"]
+            est["ensemble_min"] = info["min"]
+            est["ensemble_max"] = info["max"]
+            est["n_realizations"] = info["n"]
+        par_estimates.append(est)
 
     # --- Verdict, not just numbers (7f-H4.2) ---
     final_phi = phi_progress[-1]["phi"] if phi_progress else None
@@ -1732,10 +1828,7 @@ def _impl_summarise_calibration(
 
     sensitivity = meta.get("sensitivity")
     if sensitivity:
-        identifiable = [
-            p for p in par_df.index
-            if p not in set(sensitivity.get("insensitive", []))
-        ]
+        identifiable = [p for p in par_df.index if p not in set(sensitivity.get("insensitive", []))]
     else:
         identifiable = None
 
@@ -1767,6 +1860,7 @@ def _impl_summarise_calibration(
     return {
         "model": model,
         "pst_file": str(pst_path),
+        "engine": engine,
         "phi_progress": phi_progress,
         "parameter_estimates": par_estimates,
         "residual_statistics": residual_stats,
@@ -1893,9 +1987,7 @@ def register(mcp: FastMCP) -> None:
         except RuntimeError as exc:
             msg = str(exc)
             if "MODFLOW 6" in msg or "binary" in msg.lower():
-                return _err(
-                    "BINARY_NOT_FOUND", msg, "Install MODFLOW 6 with: get-modflow :"
-                )
+                return _err("BINARY_NOT_FOUND", msg, "Install MODFLOW 6 with: get-modflow :")
             return _err("PEST_ERROR", msg)
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
@@ -2002,9 +2094,7 @@ def register(mcp: FastMCP) -> None:
         except RuntimeError as exc:
             msg = str(exc)
             if "not found" in msg.lower() or "binary" in msg.lower():
-                return _err(
-                    "BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :"
-                )
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
             return _err("PEST_ERROR", msg)
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
@@ -2023,9 +2113,7 @@ def register(mcp: FastMCP) -> None:
         except RuntimeError as exc:
             msg = str(exc)
             if "not found" in msg.lower() or "binary" in msg.lower():
-                return _err(
-                    "BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :"
-                )
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
             return _err("PEST_ERROR", msg)
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
@@ -2045,9 +2133,7 @@ def register(mcp: FastMCP) -> None:
         except RuntimeError as exc:
             msg = str(exc)
             if "not found" in msg.lower() or "binary" in msg.lower():
-                return _err(
-                    "BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :"
-                )
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
             return _err("PEST_ERROR", msg)
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))

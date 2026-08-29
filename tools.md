@@ -464,7 +464,7 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 **Windows model command:** must be a direct executable or a space-free Python wrapper. pestpp cannot run `.bat`/`.cmd` wrappers (it hangs normalising `cmd /c`) nor executables whose path contains spaces; `setup_pest_control` warns when it detects either.
 | `run_pestpp_glm` | `model: str`, `pst_file: str`, `num_workers: int = 1` | `{ converged: bool, final_phi: float, iterations: int }` |
 | `run_pestpp_ies` | `model: str`, `pst_file: str`, `num_reals: int = 50`, `num_workers: int = 1` | `{ final_phi_mean: float, final_phi_std: float, iterations: int }` |
-| `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), and a `verdict` |
+| `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
 | `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
 | `check_parameter_sensitivity` | `model: str`, `parameters: dict[str, float]`, `template_files: list[str]`, `delta: float = 0.1` | Per-parameter sensitivity (mean relative change of the simulated observations) over n+1 forward runs (7f-H3.1) |
 | `calibrate` | `model: str`, `par_data: dict`, `template_files: list[str]`, `time_budget_minutes: float = 30.0`, `noptmax: int = 10`, `num_reals: int = 50` | Chosen method + rationale + the run result (7f-H4.1) |
@@ -480,6 +480,19 @@ writing residuals (no `<case>.res` / `.rei` / `.base.rei`) returns the
 `OUTPUT_FILE_MISSING` envelope naming the missing file — never a
 successful-looking result with `rmse: None, n_observations: 0`. A corrupt
 `.par`/phi CSV surfaces an error instead of empty progress (7e-B3).
+
+**pestpp-ies summarise (2026-08-29):** `summarise_calibration` works for both
+engines, auto-detected from the run artifacts (`engine` in the result):
+`glm` from `<case>.par`/`.iobj`, `ies` from `<case>.*.par.csv`/`.obs.csv`
+(no `.par` present). For an IES run: phi comes from `<case>.phi.actual.csv`'s
+ensemble-mean column (never a sum of the mean/std/min/max/realisation
+columns); parameter estimates come from the final ensemble
+`<case>.<N>.par.csv` with `estimated_value` = the ensemble mean plus
+`ensemble_mean/std/min/max` and `n_realizations`; residuals come from
+`<case>.rei` when present, otherwise from the final observation ensemble
+`<case>.<N>.obs.csv` compared against the PST observed values (modelled =
+ensemble mean per site). Only a run with neither residuals nor an ensemble
+file fails `OUTPUT_FILE_MISSING`.
 
 ---
 
