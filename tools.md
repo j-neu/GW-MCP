@@ -69,6 +69,13 @@ registered target count and the observation loop
 (`read_simulated_observations`, `compare_to_observed`, and
 `setup_pest_control(obs_source="model")`) can consume them.
 
+**Large grids:** the site→cell spatial join over a ~2M-cell regional grid
+with thousands of sites can exceed the client's 60 s call timeout. The server
+completes the import anyway (the call is not transactional with the timeout),
+so after a `-32001 Request timed out` just verify `summarise_model`/the
+obs summary CSV, then continue — the client may need its MCP connection
+re-established before further calls (2026-08-30 rerun-5 finding).
+
 ### Notes
 
 - `import_grid_from_shapefile` uses `flopy.utils.GridGen` (DISV) or derives a regular DIS grid from the polygon bounding box.
@@ -457,7 +464,7 @@ l1 !dum! !o0001!
 l1 !dum! !o0002!
 ```
 
-Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token (skips the dummy column), `w` reads-and-discards a word, `!name!` reads the value into observation `name`. The header marker (`~` or `@`) is arbitrary. Keep one instruction line per line of the model output file.
+Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token (skips the dummy column), `w` reads-and-discards a word, `!name!` reads the value into observation `name`. The header marker (`~` or `@`) is arbitrary. Keep one instruction line per line of the model output file. **CSV output files:** use `!dum!` (not `w`) to discard skipped columns — pestpp rejects `w` on comma-delimited lines ("EOL encountered while executing whitespace instruction"), e.g. `l1 !dum! !name! !dum! !name! …` for a header + comma-separated values row.
 
 **Templates:** must start with `ptf`/`jtf`. Parameter tokens must be **wide fixed-width** (`@          k          @`) — narrow tokens truncate substituted values to `1.0` and zero out the Jacobian.
 
