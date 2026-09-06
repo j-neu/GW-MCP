@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-63 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+66 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -39,6 +39,9 @@ Translate processed spatial data (rasters, shapefiles, CSVs) into MODFLOW 6 mode
 | `import_grid_from_shapefile` | `model: str`, `shapefile: str`, `nlay: int`, `layer_surfaces: list[str]`, `method: "disv" \| "dis" = "disv"`, `target_crs: str \| None` | Grid summary: cell count, layer count, CRS, bounding box |
 | `assign_top_from_raster` | `model: str`, `raster: str`, `layer: int = 0`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Array statistics (min, max, mean), `cells_assigned`, `cells_no_coverage`, optional `warning` |
 | `assign_k_from_zones` | `model: str`, `shapefile: str`, `k_field: str`, `layer: int \| list[int]`, `k33_field: str \| None`, `icelltype_field: str \| None` | Zone summary: zone count, cell count per zone, K range |
+| `assign_k_from_raster` | `model: str`, `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `k33_raster: str \| list[str] \| None`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Per-layer assignments, `cells_assigned`, `cells_no_coverage`, `k_range`, optional `warning` |
+| `assign_ic_from_raster` | `model: str`, `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Per-layer assignments, `cells_assigned`, `cells_no_coverage`, `head_range`, optional `warning` |
+| `assign_array_from_raster` | `model: str`, `target: str` (`NPF.k` / `NPF.k33` / `IC.strt` / `STO.ss` / `STO.sy` / `RCHA.recharge` / `EVTA.surface` / `EVTA.rate` / `EVTA.depth`), `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `stress_period: int = 0`, `method`, `fill`, `coverage_tolerance`, `rate_units: str \| None` | Per-layer or per-period assignment counts, written `value_range`, optional `warning` / `value_warnings`, `rate_units` when converted |
 | `import_river_from_shapefile` | `model: str`, `shapefile: str`, `package: "RIV" \| "DRN" \| "GHB"`, `stage_field: str \| None`, `cond_field: str \| None`, `depth_field: str \| None`, `stage_raster: str \| None`, `stage_offset: float = 1.0`, `coverage_tolerance: float = 0.1`, `stress_periods: list[int] \| None`, `bed_k: float \| None`, `bed_thickness: float \| None`, `channel_width: float \| None` | Stress period data summary: reach count, stage source, per-reach coverage count, package written |
 
 **Conductance is derived, not guessed (7f-H1.2):** pass a `cond_field`
@@ -81,6 +84,8 @@ re-established before further calls (2026-08-30 rerun-5 finding).
 - `import_grid_from_shapefile` uses `flopy.utils.GridGen` (DISV) or derives a regular DIS grid from the polygon bounding box.
 - `assign_top_from_raster` uses `rasterio` to sample the raster at cell centroids and writes the result to the model's top or botm arrays.
 - `assign_k_from_zones` intersects cell centroids with zone polygons via `geopandas`; cells outside all zones retain their existing K.
+- `assign_k_from_raster` / `assign_ic_from_raster` sample a GeoTIFF at cell centroids (`nearest`/`bilinear`) or aggregate per cell (`mean`/`min`/`max`, regular DIS grids only) and write the K/k33 (NPF) or starting-head (IC) arrays per layer — the raster-based route for per-cell K fields (e.g. TX/CL GeoTIFF layers, or a fine K raster against a coarse model grid). Raster values must already be in the model's K units. Coverage/fill semantics match `assign_top_from_raster`; the K variant refuses non-positive/non-finite K in active cells. `raster` accepts one path reused across layers or a list of paths (one per layer); a mismatched list is refused, never silently remapped.
+- `assign_array_from_raster` is the catch-all for any other model array driven by a raster: an enumerated target table names the (package, array) pair — `NPF.k`/`NPF.k33`, `IC.strt`, `STO.ss`/`STO.sy` (per layer) and `RCHA.recharge`, `EVTA.surface`/`EVTA.rate`/`EVTA.depth` (per stress period, on the layer-0 footprint = topmost active cell per column, the MF6 default). Rate targets (`RCHA.recharge`, `EVTA.rate`) accept `rate_units` (e.g. `mm/yr`) and convert to m/d, recording the declared units. Odd values (negative ET rates, non-positive ET depth) are reported in `value_warnings`, never written silently. RCHA/EVTA packages are created on first use; NPF/IC/STO need their builder call first. This completes the file-based ingestion path — an agent names a file, never a payload of cell values.
 - `import_river_from_shapefile` intersects the river network with the model grid and snaps reaches to cell faces.
 - `import_obs_from_csv` matches observation sites to model cells by (x, y) coordinate if provided; otherwise by site name mapped to a pre-existing cell mapping.
 
@@ -167,7 +172,8 @@ write occurred. This removes the quadratic write volume of a regional build
 ### model_status and next_steps (7e-C8)
 
 Ordering constraints (`add_sto_package` needs `set_simulation` first;
-`assign_k_from_zones` needs `add_npf_package` first; `import_grid_from_shapefile`
+`assign_k_from_zones`/`assign_k_from_raster` need `add_npf_package` first;
+`assign_ic_from_raster` needs `add_ic_package` first; `import_grid_from_shapefile`
 documents a `set_simulation` prerequisite) used to surface only as the *next*
 call's error. `model_status(model)` reports the whole build order up front —
 `runnable` is `True` once the grid (DIS/DISV), simulation (TDIS+IMS), NPF, IC,

@@ -284,6 +284,579 @@ def _zonal_stats_from_grid(
     return dst
 
 
+# ---------------------------------------------------------------------------
+# Raster-to-array helpers (shared by the assign_*_from_raster tools)
+# ---------------------------------------------------------------------------
+
+
+def _raster_values_for_grid(
+    model: str, raster: str, method: str, fill: str, coverage_tolerance: float
+) -> dict:
+    """Sample ``raster`` over the layer-0 cell footprint of ``model``'s grid.
+
+    Mirrors ``assign_top_from_raster``'s semantics exactly (7e-B5 / 7e-B11.3):
+    ``method`` mean/min/max aggregate per cell on regular DIS grids,
+    nearest/bilinear sample at cell centroids; ``fill`` controls cells without
+    raster coverage. Returns ``values`` shaped (nrow, ncol) for DIS or
+    (ncpl,) for DISV, plus ``n_nan`` / ``n_total`` / ``warning``.
+    """
+    from groundwater_mcp.utils.spatial import CRSError, grid_centroids, sample_raster_at_points
+
+    gwf = get_gwf(model)
+    mg = gwf.modelgrid
+
+    method = (method or "nearest").lower()
+    if method not in ("mean", "min", "max", "nearest", "bilinear"):
+        raise ValueError(
+            f"method must be one of mean, min, max, nearest, bilinear — got '{method}'."
+        )
+    fill = (fill or "error").lower()
+    if fill not in ("error", "median", "nearest"):
+        raise ValueError(
+            f"fill must be one of error, median, nearest — got '{fill}'."
+        )
+    if not (0.0 < coverage_tolerance <= 1.0):
+        raise ValueError("coverage_tolerance must be in (0, 1].")
+
+    model_crs = str(mg.crs) if mg.crs else None
+
+    # Fail loudly on unknown/mismatched CRS (7e-B11.2): a model without a CRS
+    # cannot be compared against a raster that declares one.
+    import rasterio
+
+    with rasterio.open(raster) as src:
+        raster_crs = src.crs
+    if model_crs is None and raster_crs is not None:
+        raise CRSError(
+            "The model grid has no CRS but the raster declares "
+            f"'{raster_crs}'. Set a CRS on the model grid first "
+            "(set_model_crs, or import_grid_from_shapefile with target_crs) so "
+            "cell values are sampled in a known coordinate space."
+        )
+
+    dis_pkg = gwf.get_package("dis")
+    disv_pkg = gwf.get_package("disv")
+
+    if dis_pkg is not None:
+        nrow = int(dis_pkg.nrow.data)
+        ncol = int(dis_pkg.ncol.data)
+        if method in ("mean", "min", "max"):
+            sampled = _zonal_stats_from_grid(raster, mg, nrow, ncol, method)
+        else:
+            xc, yc = grid_centroids(mg)
+            resampling = "bilinear" if method == "bilinear" else "nearest"
+            sampled = sample_raster_at_points(
+                raster, xc, yc, src_crs=model_crs, resampling=resampling
+            ).reshape(nrow, ncol)
+    elif disv_pkg is not None:
+        if method in ("mean", "min", "max"):
+            raise ValueError(
+                "method 'mean'/'min'/'max' aggregate whole cells and require a "
+                "regular DIS grid; use 'nearest' or 'bilinear' for DISV grids."
+            )
+        xc, yc = grid_centroids(mg)
+        resampling = "bilinear" if method == "bilinear" else "nearest"
+        sampled = sample_raster_at_points(
+            raster, xc, yc, src_crs=model_crs, resampling=resampling
+        )
+    else:
+        raise RuntimeError("No DIS or DISV package found. Add a grid first.")
+
+    n_nan = int((~np.isfinite(sampled)).sum())
+    n_total = int(sampled.size)
+    if n_nan == n_total:
+        raise ValueError(
+            f"The raster does not cover any of the {n_total} model cells — "
+            "check that the raster extent overlaps the model grid and that "
+            "both share a CRS."
+        )
+    if n_nan / n_total > coverage_tolerance and fill == "error":
+        raise ValueError(
+            f"{n_nan} of {n_total} cells ({n_nan / n_total:.1%}) have no "
+            f"raster coverage (coverage_tolerance={coverage_tolerance}). Use "
+            "fill='median' or fill='nearest', raise coverage_tolerance, or "
+            "check the raster extent."
+        )
+
+    warning = None
+    if n_nan > 0:
+        if fill == "nearest":
+            sampled = _nearest_valid_fill(sampled)
+        else:  # "error" (within tolerance) and "median" both median-fill
+            sampled = np.where(
+                np.isfinite(sampled), sampled, float(np.nanmedian(sampled))
+            )
+        warning = (
+            f"{n_nan} cells had no raster coverage and were filled with "
+            f"'{'nearest' if fill == 'nearest' else 'median'}'."
+        )
+
+    return {
+        "values": sampled,
+        "n_nan": n_nan,
+        "n_total": n_total,
+        "warning": warning,
+    }
+
+
+def _checked_layers(layer: int | list[int], nlay: int) -> list[int]:
+    """Normalise the 0-based ``layer`` argument to a list and range-check it."""
+    layers = layer if isinstance(layer, list) else [layer]
+    for lyr in layers:
+        if not isinstance(lyr, int):
+            raise ValueError(f"layer entries must be integers, got '{lyr}'.")
+        if lyr >= nlay:
+            raise ValueError(f"Layer {lyr} out of range for model with {nlay} layers.")
+    if not layers:
+        raise ValueError("layer must name at least one layer.")
+    return layers
+
+
+def _expand_raster_spec(raster, layers: list[int], argname: str) -> list[str]:
+    """Return one raster path per requested layer.
+
+    A single path is reused for every layer; a list must have one entry per
+    layer (or exactly one entry, also reused). Anything else is refused so a
+    mismatched list can never silently map the wrong raster onto a layer.
+    """
+    if isinstance(raster, str):
+        return [raster] * len(layers)
+    if isinstance(raster, list) and raster:
+        if len(raster) == len(layers):
+            return [str(r) for r in raster]
+        if len(raster) == 1:
+            return [str(raster[0])] * len(layers)
+        raise ValueError(
+            f"{argname} has {len(raster)} entries but {len(layers)} layer(s) "
+            "were requested — pass one raster path per layer, or a single "
+            "path to reuse it across every layer."
+        )
+    raise ValueError(
+        f"{argname} must be a raster path or a list of raster paths."
+    )
+
+
+def _active_layer_mask(dis_pkg, disv_pkg, lyr: int, shape=None) -> np.ndarray:
+    """Boolean active-cell mask for ``lyr``.
+
+    With no explicit ``idomain`` the MODFLOW default is that every cell is
+    active, so the mask is all-True for ``shape``.
+    """
+    pkg = dis_pkg if dis_pkg is not None else disv_pkg
+    idm = getattr(pkg, "idomain", None)
+    if idm is not None and idm.array is not None:
+        return np.asarray(idm.array)[lyr] > 0
+    if shape is None:
+        return np.ones(1, dtype=bool)
+    return np.ones(shape, dtype=bool)
+
+
+# ---------------------------------------------------------------------------
+# Generic raster-to-model-array target table (assign_array_from_raster)
+# ---------------------------------------------------------------------------
+#
+# Each entry describes one MODFLOW 6 array an agent can fill from a GeoTIFF.
+# kind == "layer":  a full 3-D cell property array (NPF k/k33, IC strt,
+#                   STO ss/sy) written per model layer (layer index 0..nlay-1).
+# kind == "period": a per-stress-period grid array on the layer-0 footprint
+#                   (RCHA recharge, EVTA surface/rate/depth) written for one
+#                   0-based stress period; applies to the topmost active cell
+#                   per column (the MF6 default).
+
+_ARRAY_TARGETS: dict[str, dict] = {
+    "NPF.k": {
+        "kind": "layer", "pkg": "npf", "attr": "k",
+        "guard": "positive_active", "units": None,
+    },
+    "NPF.k33": {
+        "kind": "layer", "pkg": "npf", "attr": "k33",
+        "guard": "positive_active", "units": None,
+    },
+    "IC.strt": {"kind": "layer", "pkg": "ic", "attr": "strt", "guard": None, "units": None},
+    "STO.ss": {
+        "kind": "layer", "pkg": "sto", "attr": "ss",
+        "guard": "nonnegative", "units": None,
+    },
+    "STO.sy": {
+        "kind": "layer", "pkg": "sto", "attr": "sy",
+        "guard": "nonnegative", "units": None,
+    },
+    "RCHA.recharge": {
+        "kind": "period", "pkg": "rcha", "attr": "recharge",
+        "guard": None, "units": "rate",
+    },
+    "EVTA.surface": {
+        "kind": "period", "pkg": "evta", "attr": "surface",
+        "guard": None, "units": None,
+    },
+    "EVTA.rate": {
+        "kind": "period", "pkg": "evta", "attr": "rate",
+        "guard": "nonnegative", "units": "rate",
+    },
+    "EVTA.depth": {
+        "kind": "period", "pkg": "evta", "attr": "depth",
+        "guard": "positive", "units": None,
+    },
+}
+
+
+def _package_of_type(gwf, pkg_type: str):
+    """The single package of ``pkg_type`` on ``gwf``, or None."""
+    for nam in gwf.get_package_list():
+        pkg = gwf.get_package(nam)
+        if pkg is not None and getattr(pkg, "package_type", "").lower() == pkg_type.lower():
+            return pkg
+    return None
+
+
+def _package_attr_array(pkg, attr: str) -> np.ndarray | None:
+    """The full .array of a package attribute, or None when undefined."""
+    obj = getattr(pkg, attr, None)
+    if obj is None:
+        return None
+    arr = getattr(obj, "array", None)
+    if arr is None:
+        return None
+    return np.asarray(arr, dtype=float)
+
+
+def _grid_nlay(gwf) -> int:
+    for pkg_type in ("dis", "disv"):
+        pkg = _package_of_type(gwf, pkg_type)
+        if pkg is not None:
+            return int(getattr(pkg, "nlay").data)
+    raise RuntimeError("No DIS or DISV package found.")
+
+
+def _active_any_mask(dis_pkg, disv_pkg, nlay: int, shape) -> np.ndarray:
+    """Cells active in at least one layer (per-column activity footprint)."""
+    mask = np.zeros(shape, dtype=bool)
+    for lyr in range(nlay):
+        mask |= _active_layer_mask(dis_pkg, disv_pkg, lyr, shape)
+    return mask
+
+
+def _impl_assign_array_from_raster(
+    model: str,
+    target: str,
+    raster: str | list[str],
+    layer: int | list[int],
+    stress_period: int,
+    method: str,
+    fill: str,
+    coverage_tolerance: float,
+    rate_units: str | None,
+) -> dict:
+    spec = _ARRAY_TARGETS.get(target)
+    if spec is None:
+        raise ValueError(
+            f"Unsupported target '{target}'. Supported targets: "
+            f"{', '.join(sorted(_ARRAY_TARGETS))}."
+        )
+
+    # The dedicated k/ic tools already implement the exact same write for
+    # these targets with matching result shapes — delegate instead of duplicating.
+    if target == "NPF.k":
+        result = _impl_assign_k_from_raster(
+            model, raster, None, layer, method, fill, coverage_tolerance
+        )
+        result["target"] = target
+        return result
+    if target == "IC.strt":
+        result = _impl_assign_ic_from_raster(
+            model, raster, layer, method, fill, coverage_tolerance
+        )
+        result["target"] = target
+        return result
+
+    if spec["kind"] == "period":
+        return _impl_assign_period_array_from_raster(
+            model, target, spec, raster, stress_period,
+            method, fill, coverage_tolerance, rate_units,
+        )
+    return _impl_assign_layer_array_from_raster(
+        model, target, spec, raster, layer, method, fill, coverage_tolerance
+    )
+
+
+def _impl_assign_layer_array_from_raster(
+    model: str,
+    target: str,
+    spec: dict,
+    raster: str | list[str],
+    layer: int | list[int],
+    method: str,
+    fill: str,
+    coverage_tolerance: float,
+) -> dict:
+    """Write a per-layer 3-D cell-property array (NPF.k33 / STO.ss / STO.sy)
+    from one raster per requested layer."""
+    gwf = get_gwf(model)
+    pkg_type = spec["pkg"]
+    attr = spec["attr"]
+
+    pkg = _package_of_type(gwf, pkg_type)
+    if pkg is None:
+        raise RuntimeError(
+            f"'{pkg_type.upper()}' package not found. Run the builder call "
+            f"that creates it first (add_npf_package / add_ic_package / "
+            "add_sto_package)."
+        )
+    dis_pkg = gwf.get_package("dis")
+    disv_pkg = gwf.get_package("disv")
+    nlay = _grid_nlay(gwf)
+
+    layers = _checked_layers(layer, nlay)
+    rasters = _expand_raster_spec(raster, layers, "raster")
+
+    arr = _package_attr_array(pkg, attr)
+    if arr is None:
+        raise RuntimeError(
+            f"'{pkg_type.upper()}.{attr}' is not defined on this model — e.g. "
+            "add_npf_package was called without k33, or add_sto_package "
+            "without sy. Define it first, then assign it from a raster."
+        )
+    arr3 = arr.copy()
+
+    conv = _package_attr_array(pkg, "iconvert")
+
+    warnings: list[str] = []
+    assignments: list[dict] = []
+    value_cells: list[np.ndarray] = []
+    n_assigned = 0
+    n_uncovered = 0
+
+    for i, lyr in enumerate(layers):
+        res = _raster_values_for_grid(
+            model, rasters[i], method, fill, coverage_tolerance
+        )
+        values = res["values"]
+        if res["warning"]:
+            warnings.append(res["warning"])
+
+        guard_active = _active_layer_mask(dis_pkg, disv_pkg, lyr, values.shape)
+        if attr == "sy" and conv is not None and conv.shape[0] > lyr:
+            guard_active = guard_active & (conv[lyr] > 0)
+
+        if spec["guard"] == "positive_active":
+            bad = guard_active & (~np.isfinite(values) | (values <= 0.0))
+            if bool(bad.any()):
+                raise ValueError(
+                    f"target '{target}' from raster '{rasters[i]}' yields "
+                    f"{int(bad.sum())} non-positive or non-finite values in "
+                    f"active cells of layer {lyr}."
+                )
+        elif spec["guard"] == "nonnegative":
+            bad = guard_active & (~np.isfinite(values) | (values < 0.0))
+            if bool(bad.any()):
+                raise ValueError(
+                    f"target '{target}' from raster '{rasters[i]}' yields "
+                    f"{int(bad.sum())} negative or non-finite values in "
+                    f"layer {lyr} — storage properties must be >= 0."
+                )
+
+        arr3[lyr] = values
+        n_assigned += res["n_total"] - res["n_nan"]
+        n_uncovered += res["n_nan"]
+        if bool(guard_active.any()):
+            value_cells.append(values[guard_active])
+        else:
+            value_cells.append(values[np.isfinite(values)])
+        assignments.append(
+            {
+                "layer": lyr,
+                "raster": rasters[i],
+                "cells_assigned": int(res["n_total"] - res["n_nan"]),
+                "cells_no_coverage": int(res["n_nan"]),
+            }
+        )
+
+    getattr(pkg, attr).set_data(arr3)
+    written = save_sim(model, gwf.simulation)
+
+    combined = np.concatenate([a.ravel() for a in value_cells]) if value_cells else np.array([])
+    value_range: dict[str, float | None]
+    if combined.size:
+        value_range = {
+            "min": float(np.min(combined)),
+            "max": float(np.max(combined)),
+            "mean": float(np.mean(combined)),
+        }
+    else:
+        value_range = {"min": None, "max": None, "mean": None}
+
+    provenance_key = {
+        "npf": "k33" if attr == "k33" else "k",
+        "sto": f"sto_{attr}",
+    }.get(pkg_type, f"{pkg_type}_{attr}")
+    _record_provenance(
+        model,
+        provenance_key,
+        rasters[0] if len(set(rasters)) == 1 else ",".join(rasters),
+        "assign_array_from_raster",
+        target=target,
+        method=method,
+    )
+
+    result: dict = {
+        "model": model,
+        "target": target,
+        "layers_updated": layers,
+        "method": method,
+        "assignments": assignments,
+        "cells_assigned": int(n_assigned),
+        "cells_no_coverage": int(n_uncovered),
+        "value_range": value_range,
+        "written": written,
+    }
+    if warnings:
+        result["warning"] = "; ".join(dict.fromkeys(warnings))
+    return result
+
+
+def _impl_assign_period_array_from_raster(
+    model: str,
+    target: str,
+    spec: dict,
+    raster: str | list[str],
+    stress_period: int,
+    method: str,
+    fill: str,
+    coverage_tolerance: float,
+    rate_units: str | None,
+) -> dict:
+    """Write one per-stress-period grid array (RCHA recharge, EVTA surface /
+    rate / depth) from a single GeoTIFF over the layer-0 footprint."""
+    if isinstance(raster, list):
+        raise ValueError(
+            f"target '{target}' is a per-stress-period grid array — raster "
+            "must be a single path (one GeoTIFF per call), not a list."
+        )
+
+    gwf = get_gwf(model)
+    pkg_type = spec["pkg"]
+    attr = spec["attr"]
+
+    sim = gwf.simulation
+    tdis = sim.get_package("tdis") if sim is not None else None
+    if tdis is None:
+        raise RuntimeError("set_simulation must be called before adding period arrays.")
+    nper = int(tdis.nper.array)
+    if not (0 <= stress_period < nper):
+        raise ValueError(
+            f"stress_period {stress_period} out of range for nper={nper}. "
+            "Use 0-based indices matching set_simulation."
+        )
+
+    dis_pkg = gwf.get_package("dis")
+    disv_pkg = gwf.get_package("disv")
+    if dis_pkg is None and disv_pkg is None:
+        raise RuntimeError("No DIS or DISV package found.")
+    nlay = _grid_nlay(gwf)
+
+    res = _raster_values_for_grid(model, raster, method, fill, coverage_tolerance)
+    values = res["values"].astype(float)
+    active_any = _active_any_mask(dis_pkg, disv_pkg, nlay, values.shape)
+
+    value_warnings: list[str] = []
+    if spec["guard"] == "nonnegative":
+        bad = active_any & (~np.isfinite(values) | (values < 0.0))
+        if bool(bad.any()):
+            value_warnings.append(
+                f"{int(bad.sum())} cells have negative {attr} values "
+                f"(min {float(np.min(values[active_any & np.isfinite(values)])):.6g})"
+            )
+    elif spec["guard"] == "positive":
+        bad = active_any & (~np.isfinite(values) | (values <= 0.0))
+        if bool(bad.any()):
+            value_warnings.append(
+                f"{int(bad.sum())} cells have non-positive {attr} values "
+                f"(min {float(np.min(values[active_any & np.isfinite(values)])):.6g})"
+            )
+
+    declared_units: str | None = None
+    if spec["units"] == "rate" and rate_units is not None:
+        from groundwater_mcp.tools.builder import _RATE_UNITS_TO_MD
+
+        if rate_units not in _RATE_UNITS_TO_MD:
+            raise ValueError(
+                f"Unrecognised rate_units '{rate_units}'. Accepted: "
+                f"{sorted(_RATE_UNITS_TO_MD)}."
+            )
+        values = values * _RATE_UNITS_TO_MD[rate_units]
+        declared_units = rate_units
+        meta = read_meta(model)
+        meta.setdefault("declared_units", {})["recharge"] = rate_units
+        write_meta(model, meta)
+
+    pkg = _package_of_type(gwf, pkg_type)
+    created = False
+    if pkg is None:
+        import flopy.mf6 as mf6
+
+        if pkg_type == "rcha":
+            mf6.ModflowGwfrcha(gwf, recharge={stress_period: values}, save_flows=True)
+        else:
+            mf6.ModflowGwfevta(
+                gwf, **{attr: {stress_period: values}}, save_flows=True
+            )
+        created = True
+        pkg = _package_of_type(gwf, pkg_type)
+    else:
+        getattr(pkg, attr).set_data({stress_period: values})
+    written = save_sim(model, gwf.simulation)
+
+    if bool(active_any.any()):
+        sel = values[active_any]
+    else:
+        sel = values[np.isfinite(values)]
+    value_range: dict[str, float | None]
+    if sel.size:
+        value_range = {
+            "min": float(np.min(sel)),
+            "max": float(np.max(sel)),
+            "mean": float(np.mean(sel)),
+        }
+    else:
+        value_range = {"min": None, "max": None, "mean": None}
+
+    provenance_key = {
+        ("rcha", "recharge"): "recharge",
+        ("evta", "surface"): "et_surface",
+        ("evta", "rate"): "et_rate",
+        ("evta", "depth"): "et_depth",
+    }.get((pkg_type, attr), f"{pkg_type}_{attr}")
+    provenance_extra: dict = {
+        "target": target,
+        "method": method,
+        "stress_period": stress_period,
+    }
+    if declared_units:
+        provenance_extra["rate_units"] = declared_units
+    _record_provenance(
+        model, provenance_key, str(raster), "assign_array_from_raster", **provenance_extra
+    )
+
+    result: dict = {
+        "model": model,
+        "target": target,
+        "package": pkg_type.upper(),
+        "stress_period": stress_period,
+        "created": created,
+        "cells_assigned": int(res["n_total"] - res["n_nan"]),
+        "cells_no_coverage": int(res["n_nan"]),
+        "value_range": value_range,
+        "written": written,
+    }
+    if declared_units:
+        result["rate_units"] = declared_units
+    if res["warning"]:
+        result["warning"] = res["warning"]
+    if value_warnings:
+        result["value_warnings"] = value_warnings
+    return result
+
+
 def _impl_assign_top_from_raster(
     model: str,
     raster: str,
@@ -539,6 +1112,245 @@ def _impl_assign_k_from_zones(
         "k_range": {"min": float(np.nanmin(k_vals)), "max": float(np.nanmax(k_vals))},
         "written": written,
     }
+
+
+def _impl_assign_k_from_raster(
+    model: str,
+    raster: str | list[str],
+    k33_raster: str | list[str] | None,
+    layer: int | list[int],
+    method: str,
+    fill: str,
+    coverage_tolerance: float,
+) -> dict:
+    """Assign per-layer K (and optionally k33) to NPF from GeoTIFF rasters.
+
+    See the registered tool docstring for the public contract.
+    """
+    gwf = get_gwf(model)
+    npf_pkg = gwf.get_package("npf")
+    if npf_pkg is None:
+        raise RuntimeError("NPF package not found. Run add_npf_package first.")
+
+    dis_pkg = gwf.get_package("dis")
+    disv_pkg = gwf.get_package("disv")
+    if dis_pkg is not None:
+        nlay = int(dis_pkg.nlay.data)
+    elif disv_pkg is not None:
+        nlay = int(disv_pkg.nlay.data)
+    else:
+        raise RuntimeError("No DIS or DISV package found.")
+
+    layers = _checked_layers(layer, nlay)
+    k_rasters = _expand_raster_spec(raster, layers, "raster")
+    k33_rasters = (
+        _expand_raster_spec(k33_raster, layers, "k33_raster")
+        if k33_raster is not None
+        else None
+    )
+
+    k_array = np.asarray(npf_pkg.k.array, dtype=float).copy()
+    k33_array: np.ndarray | None = None
+    if k33_rasters is not None:
+        k33_array = (
+            np.asarray(npf_pkg.k33.array, dtype=float).copy()
+            if npf_pkg.k33.array is not None
+            else k_array.copy()
+        )
+
+    warnings: list[str] = []
+    assignments: list[dict] = []
+    k_min_max: list[np.ndarray] = []
+    n_assigned = 0
+    n_uncovered = 0
+
+    for i, lyr in enumerate(layers):
+        res = _raster_values_for_grid(
+            model, k_rasters[i], method, fill, coverage_tolerance
+        )
+        values = res["values"]
+        if res["warning"]:
+            warnings.append(res["warning"])
+
+        # A non-positive or non-finite K in an active cell crashes MODFLOW's
+        # NPF prepcheck with an opaque floating-invalid error (rerun-2 finding).
+        # Refuse to write it rather than hand the model a time bomb.
+        active = _active_layer_mask(dis_pkg, disv_pkg, lyr, values.shape)
+        bad = active & (~np.isfinite(values) | (values <= 0.0))
+        if bool(bad.any()):
+            raise ValueError(
+                f"raster '{k_rasters[i]}' yields {int(bad.sum())} non-positive "
+                f"or non-finite K values in active cells of layer {lyr} — K "
+                "must be > 0 wherever the model is active. Check the raster "
+                "nodata/coverage handling and the value units."
+            )
+
+        k_array[lyr] = values
+        if k33_rasters is not None:
+            k33_res = _raster_values_for_grid(
+                model, k33_rasters[i], method, fill, coverage_tolerance
+            )
+            k33_vals = k33_res["values"]
+            if k33_res["warning"]:
+                warnings.append(k33_res["warning"])
+            bad33 = active & (~np.isfinite(k33_vals) | (k33_vals <= 0.0))
+            if bool(bad33.any()):
+                raise ValueError(
+                    f"k33_raster '{k33_rasters[i]}' yields {int(bad33.sum())} "
+                    f"non-positive or non-finite values in active cells of "
+                    f"layer {lyr}."
+                )
+            assert k33_array is not None  # set when k33_rasters is not None
+            k33_array[lyr] = k33_vals
+
+        n_assigned += res["n_total"] - res["n_nan"]
+        n_uncovered += res["n_nan"]
+        if bool(active.any()):
+            k_min_max.append(values[active])
+        else:
+            k_min_max.append(values[np.isfinite(values)])
+        assignments.append(
+            {
+                "layer": lyr,
+                "raster": k_rasters[i],
+                "cells_assigned": int(res["n_total"] - res["n_nan"]),
+                "cells_no_coverage": int(res["n_nan"]),
+            }
+        )
+
+    npf_pkg.k.set_data(k_array)
+    if k33_rasters is not None:
+        npf_pkg.k33.set_data(k33_array)
+    written = save_sim(model, gwf.simulation)
+
+    combined = np.concatenate([a.ravel() for a in k_min_max]) if k_min_max else np.array([])
+    k_range: dict[str, float | None]
+    if combined.size:
+        k_range = {"min": float(np.min(combined)), "max": float(np.max(combined))}
+    else:
+        k_range = {"min": None, "max": None}
+
+    provenance_extra = {"method": method, "rasters": [str(r) for r in k_rasters]}
+    if k33_rasters is not None:
+        provenance_extra["k33_rasters"] = [str(r) for r in k33_rasters]
+    _record_provenance(
+        model,
+        "k",
+        k_rasters[0] if len(set(k_rasters)) == 1 else ",".join(str(r) for r in k_rasters),
+        "assign_k_from_raster",
+        **provenance_extra,
+    )
+
+    result: dict = {
+        "model": model,
+        "layers_updated": layers,
+        "method": method,
+        "assignments": assignments,
+        "cells_assigned": int(n_assigned),
+        "cells_no_coverage": int(n_uncovered),
+        "k_range": k_range,
+        "written": written,
+    }
+    if warnings:
+        result["warning"] = "; ".join(dict.fromkeys(warnings))
+    return result
+
+
+def _impl_assign_ic_from_raster(
+    model: str,
+    raster: str | list[str],
+    layer: int | list[int],
+    method: str,
+    fill: str,
+    coverage_tolerance: float,
+) -> dict:
+    """Assign per-layer starting heads (IC strt) from GeoTIFF rasters.
+
+    See the registered tool docstring for the public contract.
+    """
+    gwf = get_gwf(model)
+    ic_pkg = gwf.get_package("ic")
+    if ic_pkg is None:
+        raise RuntimeError("IC package not found. Run add_ic_package first.")
+
+    dis_pkg = gwf.get_package("dis")
+    disv_pkg = gwf.get_package("disv")
+    if dis_pkg is not None:
+        nlay = int(dis_pkg.nlay.data)
+    elif disv_pkg is not None:
+        nlay = int(disv_pkg.nlay.data)
+    else:
+        raise RuntimeError("No DIS or DISV package found.")
+
+    layers = _checked_layers(layer, nlay)
+    rasters = _expand_raster_spec(raster, layers, "raster")
+
+    strt = np.asarray(ic_pkg.strt.array, dtype=float).copy()
+    warnings: list[str] = []
+    assignments: list[dict] = []
+    head_cells: list[np.ndarray] = []
+    n_assigned = 0
+    n_uncovered = 0
+
+    for i, lyr in enumerate(layers):
+        res = _raster_values_for_grid(
+            model, rasters[i], method, fill, coverage_tolerance
+        )
+        values = res["values"]
+        if res["warning"]:
+            warnings.append(res["warning"])
+        strt[lyr] = values
+        n_assigned += res["n_total"] - res["n_nan"]
+        n_uncovered += res["n_nan"]
+        active = _active_layer_mask(dis_pkg, disv_pkg, lyr, values.shape)
+        if bool(active.any()):
+            head_cells.append(values[active])
+        else:
+            head_cells.append(values[np.isfinite(values)])
+        assignments.append(
+            {
+                "layer": lyr,
+                "raster": rasters[i],
+                "cells_assigned": int(res["n_total"] - res["n_nan"]),
+                "cells_no_coverage": int(res["n_nan"]),
+            }
+        )
+
+    ic_pkg.strt.set_data(strt)
+    written = save_sim(model, gwf.simulation)
+
+    combined = np.concatenate([a.ravel() for a in head_cells]) if head_cells else np.array([])
+    head_range: dict[str, float | None]
+    if combined.size:
+        head_range = {
+            "min": float(np.min(combined)),
+            "max": float(np.max(combined)),
+            "mean": float(np.mean(combined)),
+        }
+    else:
+        head_range = {"min": None, "max": None, "mean": None}
+
+    _record_provenance(
+        model,
+        "ic",
+        rasters[0] if len(set(rasters)) == 1 else ",".join(rasters),
+        "assign_ic_from_raster",
+        method=method,
+    )
+
+    result: dict = {
+        "model": model,
+        "layers_updated": layers,
+        "method": method,
+        "assignments": assignments,
+        "cells_assigned": int(n_assigned),
+        "cells_no_coverage": int(n_uncovered),
+        "head_range": head_range,
+        "written": written,
+    }
+    if warnings:
+        result["warning"] = "; ".join(dict.fromkeys(warnings))
+    return result
 
 
 def _impl_import_river_from_shapefile(
@@ -959,6 +1771,181 @@ def register(mcp) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("K_ASSIGN_FAILED", str(exc))
+
+    @mcp.tool()
+    def assign_k_from_raster(
+        model: str,
+        raster: str | list[str],
+        layer: int | list[int] = 0,
+        k33_raster: str | list[str] | None = None,
+        method: str = "nearest",
+        fill: str = "error",
+        coverage_tolerance: float = 0.1,
+    ) -> dict:
+        """Assign per-layer hydraulic conductivity (k, and optionally k33) to the
+        NPF package from GeoTIFF rasters.
+
+        Each requested model layer samples its raster at the cell centroids
+        ("nearest" / "bilinear") or aggregates per cell ("mean" / "min" /
+        "max", regular DIS grids only) and writes the result into the NPF k
+        (and k33) arrays. Raster values must already be in the model's k units
+        (the units declared at add_npf_package, e.g. m/d). Unlike
+        assign_k_from_zones no polygon zones are needed — this is the tool for
+        per-cell K stored as raster grids (e.g. TX*.tif / CL*.tif layers, or a
+        full-resolution K field against a coarse model grid).
+
+        layer is the 0-based model layer index (0..nlay-1); pass a list to
+        update several layers in one call. raster (and k33_raster) accept a
+        single path — reused for every requested layer — or a list with one
+        path per layer. A mismatched list is refused rather than silently
+        mapped onto the wrong layer.
+
+        Coverage and fill behave exactly like assign_top_from_raster: cells
+        outside the raster extent become NaN and are handled by fill
+        ("error" fails beyond coverage_tolerance, "median" / "nearest" fill
+        them), and cells_no_coverage is reported. The model grid must carry a
+        CRS when the raster declares one, otherwise the call fails with
+        CRS_UNKNOWN.
+
+        The call refuses to write a non-positive or non-finite K into an
+        active cell — MODFLOW's NPF prepcheck would otherwise crash on it with
+        an opaque floating-invalid error. Requires NPF (add_npf_package first)
+        and a DIS or DISV grid."""
+        try:
+            return _impl_assign_k_from_raster(
+                model, raster, k33_raster, layer, method, fill, coverage_tolerance
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except CRSError as exc:
+            return _err(
+                "CRS_UNKNOWN",
+                str(exc),
+                "Set a CRS on the model grid first (set_model_crs or "
+                "import_grid_from_shapefile with target_crs).",
+            )
+        except RuntimeError as exc:
+            return _err("PACKAGE_MISSING", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("K_ASSIGN_FAILED", str(exc))
+
+    @mcp.tool()
+    def assign_ic_from_raster(
+        model: str,
+        raster: str | list[str],
+        layer: int | list[int] = 0,
+        method: str = "nearest",
+        fill: str = "error",
+        coverage_tolerance: float = 0.1,
+    ) -> dict:
+        """Assign per-layer starting heads (IC strt) from GeoTIFF rasters.
+
+        Replaces the scalar/per-layer heads set by add_ic_package with
+        spatially varying starting heads sampled from a raster (same
+        method / fill / coverage_tolerance semantics as assign_top_from_raster;
+        mean/min/max aggregates are for regular DIS grids, nearest/bilinear
+        sample at cell centroids on any grid). This matters mainly as a good
+        initial guess for iterative solves — it has no effect on a converged
+        steady-state result.
+
+        layer is the 0-based model layer index (0..nlay-1); pass a list to
+        update several layers in one call. raster accepts a single path
+        (reused for every requested layer) or a list with one path per layer.
+        Requires an IC package (add_ic_package first) and a DIS or DISV grid;
+        the model grid must carry a CRS when the raster declares one."""
+        try:
+            return _impl_assign_ic_from_raster(
+                model, raster, layer, method, fill, coverage_tolerance
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except CRSError as exc:
+            return _err(
+                "CRS_UNKNOWN",
+                str(exc),
+                "Set a CRS on the model grid first (set_model_crs or "
+                "import_grid_from_shapefile with target_crs).",
+            )
+        except RuntimeError as exc:
+            return _err("PACKAGE_MISSING", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("IC_ASSIGN_FAILED", str(exc))
+
+    @mcp.tool()
+    def assign_array_from_raster(
+        model: str,
+        target: str,
+        raster: str | list[str],
+        layer: int | list[int] = 0,
+        stress_period: int = 0,
+        method: str = "nearest",
+        fill: str = "error",
+        coverage_tolerance: float = 0.1,
+        rate_units: str | None = None,
+    ) -> dict:
+        """Apply a GeoTIFF field to any supported MODFLOW 6 model array — the
+        generic raster→array tool.
+
+        The AI never carries cell values: it names a *file* and a target from
+        the enumerated table below, and the server samples the raster and
+        writes the array (same method/fill/coverage_tolerance contract as
+        assign_top_from_raster). Supported ``target`` values:
+
+        - ``NPF.k`` / ``NPF.k33`` — per-layer hydraulic conductivity (must be
+          positive in active cells). ``layer`` may be a list with one raster
+          path per layer, or a single path reused across layers.
+        - ``IC.strt`` — per-layer starting heads.
+        - ``STO.ss`` / ``STO.sy`` — per-layer specific storage / yield (must
+          be >= 0).
+        - ``RCHA.recharge`` — per-stress-period recharge array over the grid
+          (topmost active cell per column, the MF6 default). Single raster
+          path, one ``stress_period`` per call.
+        - ``EVTA.surface`` / ``EVTA.rate`` / ``EVTA.depth`` — per-stress-period
+          evapotranspiration arrays (surface elevation / maximum ET rate /
+          extinction depth). Same single-path, one-period-per-call form.
+
+        Raster values must already be in the model's units, except the rate
+        targets ``RCHA.recharge`` and ``EVTA.rate`` which honour ``rate_units``
+        (e.g. "mm/yr", "m/d") and convert to m/d, recording the declared units.
+        For per-layer targets pass one raster per layer (or a single path
+        reused across layers); per-period targets take exactly one raster.
+        RCHA/EVTA packages are created on first use; NPF/IC/STO targets need
+        their builder call first. The model grid must carry a CRS when the
+        raster declares one (CRS_UNKNOWN otherwise).
+
+        Every call returns per-target coverage counts and the written
+        value range; odd values (negative ET rates, non-positive ET depth)
+        are reported in ``value_warnings`` rather than written silently."""
+        try:
+            return _impl_assign_array_from_raster(
+                model, target, raster, layer, stress_period,
+                method, fill, coverage_tolerance, rate_units,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except CRSError as exc:
+            return _err(
+                "CRS_UNKNOWN",
+                str(exc),
+                "Set a CRS on the model grid first (set_model_crs or "
+                "import_grid_from_shapefile with target_crs).",
+            )
+        except RuntimeError as exc:
+            return _err("PACKAGE_MISSING", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("ARRAY_ASSIGN_FAILED", str(exc))
 
     @mcp.tool()
     def import_river_from_shapefile(

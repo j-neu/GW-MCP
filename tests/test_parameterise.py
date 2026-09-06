@@ -364,6 +364,422 @@ def test_assign_k_invalid_field_raises(dis_model, zone_shapefile):
 
 
 # ---------------------------------------------------------------------------
+# assign_k_from_raster / assign_ic_from_raster
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def zero_raster(tmp_path: Path) -> Path:
+    """A GeoTIFF of zeros covering the catchment (an invalid K field)."""
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    data = np.zeros((10, 10), dtype=np.float64)
+    path = tmp_path / "zero.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", height=10, width=10, count=1,
+        dtype=data.dtype, crs="EPSG:32755",
+        transform=from_bounds(0, 0, 1000, 1000, 10, 10),
+    ) as dst:
+        dst.write(data, 1)
+    return path
+
+
+def test_assign_k_from_raster_single_layer(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_k_from_raster(
+        dis_model, str(dem_raster), None, 0, "nearest", "error", 0.1
+    )
+    assert "error" not in result
+    assert result["layers_updated"] == [0]
+    assert result["cells_assigned"] == 100
+    assert result["cells_no_coverage"] == 0
+    assert result["k_range"]["min"] == pytest.approx(50.0, abs=1.0)
+
+    gwf = get_gwf(dis_model)
+    k = gwf.npf.k.array
+    # dem raster runs 50 (row 0, col 0) to 100 (row 9, col 9)
+    assert float(k[0, 0, 0]) == pytest.approx(50.0, abs=0.6)
+    assert float(k[0, 9, 9]) == pytest.approx(100.0, abs=0.6)
+    # the untouched layer 1 keeps its scalar value
+    assert float(k[1, 0, 0]) == pytest.approx(1.0)
+
+
+def test_assign_k_from_raster_multiple_layers(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_k_from_raster(
+        dis_model, [str(dem_raster)] * 2, None, [0, 1], "nearest", "error", 0.1
+    )
+    assert "error" not in result
+    assert result["layers_updated"] == [0, 1]
+    assert result["cells_assigned"] == 200
+    assert len(result["assignments"]) == 2
+
+    gwf = get_gwf(dis_model)
+    k = gwf.npf.k.array
+    assert float(k[0, 9, 9]) == pytest.approx(100.0, abs=0.6)
+    assert float(k[1, 9, 9]) == pytest.approx(100.0, abs=0.6)
+
+
+def test_assign_k_from_raster_sets_k33(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_k_from_raster(
+        dis_model, str(dem_raster), str(dem_raster), 0, "nearest", "error", 0.1
+    )
+    assert "error" not in result
+
+    gwf = get_gwf(dis_model)
+    k33 = gwf.npf.k33.array
+    assert float(k33[0, 0, 0]) == pytest.approx(50.0, abs=0.6)
+
+
+def test_assign_k_from_raster_mismatched_list_raises(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+
+    with pytest.raises(ValueError, match="entries but 1 layer"):
+        _impl_assign_k_from_raster(
+            dis_model, [str(dem_raster)] * 2, None, [0], "nearest", "error", 0.1
+        )
+
+
+def test_assign_k_from_raster_layer_out_of_range_raises(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+
+    with pytest.raises(ValueError, match="out of range for model with 2 layers"):
+        _impl_assign_k_from_raster(
+            dis_model, str(dem_raster), None, 7, "nearest", "error", 0.1
+        )
+
+
+def test_assign_k_from_raster_requires_npf(tmp_path, model_name):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(model_name, 1, [1.0], [1], "simple")
+    _impl_add_dis_package(
+        model_name, nlay=1, nrow=2, ncol=2, delr=100.0, delc=100.0, top=10.0, botm=[0.0]
+    )
+    with pytest.raises(RuntimeError, match="NPF package not found"):
+        _impl_assign_k_from_raster(
+            model_name, "k.tif", None, 0, "nearest", "error", 0.1
+        )
+
+
+def test_assign_k_zero_raster_raises(dis_model, zero_raster):
+    """A K raster that is zero over active cells must be refused, not written —
+    MODFLOW's NPF prepcheck would crash with an opaque floating-invalid error."""
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+
+    with pytest.raises(ValueError, match="non-positive"):
+        _impl_assign_k_from_raster(
+            dis_model, str(zero_raster), None, 0, "nearest", "error", 0.1
+        )
+
+
+def test_assign_k_from_raster_uses_true_centroids(dis_model_crs, tmp_path):
+    """Per-cell K must equal the raster value at the cell's TRUE centroid.
+    Regression guard for the transposed (y, x) sampler bug class (7f-D1.1)."""
+    from groundwater_mcp.tools.builder import _impl_add_npf_package
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    _impl_add_npf_package(dis_model_crs, icelltype=1, k=1.0, k33=0.1, save_flows=True)
+    raster = _ramp_raster_x(tmp_path, "ramp_kx.tif", ncol=10, nrow=5, width=1000.0, height=1000.0)
+
+    result = _impl_assign_k_from_raster(
+        dis_model_crs, str(raster), None, 0, "nearest", "error", 0.1
+    )
+    assert "error" not in result
+    assert result["cells_assigned"] == 50
+
+    gwf = get_gwf(dis_model_crs)
+    mg = gwf.modelgrid
+    k = gwf.npf.k.array
+    for r in range(5):
+        for c in range(10):
+            xc = float(mg.xcellcenters[r, c])
+            assert float(k[0, r, c]) == pytest.approx(xc, abs=1e-6, rel=1e-6)
+
+
+def test_assign_ic_from_raster(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_ic_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_ic_from_raster(
+        dis_model, str(dem_raster), 0, "nearest", "error", 0.1
+    )
+    assert "error" not in result
+    assert result["layers_updated"] == [0]
+    assert result["cells_assigned"] == 100
+    assert result["head_range"]["min"] == pytest.approx(50.0, abs=1.0)
+    assert result["head_range"]["max"] == pytest.approx(100.0, abs=1.0)
+
+    gwf = get_gwf(dis_model)
+    strt = gwf.ic.strt.array
+    assert float(strt[0, 0, 0]) == pytest.approx(50.0, abs=0.6)
+    assert float(strt[0, 9, 9]) == pytest.approx(100.0, abs=0.6)
+    # untouched layer 1 keeps the scalar value set by add_ic_package
+    assert float(strt[1, 0, 0]) == pytest.approx(45.0)
+
+
+def test_assign_ic_from_raster_multiple_layers(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_ic_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_ic_from_raster(
+        dis_model, str(dem_raster), [0, 1], "nearest", "error", 0.1
+    )
+    assert "error" not in result
+    assert result["layers_updated"] == [0, 1]
+
+    gwf = get_gwf(dis_model)
+    strt = gwf.ic.strt.array
+    assert float(strt[1, 9, 9]) == pytest.approx(100.0, abs=0.6)
+
+
+def test_assign_ic_from_raster_requires_ic(tmp_path, model_name):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.tools.parameterise import _impl_assign_ic_from_raster
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(model_name, 1, [1.0], [1], "simple")
+    _impl_add_dis_package(
+        model_name, nlay=1, nrow=2, ncol=2, delr=100.0, delc=100.0, top=10.0, botm=[0.0]
+    )
+    _impl_add_npf_package(model_name, icelltype=1, k=1.0, k33=0.1, save_flows=True)
+    with pytest.raises(RuntimeError, match="IC package not found"):
+        _impl_assign_ic_from_raster(
+            model_name, "strt.tif", 0, "nearest", "error", 0.1
+        )
+
+
+def test_assign_ic_partial_coverage_errors(dis_model, tmp_path):
+    """More than the default 10% of cells without raster coverage must fail
+    loudly rather than leave a half-assigned starting-head field (mirrors the
+    assign_top_from_raster coverage contract)."""
+    from groundwater_mcp.tools.parameterise import _impl_assign_ic_from_raster
+
+    raster = _ramp_raster_x(tmp_path, "ramp_half.tif", ncol=4, nrow=10, width=400.0, height=1000.0)
+
+    with pytest.raises(ValueError, match="have no raster coverage"):
+        _impl_assign_ic_from_raster(
+            dis_model, str(raster), 0, "nearest", "error", 0.1
+        )
+
+    result = _impl_assign_ic_from_raster(
+        dis_model, str(raster), 0, "nearest", "median", 0.9
+    )
+    assert "error" not in result
+    assert result["cells_no_coverage"] == 60
+    assert result["warning"] is not None
+
+
+# ---------------------------------------------------------------------------
+# assign_array_from_raster (generic raster→array target tool)
+# ---------------------------------------------------------------------------
+
+
+def test_assign_array_recharge_creates_rcha(dis_model, dem_raster):
+    """RCHA.recharge auto-creates the package and writes the raster over the
+    layer-0 footprint of a 2-layer model."""
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_array_from_raster(
+        dis_model, "RCHA.recharge", str(dem_raster), layer=0, stress_period=0,
+        method="nearest", fill="error", coverage_tolerance=0.1, rate_units=None,
+    )
+    assert "error" not in result
+    assert result["created"] is True
+    assert result["package"] == "RCHA"
+    assert result["stress_period"] == 0
+    assert result["cells_assigned"] == 100
+
+    gwf = get_gwf(dis_model)
+    rch = gwf.get_package("rch")
+    assert rch is not None
+    vals = np.asarray(rch.recharge.get_data(0))
+    assert vals.shape == (10, 10)
+    assert float(vals[0, 0]) == pytest.approx(50.0, abs=0.6)
+    assert float(vals[9, 9]) == pytest.approx(100.0, abs=0.6)
+
+
+def test_assign_array_recharge_rate_units_conversion(dis_model, dem_raster):
+    from groundwater_mcp.tools.builder import _RATE_UNITS_TO_MD
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_array_from_raster(
+        dis_model, "RCHA.recharge", str(dem_raster), layer=0, stress_period=0,
+        method="nearest", fill="error", coverage_tolerance=0.1,
+        rate_units="mm/yr",
+    )
+    assert "error" not in result
+    assert result["rate_units"] == "mm/yr"
+
+    gwf = get_gwf(dis_model)
+    vals = np.asarray(gwf.get_package("rch").recharge.get_data(0))
+    factor = _RATE_UNITS_TO_MD["mm/yr"]
+    assert float(vals[0, 0]) == pytest.approx(50.0 * factor, rel=1e-6)
+    assert float(vals[9, 9]) == pytest.approx(100.0 * factor, rel=1e-6)
+
+
+def test_assign_array_evt_arrays_independent(dis_model, dem_raster):
+    from groundwater_mcp.tools.builder import _RATE_UNITS_TO_MD
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    _impl_assign_array_from_raster(
+        dis_model, "EVTA.surface", str(dem_raster), 0, 0, "nearest", "error", 0.1, None
+    )
+    _impl_assign_array_from_raster(
+        dis_model, "EVTA.rate", str(dem_raster), 0, 0, "nearest", "error", 0.1,
+        "mm/yr",
+    )
+    gwf = get_gwf(dis_model)
+    evt = gwf.get_package("evt")
+    surface = np.asarray(evt.surface.get_data(0))
+    rate = np.asarray(evt.rate.get_data(0))
+    assert float(surface[0, 0]) == pytest.approx(50.0, abs=0.6)
+    assert float(rate[0, 0]) == pytest.approx(50.0 * _RATE_UNITS_TO_MD["mm/yr"], rel=1e-6)
+
+
+def test_assign_array_unknown_target_raises(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+
+    with pytest.raises(ValueError, match="Unsupported target"):
+        _impl_assign_array_from_raster(
+            dis_model, "NPF.hk", str(dem_raster), 0, 0, "nearest", "error", 0.1, None
+        )
+
+
+def test_assign_array_stress_period_out_of_range(dis_model, dem_raster):
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+
+    with pytest.raises(ValueError, match="out of range for nper=1"):
+        _impl_assign_array_from_raster(
+            dis_model, "RCHA.recharge", str(dem_raster), 0, 3,
+            "nearest", "error", 0.1, None,
+        )
+
+
+def test_assign_array_npf_k33_target(dis_model, dem_raster):
+    """NPF.k33 on a package that HAS k33 writes per layer without touching k."""
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    result = _impl_assign_array_from_raster(
+        dis_model, "NPF.k33", str(dem_raster), 0, 0, "nearest", "error", 0.1, None
+    )
+    assert "error" not in result
+    assert result["target"] == "NPF.k33"
+
+    gwf = get_gwf(dis_model)
+    k33 = gwf.npf.k33.array
+    assert float(k33[0, 0, 0]) == pytest.approx(50.0, abs=0.6)
+    # untouched layer 1 keeps its scalar k33
+    assert float(k33[1, 0, 0]) == pytest.approx(0.1)
+    # k is untouched by the k33 assignment
+    assert float(gwf.npf.k.array[0, 0, 0]) == pytest.approx(1.0)
+
+
+def test_assign_array_npf_k33_missing_raises(tmp_path, model_name):
+    """A package attribute that was never defined must be refused, not invented."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_ic_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(model_name, 1, [1.0], [1], "simple")
+    _impl_add_dis_package(
+        model_name, nlay=1, nrow=2, ncol=2, delr=100.0, delc=100.0, top=10.0, botm=[0.0]
+    )
+    from groundwater_mcp.tools.builder import _impl_add_npf_package
+
+    _impl_add_npf_package(model_name, icelltype=1, k=1.0, k33=None, save_flows=True)
+    _impl_add_ic_package(model_name, strt=1.0)
+    with pytest.raises(RuntimeError, match="not defined"):
+        _impl_assign_array_from_raster(
+            model_name, "NPF.k33", "x.tif", 0, 0, "nearest", "error", 0.1, None
+        )
+
+
+def test_assign_array_sto_ss_and_sy(tmp_path, model_name):
+    """STO.ss / STO.sy are written per layer on a transient model."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_ic_package,
+        _impl_add_npf_package,
+        _impl_add_sto_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    ws = str(tmp_path / model_name)
+    _impl_create_model(model_name, ws, "METERS", "DAYS")
+    _impl_set_simulation(model_name, 1, [365.0], [12], "moderate")
+    _impl_add_dis_package(
+        model_name, nlay=2, nrow=2, ncol=2, delr=100.0, delc=100.0, top=10.0,
+        botm=[5.0, 0.0],
+    )
+    _impl_add_npf_package(model_name, icelltype=[1, 0], k=1.0, k33=0.1, save_flows=True)
+    _impl_add_ic_package(model_name, strt=5.0)
+    _impl_add_sto_package(model_name, iconvert=[1, 0], ss=1e-5, sy=0.2, steady_state=[0], save_flows=True)
+
+    data = np.array([[10.0, 20.0], [30.0, 40.0]])
+    raster = tmp_path / "sto_ss.tif"
+    with rasterio.open(
+        raster, "w", driver="GTiff", height=2, width=2, count=1,
+        dtype="float64", crs="EPSG:32755", transform=from_bounds(0, 0, 200, 200, 2, 2),
+    ) as dst:
+        dst.write(data, 1)
+    get_gwf(model_name).modelgrid.set_coord_info(xoff=0.0, yoff=0.0, crs="EPSG:32755")
+
+    result = _impl_assign_array_from_raster(
+        model_name, "STO.ss", str(raster), 0, 0, "mean", "error", 0.1, None
+    )
+    assert "error" not in result, result
+    gwf = get_gwf(model_name)
+    ss = gwf.sto.ss.array
+    assert float(ss[0, 0, 0]) == pytest.approx(10.0)
+    assert float(ss[0, 1, 1]) == pytest.approx(40.0)
+
+    result2 = _impl_assign_array_from_raster(
+        model_name, "STO.sy", str(raster), 0, 0, "mean", "error", 0.1, None
+    )
+    assert "error" not in result2, result2
+    sy = gwf.sto.sy.array
+    assert float(sy[0, 0, 0]) == pytest.approx(10.0)
+
+
+# ---------------------------------------------------------------------------
 # import_river_from_shapefile
 # ---------------------------------------------------------------------------
 
