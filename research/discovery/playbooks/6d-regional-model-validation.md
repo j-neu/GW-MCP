@@ -545,6 +545,90 @@ Work step by step and explain what you are doing at each step.
 
 ---
 
+## Target 5 — mf6_freyberg (usgs/pestpp PEST++ benchmark)
+
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\mf6_freyberg/`
+(usgs/pestpp @ `5d49814`, USGS public domain; TM7C26 — White et al. 2020
+PEST++ report benchmark; staged in Round-2 holdout). Complete runnable MF6
+input set **plus** the shipped PEST++ parameterisation. Verified 2026-09-07:
+single GWF `freyberg6`; DIS **3 layers × 40 rows × 20 cols @ 250 m** (meters);
+**transient 25 monthly stress periods** (perlen in days, 1 timestep each),
+TIME_UNITS days; packages DIS/IC/NPF/STO/OC/WEL/RCH/GHB/SFR (NEWTON) + OBS6
+(`head.obs` → `heads.csv`, **26 `trgw_*` head observations** at layers 1 and 3).
+Shipped PEST++ interface: array parameterisation with templates (`npf_k_0/1/2`,
+`npf_k33_0/1/2`, `sto_ss_*`, `sto_sy_*`, `wel.tpl`, `rch.tpl`, `sfr.csv.ins`,
+`freyberg6.lst.ins`), pyemu CSV sets (`*.par_data.csv`/`*.obs_data.csv`), `.pst`
+variants (`freyberg6_run/glm/ies/sen/opt/sweep/truth`), and prior covariance
+matrices (`glm_prior.cov`, `ies_prior.jcb`, `temporal_loc.jcb`). Solved
+`freyberg6.dis.grb` present; the benchmark's "observed" heads.csv series and
+`truth.*` files define the reference. No closed-book 6d run yet (the Round-2
+2026-08-16 chain PASS was a pre-6d toolchain check, not an Agent Manager
+closed-book run).
+
+### Prompt (paste verbatim into the Agent Manager session)
+
+```
+CLOSED-BOOK VALIDATION RUN — Phase 6d target 5 (mf6_freyberg PEST++ benchmark).
+
+You are a groundwater modelling assistant validating an MCP toolchain on a real
+published PEST++ benchmark model. Do NOT read the groundwater-mcp repository
+source code, its tests, .kilo plans, or prior research session logs. You MAY
+read the dataset's own model files, PEST++ files, and the report example's data
+— they are the model specification and the reference.
+
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\mf6_freyberg\
+(usgs/pestpp @ 5d49814, USGS public domain, TM7C26 White et al 2020).
+Single GWF model freyberg6: DIS 3 layers x 40 rows x 20 cols @ 250 m
+(METERS); TRANSIENT 25 monthly stress periods (perlen in days, 1 timestep
+each), TIME_UNITS days; packages DIS/IC/NPF/STO/OC/WEL/RCH/GHB/SFR (NEWTON) +
+OBS6 head.obs writing heads.csv (26 trgw_* head observations at layers 1 and
+3). The folder also ships the full PEST++ parameterisation: K/k33/STO array
+templates (npf_k_*.dat.tpl, npf_k33_*.dat.tpl, sto_ss_*.dat.tpl,
+sto_sy_*.dat.tpl), wel/rch templates, par/obs CSV sets, .pst files for
+run/glm/ies/sen/opt/sweep/truth variants, and prior covariance matrices
+(glm_prior.cov, ies_prior.jcb, temporal_loc.jcb). This is the calibration
+reference this run works against.
+
+SUCCESS CRITERIA:
+1) check_environment first; report the stack.
+2) Adopt the model into an MCP workspace with the adopt_model tool (the shipped
+   mfsim.nam + package files ARE the model — do NOT rebuild the grid, do NOT
+   rename files): pick a model name <= 16 chars and point the workspace at the
+   mf6_freyberg directory. Make the model runnable through the MCP tools.
+3) check_model clean (or documented).
+4) run_simulation converges / normal termination across all 25 transient stress
+   periods. Verify via get_run_log if a client timeout occurs.
+5) Postprocess: read_heads (pick representative stress periods, e.g. first/last,
+   or the period matching the shipped heads.csv observations), compute_water_balance
+   (must close), plot_heads_map.
+6) Calibrate through the MCP calibration chain (setup_pest_control →
+   run_pestpp_glm or run_pestpp_ies → summarise_calibration) against the shipped
+   observation series (heads.csv / the head.obs sites; values as shipped or as
+   documented pseudo-observations from the reference run). Calibrate a documented
+   parameter set (the shipped K/STO/WEL/RCH array parameterisation, or a clearly
+   documented subset) and compare your results against the shipped reference
+   (e.g. the benchmark truth files / observed series / prior covariance).
+7) Write run-log.md in the session folder: tool-call sequence, reprompts,
+   decisions, deviations from the source model, convergence evidence,
+   calibration results, and the reference comparison.
+
+MCP-ONLY CONSTRAINT: every action that builds, adopts, runs, post-processes,
+or calibrates the MF6 MODEL ITSELF must go through a groundwater-mcp tool
+call — do NOT call flopy/pyemu MODFLOW or PEST classes directly, and do NOT
+hand-edit MODFLOW or PEST files with a text editor or shell command.
+Ordinary Python for reading the shipped CSV/PEST reference files and preparing
+observation CSVs is fine — that is data prep/reference reading, not model
+building. If a groundwater-mcp tool cannot do something you need, STOP and
+report exactly what capability is missing and why — do not work around the
+gap by building/running/calibrating the model with raw flopy/pyemu instead.
+A workaround invalidates this run: it is testing whether the MCP tools are
+sufficient on their own.
+
+Work step by step and explain what you are doing at each step.
+```
+
+---
+
 ## Session log template
 
 `research/discovery/sessions/YYYY-MM-DD-6d-<target>.md`:
