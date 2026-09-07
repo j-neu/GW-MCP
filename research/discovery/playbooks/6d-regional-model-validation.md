@@ -629,6 +629,97 @@ Work step by step and explain what you are doing at each step.
 
 ---
 
+## Target 6 — neversink_workflow (DOI-USGS, Neversink–Rondout watershed, NY)
+
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\neversink_workflow/`
+(DOI-USGS/neversink_workflow @ main, USGS public domain; **staged 2026-09-07**,
+~231 MB = `neversink_mf6/` + `processed_data/`). Real watershed MF6 model built
+with modflow-setup/flopy 3.3.3 (2021) for the source-water-delineation
+workflow (Rondoni & Hunt USGS). Verified 2026-09-07: single GWF `neversink`;
+DIS **4 layers × 680 rows × 619 cols @ 50 m** (meters, projected
+XORIGIN/YORIGIN); **single steady-state stress period** (perlen 1 d, START
+2011-01-01), TIME_UNITS days; packages DIS/IC/NPF/RCH/OC/WEL/CHD/**SFR** +
+OBS6 (`neversink.obs`, continuous head `neversink.head.obs`, USGS-well site
+ids in layers 1/2/3/4) + SFR obs (`neversink.sfr.obs`). All arrays external
+files (`top.dat`, `botm_*.dat`, `idomain_*.dat`, `k0-3.dat`, `k330-333.dat`,
+`rch_000.dat`, `wel_000.dat`); shipped solved listings (`mfsim.lst`,
+`neversink.list`, `neversink_SFR.chk`) and `neversink.dis.grb`. **No binary
+`.hds`/`.cbc` are committed** and no ready-made observed-value table ships in
+`neversink_mf6/` — observed head/streamflow series derive from the NWIS /
+NY-DEC gage data in `processed_data/` (and the repo's source_data/output),
+so the calibration-target approach must be documented (field-obs where a
+defensible source exists, else reference-derived pseudo-obs from the shipped
+solved listings). The full DOI-USGS repo (source GIS, notebooks, 455 MB
+`output/` reference results) stays in the upstream repo — compare against the
+shipped solved listings; fetch more only if genuinely needed.
+
+### Prompt (paste verbatim into the Agent Manager session)
+
+```
+CLOSED-BOOK VALIDATION RUN — Phase 6d target 6 (neversink_workflow watershed model).
+
+You are a groundwater modelling assistant validating an MCP toolchain on a real
+published watershed model. Do NOT read the groundwater-mcp repository source
+code, its tests, .kilo plans, or prior research session logs. You MAY read the
+dataset's own model files and reference listings — they are the model
+specification and the reference.
+
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\neversink_workflow\
+(DOI-USGS/neversink_workflow, USGS public domain; Neversink–Rondout basin NY
+source-water-delineation model, modflow-setup/flopy 3.3.3 2021).
+Layout: neversink_mf6/ = the runnable MODFLOW 6 model (single GWF model
+neversink: DIS 4 layers x 680 rows x 619 cols @ 50 m METERS; single steady
+stress period, perlen 1 day from 2011-01-01, TIME_UNITS days; DIS/IC/NPF/RCH/
+OC/WEL/CHD/SFR + OBS6 continuous head observations neversink.head.obs at
+USGS-well sites across layers + SFR obs neversink.sfr.obs; all arrays are
+external files top.dat/botm_*.dat/idomain_*.dat/k*.dat/rch_000.dat; shipped
+solved listings mfsim.lst + neversink.list + neversink_SFR.chk and
+neversink.dis.grb — no binary .hds/.cbc are committed). processed_data/ =
+the GIS/geology/K-zone and NWIS / NY-DEC gage sources behind the model
+(observed head/streamflow series live here or in the upstream repo's
+source_data/output, which is NOT fully staged).
+
+SUCCESS CRITERIA:
+1) check_environment first; report the stack.
+2) Adopt the model into an MCP workspace with the adopt_model tool (the shipped
+   mfsim.nam + package files ARE the model — do NOT rebuild the grid, do NOT
+   rename files): pick a model name <= 16 chars and point the workspace at the
+   neversink_mf6 directory. Make the model runnable through the MCP tools.
+3) check_model clean (or documented).
+4) run_simulation converges / normal termination (large model ~1.7M cells,
+   843k active — allow minutes; verify via get_run_log if a client timeout
+   occurs).
+5) Postprocess: read_heads, compute_water_balance (must close), plot_heads_map.
+6) Calibrate through the MCP calibration chain (setup_pest_control →
+   run_pestpp_glm or run_pestpp_ies → summarise_calibration) against a
+   documented observation set for this model. Observed head/streamflow VALUES
+   are not shipped as a ready target table: derive a defensible observed set
+   (field observations from the NWIS/NY-DEC data in processed_data/ where
+   possible, otherwise reference-derived pseudo-observations from the shipped
+   solved listings) and DOCUMENT the approach. Compare your calibrated results
+   against the shipped reference (the solved listings reproduce the native
+   parameter run).
+7) Write run-log.md in the session folder: tool-call sequence, reprompts,
+   decisions, deviations from the source model, convergence evidence,
+   calibration results, and the reference comparison.
+
+MCP-ONLY CONSTRAINT: every action that builds, adopts, runs, post-processes,
+or calibrates the MF6 MODEL ITSELF must go through a groundwater-mcp tool
+call — do NOT call flopy/pyemu MODFLOW or PEST classes directly, and do NOT
+hand-edit MODFLOW or PEST files with a text editor or shell command.
+Ordinary Python for reading the shipped reference listings / obs CSVs and
+preparing observation CSVs is fine — that is data prep/reference reading, not
+model building. If a groundwater-mcp tool cannot do something you need, STOP
+and report exactly what capability is missing and why — do not work around
+the gap by building/running/calibrating the model with raw flopy/pyemu
+instead. A workaround invalidates this run: it is testing whether the MCP
+tools are sufficient on their own.
+
+Work step by step and explain what you are doing at each step.
+```
+
+---
+
 ## Session log template
 
 `research/discovery/sessions/YYYY-MM-DD-6d-<target>.md`:
