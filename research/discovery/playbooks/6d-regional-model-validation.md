@@ -66,10 +66,12 @@ removed) — every target in this playbook calibrates via PEST++ only.
 1. MCP server registered globally in `~/.config/kilo/kilo.jsonc`
    (`groundwater-mcp_*` auto-allowed; holdout + `.groundwater-mcp` folders
    allow-listed under `permission.external_directory`) — already done.
-2. Data staged (2026-08-16): see `research/holdout-registry.md` Round-3 rows.
-   - mf6brabant → `GW-MCP-holdout/selected/mf6brabant/` (520 MiB) — run 1 cancelled 2026-08-17d; held until 7e+7f gate work
-   - zenodo-21381071 → `GW-MCP-holdout/selected/zenodo-21381071/` (1.28 GiB) — rerun-3 held until 7e+7f gate work
-   - aare-valley → `GW-MCP-holdout/selected/aare-valley/` (**download pending**, ~3 GB)
+2. Data staged (2026-08-16; relocated to the D: sibling folder 2026-09-05): see
+   `research/holdout-registry.md` Round-3 rows.
+   - mf6brabant → `GW-MCP-holdout/selected/mf6brabant/` (520 MiB) — **PASSED 2026-09-06**
+   - zenodo-21381071 → `GW-MCP-holdout/selected/zenodo-21381071/` (1.28 GiB) — **PASSED 2026-08-30**
+   - aare-valley → `GW-MCP-holdout/selected/aare-valley/` (**staged 2026-09-07**, ~3 GB zip
+     `PriorPosteriorHydro.zip` verified 3,019,972,140 bytes; extracted root `exportPaper/`)
    - gms-pest_obs_ss → already local at
      `GW-MCP-holdout/initial-local/GMS Tutorials/MODFLOW6/mf6_pest_obs_ss.zip`
 3. **Gating (2026-08-17d):** the owner promoted ALL of tasks.md § 7e (Tiers A–C)
@@ -203,7 +205,7 @@ tasks.md § 7e (Tiers A–C) + § 7f (Tiers D–I) v0.1.0 gate work is complete.
 
 ## Target 1 — mf6brabant (Brabant NL regional aquifer)
 
-**Data:** `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\selected\mf6brabant\`
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\mf6brabant\`
 (commit `d681f912`, MIT). Steady-state regional model. The repo is
 **flopy-script-only for MF6** — inputs are generated at runtime by
 `mf6brabant/` + `notebooks/run_mf6_using_external_files.ipynb`. The agent
@@ -234,7 +236,7 @@ repository's own data, notebooks, and scripts — they are the model
 specification. Do NOT run the repository's flopy scripts to generate the model;
 build it through the available MCP tools from the repository's data.
 
-DATA: C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\selected\mf6brabant\
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\mf6brabant\
 (commit d681f912, MIT). Reference facts: steady-state Brabant regional aquifer;
 19 aquifer layers (reference constructs 37 alternating layers); grid 450 x 601
 @ 250 m; origin xll=60000, yll=322500; units METERS/DAYS, 1 stress period.
@@ -290,7 +292,7 @@ Work step by step and explain what you are doing at each step.
 
 ## Target 2 — zenodo-21381071 (real calibrated MF6 + PESTPP-IES ensemble)
 
-**Data:** `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\selected\zenodo-21381071\`
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\zenodo-21381071\`
 (CC BY 4.0, md5-verified). Sample from Nature Sustainability 2026 supplement
 (GMDSI notebook workflow). Extract already done: the sample zip contains a
 nested `subdirs_unzip_here.zip` → `simulation/`. **Four complete real model
@@ -318,7 +320,7 @@ code, its tests, .kilo plans, or prior research session logs. You MAY read the
 dataset's own README, notebooks, and scripts — they are the model
 specification.
 
-DATA: C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\selected\zenodo-21381071\simulation\c1\
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\zenodo-21381071\simulation\c1\
 Four real domains: 0205, 0501, 0504, 0505 (each a complete MF6 input set, 1
 layer x 1600 x 1252 @ 250 m, unconfined steady-state; CHD/GHB/DRN/RCH + OBS6
 head observations). The NPF references an external K array (hk.dat) that must
@@ -380,17 +382,30 @@ Work step by step and explain what you are doing at each step.
 
 ## Target 3 — Aare Valley (Zenodo 8047723; Neven & Renard 2023, WRR)
 
-**Data:** `C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\selected\aare-valley\`
-(CC BY 4.0; **download pending — stage via playbook step:**
-`curl -L -o <zip> "https://zenodo.org/records/8047723/files/PriorPosteriorHydro.zip/content"`
-≈ 3 GB, then extract). Archive structure (per record description):
-`PriorModel/` (ArchPy, borehole-conditioned), `PosteriorModel/` (ArchPy with
-data-assimilation results), **`HydrologicalModel/` = a complete MODFLOW 6 model
-"with all the boundary conditions, pumping well and observation points"**,
-`LoadAndPlotArchpy.ipynb`, `environment.yml`. The posterior is a published
-reference (WRR 2023). Original calibration toolchain is ArchPy/Bayesian — that
-is NOT a blocker: this run calibrates the MF6 model with PEST++ and
-compares against the published posterior values.
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\aare-valley\`
+(CC BY 4.0; **staged 2026-09-07** — zip `PriorPosteriorHydro.zip`, 3,019,972,140
+bytes verified; `curl` note: the `/records/<id>/files/` URL 404s, use
+`https://zenodo.org/api/records/8047723/files/PriorPosteriorHydro.zip/content`).
+Extract root is `exportPaper/`. Actual archive structure (differs from the
+record description's folder names): `HydrologicalModel/` = a **complete,
+runnable MODFLOW 6 input set with solved reference outputs shipped**;
+`ArchPyPrior/` (~5 MB) and `ArchPyPosterior/` (~16 GB) = ArchPy stochastic-
+geology prior/posterior ensembles (data-assimilation results); `LoadAndPlotArchpy.ipynb`,
+`environment.yml`, `ReadME.txt`.
+
+MF6 model facts (verified 2026-09-07): single GWF model `aar_2d`, mfsim.nam +
+`aar_2d.{dis,dis.grb,hds,ic,ims,lst,npf,obs,oc,rcha,tdis}`, plus `Aar.riv`,
+`Gurbe.riv`, `lake.chd`, `wel.wel`. Grid **1 layer × 205 rows × 202 cols**,
+steady state (NPER 1), `TIME_UNITS seconds`, DIS XORIGIN/YORIGIN set
+(CH1903+/LV95 ~ EPSG:2056). BCs: RCH (CONSTANT recharge 1.78e-8), WEL (2
+wells), CHD (`lake.chd`), **two RIV6 packages** (`Aar.riv`, `Gurbe.riv`), NPF k
+CONSTANT 0.03 (m/s) with SAVE_FLOWS. **34 head-observation points Obs0–Obs33**
+defined in `aar_2d.obs` (OBS6 continuous → writes `head_obs.csv` at run time);
+observation VALUES are NOT shipped. Solved reference present: `mfsim.lst`
+"Normal termination of simulation" (elapsed ~1 s), `aar_2d.hds`/`.cbc`/`.grb`.
+The posterior is a published reference (WRR 2023). Original calibration
+toolchain is ArchPy/Bayesian — that is NOT a blocker: this run calibrates the
+MF6 model with PEST++ and compares against the published posterior values.
 
 ### Prompt (paste verbatim into the Agent Manager session)
 
@@ -403,30 +418,42 @@ code, its tests, .kilo plans, or prior research session logs. You MAY read the
 dataset's own notebooks and model files — they are the model specification and
 the published reference.
 
-DATA: C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\selected\aare-valley\
-(CC BY 4.0, Zenodo 8047723, Neven & Renard 2023 Water Resources Research). The
-archive contains: PriorModel/ and PosteriorModel/ (ArchPy stochastic-geology
-models — prior/posterior from data assimilation) and HydrologicalModel/ (a
-complete MODFLOW 6 hydrologic model with all boundary conditions, pumping
-wells and observation points). The published posterior is the reference this
-run compares against.
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\aare-valley\exportPaper\
+(CC BY 4.0, Zenodo 8047723, Neven & Renard 2023 Water Resources Research).
+Layout: HydrologicalModel/ = complete MODFLOW 6 hydrologic model (single GWF
+model aar_2d; mfsim.nam + aar_2d.* package files; 1 layer x 205 rows x 202
+cols; steady state; TIME_UNITS seconds; CHD/RCH/WEL/RIV BCs incl. TWO RIV6
+packages Aar.riv + Gurbe.riv; NPF k CONSTANT 0.03 m/s; 34 OBS6 head points
+Obs0-Obs33 in aar_2d.obs; solved reference aar_2d.hds + mfsim.lst shipped,
+"Normal termination of simulation"). ArchPyPrior/ and ArchPyPosterior/ =
+stochastic-geology prior/posterior ensembles from the paper's data
+assimilation; ArchPyPosterior/ is the published reference this run compares
+against (~16 GB, ~50 realizations). LoadAndPlotArchpy.ipynb + ReadME.txt
+document the format.
 
 SUCCESS CRITERIA:
 1) check_environment first; report the stack.
-2) Inspect the archive layout and identify the MF6 model under HydrologicalModel/.
-   Adopt it into an MCP workspace: create_model with a model name <= 16 chars
-   and an explicit workspace inside THIS session folder; make the model
-   runnable through the MCP tools.
+2) Inspect the archive layout and identify the MF6 model under
+   HydrologicalModel/. Adopt it into an MCP workspace with the adopt_model tool
+   (the shipped mfsim.nam + package files ARE the model — do NOT rebuild the
+   grid, do NOT rename files): pick a model name <= 16 chars and point the
+   workspace at the HydrologicalModel directory. Make the model runnable
+   through the MCP tools. The two RIV6 packages and solved outputs already in
+   the directory are part of the adopted model — adopt_model registers the
+   existing simulation on disk.
 3) check_model clean (or documented).
 4) run_simulation converges / normal termination. Verify via get_run_log if a
-   client timeout occurs.
+   client timeout occurs. (The shipped reference run took ~1 s.)
 5) Postprocess: read_heads, compute_water_balance (must close), plot_heads_map.
 6) Calibrate the MF6 model with the MCP calibration chain (setup_pest_control →
-   run_pestpp_glm or run_pestpp_ies → summarise_calibration) against the
-   observation points shipped in the archive. Then COMPARE your calibrated
-   parameter values against the published posterior (ArchPy posterior
-   realizations in PosteriorModel/) and report how they compare — document
-   units and structural differences between the two models.
+   run_pestpp_glm or run_pestpp_ies → summarise_calibration) against the 34
+   shipped observation points. Observed head VALUES are not shipped: derive
+   pseudo-observed heads at the Obs0-Obs33 cells from the shipped reference
+   aar_2d.hds (or the run's own head_obs.csv) and document this approach.
+   Then COMPARE your calibrated parameter values against the published
+   posterior (ArchPy posterior realizations in ArchPyPosterior/, e.g. k/facies
+   fields P1.*) and report how they compare — document units and structural
+   differences between the two models.
 7) Write run-log.md in the session folder: tool-call sequence, reprompts,
    decisions, deviations from the source model, convergence evidence,
    calibration results, and the posterior comparison.
@@ -451,7 +478,7 @@ Work step by step and explain what you are doing at each step.
 ## Target 4 — GMS MODFLOW 6 tutorial (mf6_pest_obs_ss)
 
 **Data:** already local at
-`C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\initial-local\GMS Tutorials\MODFLOW6\mf6_pest_obs_ss.zip`
+`D:\Claude Projects\GW-MCP-holdout\initial-local\GMS Tutorials\MODFLOW6\mf6_pest_obs_ss.zip`
 (Aquaveo GMS 10.9 tutorial, ToS — not public domain; local validation use
 only). **CORRECTED 2026-08-16:** the zip ships the *generated MF6 input sets*
 (`sample/…_models/MODFLOW 6/` — `pest_obs_ss.*` incl. `.disv`/`.nam`/`.npf`/
@@ -473,7 +500,7 @@ code, its tests, .kilo plans, or prior research session logs. You MAY read the
 tutorial's own model files and PEST interface files — they are the model
 specification and the solved reference.
 
-DATA: C:\Users\jakob\Documents\Cursor projects\GW-MCP-holdout\initial-local\GMS Tutorials\MODFLOW6\mf6_pest_obs_ss.zip
+DATA: D:\Claude Projects\GW-MCP-holdout\initial-local\GMS Tutorials\MODFLOW6\mf6_pest_obs_ss.zip
 (Aquaveo GMS 10.9 tutorial, local copy). The zip contains a complete MODFLOW 6
 model with a PEST observation workflow: generated MF6 input sets (DISV grid;
 CHD/WEL/RIV/RCH; `_input/` external arrays), solved reference outputs
