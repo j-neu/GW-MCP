@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv  # noqa: F401
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -209,3 +211,54 @@ def test_generate_zone_mult_tpl_has_one_wide_token_per_zone(tmp_path):
     # tokens are wide (>= 15 chars of content)
     for line in text[1:]:
         assert len(line) - 2 >= 15
+
+
+def _mf6_available():
+    try:
+        from groundwater_mcp.tools.runner import _find_mf6_binary
+
+        _find_mf6_binary()
+        return True
+    except RuntimeError:
+        return False
+
+
+requires_mf6 = pytest.mark.skipif(not _mf6_available(), reason="MODFLOW 6 binary not installed")
+
+
+def test_generate_forward_wrapper_default_unchanged(tmp_path):
+    from groundwater_mcp.tools.calibration import _generate_forward_wrapper
+
+    if not _mf6_available():
+        pytest.skip("MODFLOW 6 binary not installed")
+    name = _build_zoned_model(tmp_path)
+    out = _generate_forward_wrapper(name)
+    body = open(out["wrapper_path"]).read()
+    assert "_apply_k_multipliers" not in body
+
+
+@requires_mf6
+def test_generate_forward_wrapper_multiplier_applies_k(tmp_path):
+    from groundwater_mcp.tools.calibration import _generate_forward_wrapper
+    from groundwater_mcp.utils.model_store import get_gwf
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_zoned_model(tmp_path)
+    gwf_name = get_gwf(name).name
+    ws = resolve_workspace(name)
+    base = np.full(25, 2.0)
+    zone = np.zeros(25, dtype=int)
+    zone[:5] = 1
+    zone[5:] = 2
+    np.savetxt(ws / f"{gwf_name}_k_base.dat", base, fmt="%.10g")
+    np.savetxt(ws / f"{gwf_name}_k_zone.dat", zone, fmt="%d")
+    np.savetxt(ws / f"{gwf_name}_k_mult.dat", np.array([3.0, 5.0]), fmt="%.10g")
+
+    out = _generate_forward_wrapper(name, multiply_k=True)
+    proc = subprocess.run(
+        [sys.executable, out["wrapper_path"]], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    k = np.loadtxt(ws / f"{gwf_name}_k.dat")
+    assert list(k[:5]) == pytest.approx([6.0] * 5)
+    assert list(k[5:]) == pytest.approx([10.0] * 20)

@@ -1264,7 +1264,7 @@ def _impl_generate_ins_from_obs_csv(
     return {"ins_path": ins_path, "obs_names": obs_names}
 
 
-def _generate_forward_wrapper(model: str) -> dict:
+def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     """Generate a Python forward-run wrapper at a space-free path (7e-A2.4).
 
     PEST++ on Windows cannot execute ``.bat``/``.cmd`` wrappers (it hangs
@@ -1306,17 +1306,43 @@ def _generate_forward_wrapper(model: str) -> dict:
             )
         wrapper_path = space_free / wrapper_name
 
-    wrapper_path.write_text(
-        "import os\n"
-        "import subprocess\n"
-        "import sys\n"
-        f"\nWS = {str(ws)!r}\n"
-        f"MF6 = {mf6_exe!r}\n"
-        "\n"
-        "os.chdir(WS)\n"
-        "proc = subprocess.run([MF6], cwd=WS)\n"
-        "sys.exit(proc.returncode)\n"
-    )
+    if multiply_k:
+        gwf_name = get_gwf(model).name
+        base_name = f"{gwf_name}_k_base.dat"
+        zone_name = f"{gwf_name}_k_zone.dat"
+        mult_name = f"{gwf_name}_k_mult.dat"
+        k_name = f"{gwf_name}_k.dat"
+        wrapper_path.write_text(
+            "import os\n"
+            "import subprocess\n"
+            "import sys\n"
+            "\n"
+            "from groundwater_mcp.tools.calibration import _apply_k_multipliers\n"
+            f"\nWS = {str(ws)!r}\n"
+            f"MF6 = {mf6_exe!r}\n"
+            "\n"
+            "os.chdir(WS)\n"
+            "_apply_k_multipliers(\n"
+            f"    os.path.join(WS, {base_name!r}),\n"
+            f"    os.path.join(WS, {zone_name!r}),\n"
+            f"    os.path.join(WS, {mult_name!r}),\n"
+            f"    os.path.join(WS, {k_name!r}),\n"
+            ")\n"
+            "proc = subprocess.run([MF6], cwd=WS)\n"
+            "sys.exit(proc.returncode)\n"
+        )
+    else:
+        wrapper_path.write_text(
+            "import os\n"
+            "import subprocess\n"
+            "import sys\n"
+            f"\nWS = {str(ws)!r}\n"
+            f"MF6 = {mf6_exe!r}\n"
+            "\n"
+            "os.chdir(WS)\n"
+            "proc = subprocess.run([MF6], cwd=WS)\n"
+            "sys.exit(proc.returncode)\n"
+        )
 
     # pestpp runs the model command with cwd = the model workspace; reference
     # the wrapper by relative name when it lives there, absolute otherwise.
