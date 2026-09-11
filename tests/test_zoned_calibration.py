@@ -188,3 +188,24 @@ def test_normalise_zoned_disv_layer(tmp_path):
     assert norm["grid"]["type"] == "DISV"
     assert norm["grid"]["ncpl"] == 2
     assert [z["base_k"] for z in norm["zones"]] == [1.0, 4.0]
+
+
+def test_generate_zone_mult_tpl_has_one_wide_token_per_zone(tmp_path):
+    from groundwater_mcp.tools.calibration import (
+        _impl_generate_zone_mult_tpl,
+        _normalise_zoned_parameterisation,
+    )
+
+    name = _build_zoned_model(tmp_path)
+    norm = _normalise_zoned_parameterisation(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    out = _impl_generate_zone_mult_tpl(name, norm["zones"], "zoned_model_k_mult.dat")
+    text = open(out["tpl_path"]).read().splitlines()
+    assert text[0].strip() == "ptf ~"
+    # exactly one token line per zone
+    assert len(text) == 1 + len(norm["zones"])
+    assert "k_z1" in text[1] and "k_z2" in text[2]
+    # tokens are wide (>= 15 chars of content)
+    for line in text[1:]:
+        assert len(line) - 2 >= 15

@@ -1204,6 +1204,22 @@ def _impl_generate_tpl(model: str, parameterisation: dict, target_file: str | No
     }
 
 
+def _impl_generate_zone_mult_tpl(model: str, zones: list[dict], target_file: str) -> dict:
+    """Generate a PEST template with exactly one wide token per zone.
+
+    The target file holds one multiplier per line, in ``zones`` order — the
+    order the forward wrapper reads and the order the returned ``zones`` list
+    reports.
+    """
+    ws = resolve_workspace(model)
+    tpl_path = ws / f"{target_file}.tpl"
+    lines = ["ptf ~"]
+    for zone in zones:
+        lines.append("~" + f"{zone['name']:^{_TPL_TOKEN_WIDTH}s}" + "~")
+    tpl_path.write_text("\n".join(lines) + "\n")
+    return {"tpl_path": str(tpl_path), "target": str(ws / target_file)}
+
+
 def _impl_generate_ins_from_obs_csv(
     csv_path: str, ins_path: str | None = None, obs_names: list[str] | None = None
 ) -> dict:
