@@ -1362,6 +1362,123 @@ def _needs_forward_wrapper(model: str) -> bool:
         return False
 
 
+def _impl_setup_calibration_zoned(
+    model: str,
+    parameterisation: dict,
+    obs_source: str = "model",
+    noptmax: int = 10,
+) -> dict:
+    """Emit a zoned/multiplier PEST interface for NPF k (scope="zones").
+
+    Writes the base K field and an integer zone map, rewires NPF k to an
+    external ``OPEN/CLOSE`` file, generates a one-token-per-zone multiplier
+    template, and forces a forward wrapper that applies
+    ``k = base_k × multiplier[zone]`` before each MODFLOW 6 run. At the default
+    multiplier 1.0 the written K field equals the base field.
+    """
+    ws = resolve_workspace(model)
+    norm = _normalise_zoned_parameterisation(model, parameterisation)
+    gwf_name = get_gwf(model).name
+
+    base_name = f"{gwf_name}_k_base.dat"
+    zone_name = f"{gwf_name}_k_zone.dat"
+    mult_name = f"{gwf_name}_k_mult.dat"
+    k_name = f"{gwf_name}_k.dat"
+
+    np.savetxt(ws / base_name, norm["k_base"], fmt="%.10g")
+    np.savetxt(ws / zone_name, norm["zone_map"], fmt="%d")
+    _impl_rewire_npf_k_external(model, filename=k_name)
+
+    tpl = _impl_generate_zone_mult_tpl(model, norm["zones"], mult_name)
+    tpl_path = Path(tpl["tpl_path"])
+
+    if obs_source != "model":
+        raise ValueError(
+            f"setup_calibration supports obs_source='model', got '{obs_source}'."
+        )
+    obs_meta = read_meta(model).get("observations")
+    if not obs_meta or not obs_meta.get("sites"):
+        raise ValueError(
+            "obs_source='model' requires observation targets registered via "
+            "import_obs_from_csv. No 'observations' entry found in "
+            ".gwmcp_meta.json for this model."
+        )
+    ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
+
+    wrapper = _generate_forward_wrapper(model, multiply_k=True)
+    model_command = wrapper["model_command"]
+
+    par_data = {
+        p["name"]: {
+            "parval1": p["initial"],
+            "parlbnd": p["lower_bound"],
+            "parubnd": p["upper_bound"],
+            "partrans": p["partrans"],
+            "pargp": "gwmcp",
+        }
+        for p in norm["parameters"]
+    }
+    pestpp_options: dict = {"noptmax": int(noptmax), "model_command": model_command}
+    if output_files:
+        pestpp_options["output_files"] = output_files
+
+    setup = _impl_setup_pest_control(
+        model=model,
+        obs_data=obs_data,
+        par_data=par_data,
+        template_files=[str(tpl_path)],
+        instruction_files=ins_paths,
+        obs_source="explicit",
+        pestpp_options=pestpp_options,
+        _suppress_command_warning=True,
+    )
+    if setup.get("error"):
+        return setup
+
+    initial_values = {p["name"]: p["initial"] for p in norm["parameters"]}
+    _tpl_substitute(tpl_path, Path(tpl["target"]), initial_values)
+    mult = np.array([initial_values[p["name"]] for p in norm["parameters"]])
+    factor = np.where(norm["zone_map"] > 0, mult[norm["zone_map"] - 1], 1.0)
+    np.savetxt(ws / k_name, norm["k_base"] * factor, fmt="%.10g")
+
+    result: dict = {
+        "model": model,
+        "pst_file": setup["pst_file"],
+        "template_file": str(tpl_path),
+        "target_file": tpl["target"],
+        "instruction_file": ins_paths[0],
+        "external_array": str(ws / k_name),
+        "forward_wrapper": wrapper["wrapper_path"],
+        "n_observations": setup["n_observations"],
+        "n_adjustable_parameters": setup["n_adjustable_parameters"],
+        "n_total_parameters": setup["n_total_parameters"],
+        "parameters": [
+            {
+                "name": p["name"],
+                "scope": p["scope"],
+                "initial": p["initial"],
+                "lower_bound": p["lower_bound"],
+                "upper_bound": p["upper_bound"],
+                "partrans": p["partrans"],
+            }
+            for p in norm["parameters"]
+        ],
+        "zones": norm["zones"],
+        "grid": norm["grid"],
+        "model_command": setup["model_command"],
+        "next_steps": (
+            "Run the calibration with run_pestpp_glm (or run_pestpp_ies for "
+            "many parameters), then summarise_calibration."
+        ),
+    }
+    if any(z["initial"] != 1.0 for z in norm["zones"]):
+        result["warning"] = (
+            "One or more zone multipliers have initial != 1.0, so the initial "
+            "state is not the shipped base K field."
+        )
+    return result
+
+
 def _impl_setup_calibration(
     model: str,
     parameterisation: dict,
@@ -1402,6 +1519,18 @@ def _impl_setup_calibration(
     input array matches the PST's initial state. Run the calibration with
     ``run_pestpp_glm``/``run_pestpp_ies`` (or ``calibrate``) afterwards.
     """
+    zone_specs = {
+        str(n): s
+        for n, s in parameterisation.items()
+        if isinstance(s, dict) and s.get("scope") == "zones"
+    }
+    if zone_specs:
+        if len(zone_specs) != len(parameterisation):
+            raise ValueError(
+                "Zoned parameterisation cannot be combined with scope "
+                "'all'/'layer'/'cells'; use scope='zones' for every parameter."
+            )
+        return _impl_setup_calibration_zoned(model, parameterisation, obs_source, noptmax)
     ws = resolve_workspace(model)
     norm = _normalise_parameterisation(model, parameterisation)
 
@@ -2216,6 +2345,13 @@ def register(mcp: FastMCP) -> None:
         — DISV). Optional keys: lower_factor/upper_factor (default 0.1/10.0)
         set the bounds from initial; partrans defaults to "log". Parameter
         names are capped at 12 characters (PEST).
+
+        scope may also be "zones" (with "layer": N): zones are derived from
+        equal positive K values in that layer and each zone becomes a
+        dimensionless multiplier parameter (initial default 1.0, bounds
+        0.1-10). A generated forward wrapper applies k = base_k × multiplier
+        before each run, preserving the base K pattern. One zones spec per
+        layer; zones specs cannot be mixed with all/layer/cells.
 
         This call: (1) rewires NPF k to an external OPEN/CLOSE array,
         (2) generates a wide-token template (>= 15 chars) over the

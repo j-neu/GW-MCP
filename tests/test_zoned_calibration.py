@@ -18,6 +18,9 @@ from groundwater_mcp.tools.builder import (
     _impl_create_model,
     _impl_set_simulation,
 )
+from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
+from groundwater_mcp.utils.model_store import get_gwf
+from groundwater_mcp.utils.spatial import grid_centroids
 
 
 def test_round_sig_array_rounds_to_significant_figures():
@@ -262,3 +265,79 @@ def test_generate_forward_wrapper_multiplier_applies_k(tmp_path):
     k = np.loadtxt(ws / f"{gwf_name}_k.dat")
     assert list(k[:5]) == pytest.approx([6.0] * 5)
     assert list(k[5:]) == pytest.approx([10.0] * 20)
+
+
+def _register_obs(tmp_path, name, n_obs=5):
+    gwf = get_gwf(name)
+    mg = gwf.modelgrid
+    xc, yc = grid_centroids(mg)
+    interior = [r * mg.ncol + c for r in range(1, mg.nrow - 1) for c in range(1, mg.ncol - 1)]
+    cells = interior[:n_obs]
+    csv_path = tmp_path / f"{name}_obs.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "x", "y"])
+        for i, cell in enumerate(cells):
+            writer.writerow(
+                [f"S{i + 1:02d}", "2020-01-01", 30.0, float(xc[cell]), float(yc[cell])]
+            )
+    _impl_import_obs_from_csv(
+        model=name,
+        csv_file=str(csv_path),
+        obs_type="HEAD",
+        site_col="site",
+        date_col="date",
+        value_col="value",
+        x_col="x",
+        y_col="y",
+        layer=0,
+    )
+
+
+@requires_mf6
+def test_setup_calibration_zoned_emits_zone_interface(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+    from groundwater_mcp.utils.workspace import resolve_workspace
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name)
+    result = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert "error" not in result, result
+    assert result["n_adjustable_parameters"] == 2
+    assert [z["name"] for z in result["zones"]] == ["k_z1", "k_z2"]
+    assert result["forward_wrapper"] is not None
+    ws = resolve_workspace(name)
+    for fname in ("zoned_model_k_base.dat", "zoned_model_k_zone.dat"):
+        assert (ws / fname).exists(), f"missing {fname}"
+    # initial multiplier 1.0 leaves the NPF k file equal to the base field
+    # (base K is 1.0 in column 0 — flat indices 0,5,10,15,20 — and 5.0 elsewhere)
+    k = np.loadtxt(ws / "zoned_model_k.dat")
+    assert list(k) == pytest.approx([1.0, 5.0, 5.0, 5.0, 5.0] * 5)
+
+
+def test_setup_calibration_zoned_rejects_mixed_scopes(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name)
+    with pytest.raises(ValueError, match="scope='zones'"):
+        _impl_setup_calibration(
+            name,
+            {
+                "kz": {"target": "npf:k", "scope": "zones", "layer": 0},
+                "kall": {"target": "npf:k", "scope": "all", "initial": 5.0},
+            },
+        )
+
+
+def test_setup_calibration_non_zoned_unchanged(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name)
+    result = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+    )
+    assert "error" not in result, result
+    assert "zones" not in result
