@@ -341,3 +341,32 @@ def test_setup_calibration_non_zoned_unchanged(tmp_path):
     )
     assert "error" not in result, result
     assert "zones" not in result
+
+
+def test_maybe_apply_zone_multipliers_writes_k(tmp_path):
+    from groundwater_mcp.tools.calibration import _maybe_apply_zone_multipliers
+    from groundwater_mcp.utils.model_store import get_gwf
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_zoned_model(tmp_path)
+    gwf_name = get_gwf(name).name
+    ws = resolve_workspace(name)
+    np.savetxt(ws / f"{gwf_name}_k_base.dat", np.array([2.0, 2.0, 2.0]), fmt="%.10g")
+    np.savetxt(ws / f"{gwf_name}_k_zone.dat", np.array([1, 1, 2]), fmt="%d")
+    mult = ws / f"{gwf_name}_k_mult.dat"
+    np.savetxt(mult, np.array([3.0, 5.0]), fmt="%.10g")
+
+    _maybe_apply_zone_multipliers(name, mult)
+    k = np.loadtxt(ws / f"{gwf_name}_k.dat")
+    assert list(k) == pytest.approx([6.0, 6.0, 10.0])
+
+
+def test_maybe_apply_zone_multipliers_noop_for_other_target(tmp_path):
+    from groundwater_mcp.tools.calibration import _maybe_apply_zone_multipliers
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_zoned_model(tmp_path)
+    ws = resolve_workspace(name)
+    other = ws / "something_else.dat"
+    other.write_text("1\n")
+    _maybe_apply_zone_multipliers(name, other)  # must not raise

@@ -646,11 +646,13 @@ def _impl_check_parameter_sensitivity(
     for (tpl, target), (name, base_value) in zip(tpl_targets, parameters.items()):
         original = target.read_bytes() if target.exists() else None
         _tpl_substitute(tpl, target, {name: base_value * (1.0 + delta)})
+        _maybe_apply_zone_multipliers(model, target)
         try:
             run = _impl_run_simulation(model, silent=True)
         finally:
             if original is not None:
                 target.write_bytes(original)
+            _maybe_apply_zone_multipliers(model, target)
             flush_model(model)
         if not run["success"]:
             results[name] = {"sensitivity": None, "run_succeeded": False}
@@ -865,6 +867,17 @@ def _apply_k_multipliers(base_path, zone_path, mult_path, out_path) -> np.ndarra
     k = base * factor
     np.savetxt(out_path, k, fmt="%.10g")
     return k
+
+
+def _maybe_apply_zone_multipliers(model: str, target: Path) -> None:
+    """Apply zone multipliers to the NPF k file when *target* is the
+    multiplier file of a zoned setup; otherwise do nothing."""
+    gwf = get_gwf(model)
+    ws = resolve_workspace(model)
+    base = ws / f"{gwf.name}_k_base.dat"
+    zone = ws / f"{gwf.name}_k_zone.dat"
+    if target.name == f"{gwf.name}_k_mult.dat" and base.exists() and zone.exists():
+        _apply_k_multipliers(base, zone, target, ws / f"{gwf.name}_k.dat")
 
 
 def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dict:
