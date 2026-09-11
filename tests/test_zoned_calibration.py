@@ -370,3 +370,85 @@ def test_maybe_apply_zone_multipliers_noop_for_other_target(tmp_path):
     other = ws / "something_else.dat"
     other.write_text("1\n")
     _maybe_apply_zone_multipliers(name, other)  # must not raise
+
+
+def _pestpp_available(exe="pestpp-glm"):
+    try:
+        from groundwater_mcp.tools.calibration import _find_pestpp_binary
+
+        _find_pestpp_binary(exe)
+        return True
+    except RuntimeError:
+        return False
+
+
+requires_pestpp = pytest.mark.skipif(
+    not _pestpp_available(), reason="PEST++ binaries not installed"
+)
+
+
+@requires_mf6
+@requires_pestpp
+def test_zoned_calibration_e2e_ies_reduces_phi(tmp_path):
+    """setup_calibration(scope='zones') → IES converges and reduces phi."""
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_ies,
+        _impl_setup_calibration,
+    )
+
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name, n_obs=9)
+    setup = _impl_setup_calibration(
+        name,
+        {"k": {"target": "npf:k", "scope": "zones", "layer": 0}},
+        noptmax=3,
+    )
+    assert "error" not in setup, setup
+    assert setup["n_adjustable_parameters"] == 2
+
+    run = _impl_run_pestpp_ies(name, setup["pst_file"], num_reals=6, num_workers=1)
+    assert "error" not in run, run
+    assert run["converged"] is True, run
+    assert run["final_phi_mean"] is not None
+
+
+@requires_mf6
+def test_zoned_sensitivity_perturbs_and_restores_k(tmp_path):
+    """check_parameter_sensitivity on a zoned parameterisation perturbs k and
+    restores the unperturbed base field afterwards."""
+    from groundwater_mcp.tools.builder import _impl_add_boundary_package
+    from groundwater_mcp.tools.calibration import (
+        _impl_check_parameter_sensitivity,
+        _impl_setup_calibration,
+    )
+    from groundwater_mcp.utils.model_store import get_gwf
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_zoned_model(tmp_path)
+    # Recharge makes the head solution K-dependent (CHD-only flow is linear in K).
+    rch = [[[0, r, c], 0.001] for r in range(1, 4) for c in range(1, 4)]
+    _impl_add_boundary_package(name, "RCH", {"0": rch}, None)
+    _register_obs(tmp_path, name, n_obs=4)
+
+    setup = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert "error" not in setup, setup
+    gwf_name = get_gwf(name).name
+    ws = resolve_workspace(name)
+    base_k = np.loadtxt(ws / f"{gwf_name}_k.dat")
+
+    result = _impl_check_parameter_sensitivity(
+        name,
+        {p["name"]: p["initial"] for p in setup["zones"]},
+        [setup["template_file"]],
+    )
+    assert "error" not in result, result
+    sens = [
+        v["sensitivity"]
+        for v in result["parameters"].values()
+        if v["sensitivity"] is not None
+    ]
+    assert sens and max(sens) > 0, result
+    # The screen restores the unperturbed (multiplier 1.0) K file.
+    assert list(np.loadtxt(ws / f"{gwf_name}_k.dat")) == pytest.approx(list(base_k))
