@@ -38,7 +38,7 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 | **calibration (PEST++)** | `setup_calibration`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `summarise_calibration`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
 | **spec / provenance** | `apply_model_spec`, `export_model_spec`, `export_reproducible_script`, `describe_model`, `export_model_report`, `clone_model`, `compare_scenarios` |
 
-`setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. The capability adds no new tools — the count is unchanged at 66.
+`setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. This zoned capability adds no new tools: the total above was corrected to 66 in this change (it had been stale at 63) and reflects earlier 7e-C additions, not this feature.
 
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 

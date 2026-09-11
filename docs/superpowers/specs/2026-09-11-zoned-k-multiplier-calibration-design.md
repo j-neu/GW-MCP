@@ -144,13 +144,11 @@ files:
 | `<gwf>_k_zone.dat` | full-grid integer zone map; `0` = fixed, else zone index |
 | `<gwf>_k_mult.dat.tpl` | PEST template: exactly one wide token per zone |
 | `<gwf>_k_mult.dat` | target of the template; one multiplier value per line |
-| `<gwf>_k_zones.json` | sidecar: zone index → parameter name + base K, for the wrapper and result |
 | `<gwf>_k.dat` | the runtime NPF `k` external file (NPF stays `OPEN/CLOSE`) |
 
-Zone order in `<gwf>_k_zones.json` and `<gwf>_k_zone.dat` matches the template
-line order and the returned `zones` list — `(layer ascending, base K
-ascending)` across every `zones` spec in the call, with zone indices `1..N`
-contiguous and global.
+Zone order in `<gwf>_k_zone.dat` matches the template line order and the
+returned `zones` list — `(layer ascending, base K ascending)` across every
+`zones` spec in the call, with zone indices `1..N` contiguous and global.
 
 `setup_calibration` reuses `_impl_rewire_npf_k_external` to put NPF `k` behind
 `OPEN/CLOSE <gwf>_k.dat`, then snapshots the array to `<gwf>_k_base.dat`.
@@ -177,12 +175,12 @@ spec is present.
 `check_parameter_sensitivity` needs one targeted change: it runs MODFLOW
 directly (`_impl_run_simulation`), which reads `<gwf>_k.dat` and ignores the
 multiplier file, so a zone perturbation would register as zero sensitivity.
-When a `<gwf>_k_zones.json` sidecar exists and the template target is the
-multiplier file, the screen must re-apply
-`k = base × mult[zone]` to `<gwf>_k.dat` after each `_tpl_substitute` and
-before the direct run. `run_pestpp_glm`, `run_pestpp_ies`, and
-`summarise_calibration` need no changes: pestpp invokes the wrapper, which
-already applies the multipliers.
+The screen detects the multiplier file by **filename matching**
+(`_maybe_apply_zone_multipliers`: a template target named `<gwf>_k_mult.dat`)
+and, after each `_tpl_substitute`, re-applies `k = base × mult[zone]` to
+`<gwf>_k.dat` before the direct run. No sidecar file is written or read.
+`run_pestpp_glm`, `run_pestpp_ies`, and `summarise_calibration` need no
+changes: pestpp invokes the wrapper, which already applies the multipliers.
 
 ## 4. Errors and limits
 
