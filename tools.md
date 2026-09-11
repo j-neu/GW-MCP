@@ -421,13 +421,28 @@ cap) to a spec dict:
 ```
 
 - `target`: the model array to parameterise — currently `"npf:k"` only.
-- `scope`: `"all"` (whole array), `"layer"` (with `"layer": N`), or `"cells"`
+- `scope`: `"all"` (whole array), `"layer"` (with `"layer": N`), `"cells"`
   (with `"cells": [[layer, row, col], ...]` on DIS — `[[layer, node], ...]`
-  on DISV). Scopes must partition the array exactly: overlaps and gaps are
-  hard errors.
+  on DISV), or `"zones"` (with `"layer": N`). Scopes must partition the array
+  exactly for all/layer/cells; `zones` is the multiplier mode below.
 - `initial` (required, > 0) sets the base value; `lower_factor` /
   `upper_factor` (defaults `0.1`/`10.0`) set the bounds as
   `initial × factor`; `partrans` defaults to `"log"`.
+
+**Zoned multipliers (scope="zones"):** zones are auto-derived from groups of
+equal positive `npf:k` values within the spec's layer (values equal to 6
+significant figures group together; inactive/zero cells stay fixed). Each zone
+becomes a dimensionless multiplier parameter `<prefix>_z<index>` (names ordered
+by layer then base K ascending, ≤12 chars). `initial` defaults to `1.0` (base
+field), bounds default 0.1–10. One spec per layer; `zones` specs cannot be
+mixed with `all`/`layer`/`cells`. `max_zones` (default 50) fails loudly when a
+layer has more distinct values than the cap. The call writes
+`<gwf>_k_base.dat`, `<gwf>_k_zone.dat`, `<gwf>_k_mult.dat.tpl` and forces a
+forward wrapper that computes `k = base_k × multiplier[zone]` before each
+MODFLOW 6 run — so the base spatial pattern is preserved and only the zone
+magnitudes are calibrated. `check_parameter_sensitivity` re-applies the
+multipliers before its direct runs. The result adds a `zones` block (name,
+layer, base_k, n_cells, bounds) and `grid`.
 
 The call then: (1) rewires NPF `k` to an external `OPEN/CLOSE <file>` array
 (so a template can target it — the model runs identically afterwards); (2)

@@ -100,6 +100,12 @@ zero-Jacobian bug — and default bounds base/10–base×10). GLM phi/iterations
 now come from `<case>.iobj` (7e-B1.1/1.2), not the IES-only `.phi.actual.csv`,
 so `run_pestpp_glm`/`summarise_calibration` no longer report empty progress.
 No capability-coverage rows changed.
+**Zoned K multipliers (2026-09-11):** `setup_calibration` gained
+`scope="zones"` — zones auto-derived from equal positive per-layer `npf:k`
+values become dimensionless multiplier parameters applied by a generated
+forward wrapper (`k = base_k × multiplier[zone]`). Calibration of zoned-field
+regional models no longer requires uniform per-layer K replacement. No
+capability-coverage rows changed.
 **7f-I (2026-08-17): surface-area cuts.** `plot_heads_map`/`plot_cross_section`
 return the PNG natively (ImageContent) and `view_image` is removed;
 `sentence-transformers` moved to the optional `semantic` extra with a Whoosh

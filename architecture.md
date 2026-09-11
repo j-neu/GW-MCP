@@ -59,6 +59,8 @@ Reads binary output files (`.hds`, `.cbb`) via `flopy.utils`, computes derived q
 ### calibration
 Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter estimation and uncertainty analysis. Invoked as a subprocess with file-based I/O. Returns phi progress, residual statistics, and predictive uncertainty bounds.
 
+Zoned K multiplier calibration (2026-09-11): `setup_calibration(scope="zones")` auto-derives zones from groups of equal positive per-layer `npf:k` values and turns each zone into a dimensionless multiplier parameter (`<prefix>_z<index>`). It writes `<gwf>_k_base.dat`, `<gwf>_k_zone.dat` and `<gwf>_k_mult.dat.tpl` and forces a forward wrapper that computes `k = base_k × multiplier[zone]` before each MODFLOW 6 run, so the base spatial K pattern is preserved and only zone magnitudes are calibrated. This closes the neversink `setup_calibration` uniform-only (whole-scope per-layer replacement) parameterisation gap.
+
 ---
 
 ## File structure

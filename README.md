@@ -25,7 +25,7 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (63 total, plus 2 MCP prompts and 3 MCP resource templates)
+## Tools (66 total, plus 2 MCP prompts and 3 MCP resource templates)
 
 | Module | Tools |
 |---|---|
@@ -37,6 +37,8 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 | **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `diagnose_water_balance`, `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `read_simulated_observations`, `compare_to_observed`, `plot_heads_map`, `plot_cross_section` |
 | **calibration (PEST++)** | `setup_calibration`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `summarise_calibration`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
 | **spec / provenance** | `apply_model_spec`, `export_model_spec`, `export_reproducible_script`, `describe_model`, `export_model_report`, `clone_model`, `compare_scenarios` |
+
+`setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. The capability adds no new tools — the count is unchanged at 66.
 
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 
