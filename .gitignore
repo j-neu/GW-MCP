@@ -2,6 +2,9 @@
 # playwright MCP browser artifacts
 .playwright-mcp/
 
+# isolated git worktrees
+.worktrees/
+
 # python bytecode
 __pycache__/
 *.py[cod]
