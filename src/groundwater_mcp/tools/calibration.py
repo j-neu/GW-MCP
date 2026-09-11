@@ -631,6 +631,17 @@ def _impl_check_parameter_sensitivity(
                 all_tokens.append(n)
         tpl_targets.append((tpl, tpl.with_suffix("")))
 
+    # Every parameter must appear in at least one template. A parameter absent
+    # from every template is never substituted, so the screen would record a
+    # spurious sensitivity of 0.0 with run_succeeded=True — fail loudly instead.
+    missing = [name for name in parameters if name not in all_tokens]
+    if missing:
+        raise ValueError(
+            f"Parameter(s) {missing} do not appear in any template token. "
+            f"Template token(s): {all_tokens}. Every key of 'parameters' must "
+            "appear in at least one template."
+        )
+
     base_run = _impl_run_simulation(model, silent=True)
     if not base_run["success"]:
         return _err(
@@ -874,10 +885,29 @@ def _derive_zones(k_layer, max_zones: int) -> tuple[np.ndarray, list[tuple[float
 
 
 def _apply_k_multipliers(base_path, zone_path, mult_path, out_path) -> np.ndarray:
-    """Write ``k = base_k × multiplier[zone]`` (zone 0 fixed) to ``out_path``."""
+    """Write ``k = base_k × multiplier[zone]`` (zone 0 fixed) to ``out_path``.
+
+    The ``base`` and ``zone`` arrays must be the same length (one entry per
+    model cell) and every positive zone id must index an available multiplier.
+    Both are validated up front so a malformed zone map raises a clear
+    ``ValueError`` instead of a raw numpy ``IndexError`` mid-run.
+    """
     base = np.loadtxt(base_path, dtype=float).reshape(-1)
     zone = np.loadtxt(zone_path, dtype=int).reshape(-1)
     mult = np.atleast_1d(np.loadtxt(mult_path, dtype=float)).reshape(-1)
+    if base.size != zone.size:
+        raise ValueError(
+            f"base ({base.size}) and zone ({zone.size}) arrays must be the "
+            "same length."
+        )
+    if zone.size and int(zone.min()) < 0:
+        raise ValueError("zone ids must be non-negative (0 marks a fixed cell).")
+    max_zone = int(zone.max()) if zone.size else 0
+    if max_zone > mult.size:
+        raise ValueError(
+            f"zone map references zone {max_zone} but only {mult.size} "
+            "multiplier(s) provided."
+        )
     factor = np.ones_like(base, dtype=float)
     zoned = zone > 0
     factor[zoned] = mult[zone[zoned] - 1]
@@ -904,6 +934,11 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
     from equal positive K values within that layer. Zone indices are global,
     contiguous and ordered by ``(layer ascending, base K ascending)``.
     """
+    if not isinstance(parameterisation, dict):
+        raise ValueError(
+            "parameterisation must be a dict mapping parameter name → spec, "
+            f"got {type(parameterisation).__name__}."
+        )
     if not parameterisation:
         raise ValueError("parameterisation must name at least one parameter.")
     gwf = get_gwf(model)
@@ -1242,6 +1277,8 @@ def _impl_generate_zone_mult_tpl(model: str, zones: list[dict], target_file: str
     reports.
     """
     ws = resolve_workspace(model)
+    if not zones:
+        raise ValueError("zones must contain at least one zone to template.")
     tpl_path = ws / f"{target_file}.tpl"
     lines = ["ptf ~"]
     for zone in zones:
@@ -1342,22 +1379,31 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
         zone_name = f"{gwf_name}_k_zone.dat"
         mult_name = f"{gwf_name}_k_mult.dat"
         k_name = f"{gwf_name}_k.dat"
+        # Self-contained: the multiplier logic is inlined (no import from
+        # groundwater_mcp), so a PEST++ forward run does not depend on the
+        # installed package or on any private helper.
         wrapper_path.write_text(
             "import os\n"
             "import subprocess\n"
             "import sys\n"
             "\n"
-            "from groundwater_mcp.tools.calibration import _apply_k_multipliers\n"
-            f"\nWS = {str(ws)!r}\n"
+            "import numpy as np\n"
+            "\n"
+            f"WS = {str(ws)!r}\n"
             f"MF6 = {mf6_exe!r}\n"
+            f"BASE = os.path.join(WS, {base_name!r})\n"
+            f"ZONE = os.path.join(WS, {zone_name!r})\n"
+            f"MULT = os.path.join(WS, {mult_name!r})\n"
+            f"KFILE = os.path.join(WS, {k_name!r})\n"
             "\n"
             "os.chdir(WS)\n"
-            "_apply_k_multipliers(\n"
-            f"    os.path.join(WS, {base_name!r}),\n"
-            f"    os.path.join(WS, {zone_name!r}),\n"
-            f"    os.path.join(WS, {mult_name!r}),\n"
-            f"    os.path.join(WS, {k_name!r}),\n"
-            ")\n"
+            "base = np.loadtxt(BASE, dtype=float).reshape(-1)\n"
+            "zone = np.loadtxt(ZONE, dtype=int).reshape(-1)\n"
+            "mult = np.atleast_1d(np.loadtxt(MULT, dtype=float)).reshape(-1)\n"
+            "factor = np.ones_like(base, dtype=float)\n"
+            "zoned = zone > 0\n"
+            "factor[zoned] = mult[zone[zoned] - 1]\n"
+            'np.savetxt(KFILE, base * factor, fmt="%.10g")\n'
             "proc = subprocess.run([MF6], cwd=WS)\n"
             "sys.exit(proc.returncode)\n"
         )
@@ -1410,6 +1456,20 @@ def _impl_setup_calibration_zoned(
     norm = _normalise_zoned_parameterisation(model, parameterisation)
     gwf_name = get_gwf(model).name
 
+    # Validate the observation source up front so a rejected call does not
+    # leave a half-configured workspace (base/zone files written, NPF rewired).
+    if obs_source != "model":
+        raise ValueError(
+            f"setup_calibration supports obs_source='model', got '{obs_source}'."
+        )
+    obs_meta = read_meta(model).get("observations")
+    if not obs_meta or not obs_meta.get("sites"):
+        raise ValueError(
+            "obs_source='model' requires observation targets registered via "
+            "import_obs_from_csv. No 'observations' entry found in "
+            ".gwmcp_meta.json for this model."
+        )
+
     base_name = f"{gwf_name}_k_base.dat"
     zone_name = f"{gwf_name}_k_zone.dat"
     mult_name = f"{gwf_name}_k_mult.dat"
@@ -1422,17 +1482,6 @@ def _impl_setup_calibration_zoned(
     tpl = _impl_generate_zone_mult_tpl(model, norm["zones"], mult_name)
     tpl_path = Path(tpl["tpl_path"])
 
-    if obs_source != "model":
-        raise ValueError(
-            f"setup_calibration supports obs_source='model', got '{obs_source}'."
-        )
-    obs_meta = read_meta(model).get("observations")
-    if not obs_meta or not obs_meta.get("sites"):
-        raise ValueError(
-            "obs_source='model' requires observation targets registered via "
-            "import_obs_from_csv. No 'observations' entry found in "
-            ".gwmcp_meta.json for this model."
-        )
     ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
 
     wrapper = _generate_forward_wrapper(model, multiply_k=True)
@@ -1549,6 +1598,11 @@ def _impl_setup_calibration(
     input array matches the PST's initial state. Run the calibration with
     ``run_pestpp_glm``/``run_pestpp_ies`` (or ``calibrate``) afterwards.
     """
+    if not isinstance(parameterisation, dict):
+        raise ValueError(
+            "parameterisation must be a dict mapping parameter name → spec, "
+            f"got {type(parameterisation).__name__}."
+        )
     zone_specs = {
         str(n): s
         for n, s in parameterisation.items()

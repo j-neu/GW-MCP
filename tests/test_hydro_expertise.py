@@ -325,6 +325,19 @@ def test_sensitivity_runs_exactly_n_plus_1_forward_runs(tmp_path, monkeypatch):
     assert calls["n"] == 2  # base + one perturbed run
 
 
+def test_sensitivity_rejects_parameter_absent_from_template(tmp_path):
+    """A parameter that appears in no template would never be substituted and
+    would be reported as spurious zero sensitivity — fail loudly instead."""
+    name = _hk_model_with_obs(tmp_path)
+    with pytest.raises(ValueError, match="do not appear in any template"):
+        _impl_check_parameter_sensitivity(
+            model=name,
+            parameters={"k": 5.0, "ghost": 1.0},
+            template_files=["hk.dat.tpl"],
+            delta=0.1,
+        )
+
+
 @requires_mf6
 def test_sensitivity_flags_insensitive_parameter_at_chd_cell(tmp_path):
     name = _hk_model_with_obs(tmp_path, obs_at_chd=True)
