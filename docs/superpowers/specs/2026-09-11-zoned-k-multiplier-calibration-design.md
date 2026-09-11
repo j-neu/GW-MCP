@@ -174,9 +174,15 @@ base field exactly (bit-for-bit) and the model is unchanged at the initial
 point. The existing wrapper remains for the spaces-only case when no `zones`
 spec is present.
 
-`check_parameter_sensitivity`, `run_pestpp_glm`, `run_pestpp_ies`, and
-`summarise_calibration` need no changes: they already work from the template
-and the `.pst`.
+`check_parameter_sensitivity` needs one targeted change: it runs MODFLOW
+directly (`_impl_run_simulation`), which reads `<gwf>_k.dat` and ignores the
+multiplier file, so a zone perturbation would register as zero sensitivity.
+When a `<gwf>_k_zones.json` sidecar exists and the template target is the
+multiplier file, the screen must re-apply
+`k = base × mult[zone]` to `<gwf>_k.dat` after each `_tpl_substitute` and
+before the direct run. `run_pestpp_glm`, `run_pestpp_ies`, and
+`summarise_calibration` need no changes: pestpp invokes the wrapper, which
+already applies the multipliers.
 
 ## 4. Errors and limits
 
@@ -204,6 +210,10 @@ cover:
   unchanged; wrapper writes `<gwf>_k.dat` before running MF6.
 - **Partial coverage:** a layer without a spec, and inactive cells, keep their
   base values after `setup_calibration`.
+- **Sensitivity screen:** `check_parameter_sensitivity` on a zoned
+  parameterisation applies the multiplier to `<gwf>_k.dat` before each direct
+  run, so a perturbed zone reports non-zero sensitivity and the unperturbed
+  base run reproduces the base field.
 - **End-to-end synthetic model:** build/adopt a small model with a zoned K
   field and registered observations → `setup_calibration(scope="zones")` →
   forward run converges → parameter count is the zone count, not the cell
