@@ -854,6 +854,19 @@ def _derive_zones(k_layer, max_zones: int) -> tuple[np.ndarray, list[tuple[float
     return zone_ids, zones
 
 
+def _apply_k_multipliers(base_path, zone_path, mult_path, out_path) -> np.ndarray:
+    """Write ``k = base_k × multiplier[zone]`` (zone 0 fixed) to ``out_path``."""
+    base = np.loadtxt(base_path, dtype=float).reshape(-1)
+    zone = np.loadtxt(zone_path, dtype=int).reshape(-1)
+    mult = np.atleast_1d(np.loadtxt(mult_path, dtype=float)).reshape(-1)
+    factor = np.ones_like(base, dtype=float)
+    zoned = zone > 0
+    factor[zoned] = mult[zone[zoned] - 1]
+    k = base * factor
+    np.savetxt(out_path, k, fmt="%.10g")
+    return k
+
+
 def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     """Validate and normalise a ``setup_calibration`` parameterisation spec.
 
