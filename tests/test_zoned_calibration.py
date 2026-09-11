@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+import csv  # noqa: F401
+
 import numpy as np
 import pytest
+
+from groundwater_mcp.tools.builder import (
+    _impl_add_boundary_package,
+    _impl_add_dis_package,
+    _impl_add_ic_package,
+    _impl_add_npf_package,
+    _impl_add_oc_package,
+    _impl_create_model,
+    _impl_set_simulation,
+)
 
 
 def test_round_sig_array_rounds_to_significant_figures():
@@ -80,3 +92,99 @@ def test_apply_k_multipliers_identity_at_one(tmp_path):
     )
     k = _apply_k_multipliers(base_p, zone_p, mult_p, out_p)
     assert list(k) == pytest.approx([0.05, 0.05, 60.96])
+
+
+def _build_zoned_model(tmp_path, name="zoned_model"):
+    """1 layer × 5 × 5, two K zones (1.0 in cols 0, 5.0 elsewhere)."""
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "METERS", "DAYS")
+    _impl_set_simulation(name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="moderate")
+    _impl_add_dis_package(name, 1, 5, 5, 100.0, 100.0, 50.0, [30.0])
+    k = np.full((1, 5, 5), 5.0)
+    k[0, :, 0] = 1.0
+    _impl_add_npf_package(name, icelltype=0, k=k, k33=None, save_flows=True)
+    _impl_add_ic_package(name, strt=25.0)
+    chd = [[[0, r, 0], 40.0] for r in range(5)] + [[[0, r, 4], 10.0] for r in range(5)]
+    _impl_add_boundary_package(name, "CHD", {"0": chd}, None)
+    _impl_add_oc_package(name, None, None, None, None)
+    return name
+
+
+def test_normalise_zoned_builds_global_indices(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_zoned_parameterisation
+
+    name = _build_zoned_model(tmp_path)
+    norm = _normalise_zoned_parameterisation(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert norm["grid"]["type"] == "DIS"
+    assert len(norm["zones"]) == 2
+    assert [z["base_k"] for z in norm["zones"]] == [1.0, 5.0]
+    assert norm["zones"][0]["name"] == "k_z1"
+    assert norm["zones"][1]["name"] == "k_z2"
+    assert norm["zones"][0]["n_cells"] == 5
+    assert norm["zones"][1]["n_cells"] == 20
+    assert norm["zones"][0]["initial"] == 1.0
+    assert norm["zone_map"].reshape(5, 5)[0, 0] == 1
+    assert norm["zone_map"].reshape(5, 5)[0, 1] == 2
+
+
+def test_normalise_zoned_requires_layer(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_zoned_parameterisation
+
+    name = _build_zoned_model(tmp_path)
+    with pytest.raises(ValueError, match="requires 'layer'"):
+        _normalise_zoned_parameterisation(
+            name, {"k": {"target": "npf:k", "scope": "zones"}}
+        )
+
+
+def test_normalise_zoned_raises_on_no_positive_layer(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_zoned_parameterisation
+
+    name = _build_zoned_model(tmp_path)
+    with pytest.raises(ValueError, match="out of range"):
+        _normalise_zoned_parameterisation(
+            name, {"k": {"target": "npf:k", "scope": "zones", "layer": 9}}
+        )
+
+
+def test_normalise_zoned_raises_on_name_too_long(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_zoned_parameterisation
+
+    name = _build_zoned_model(tmp_path)
+    with pytest.raises(ValueError, match="12"):
+        _normalise_zoned_parameterisation(
+            name, {"averylongprefix": {"target": "npf:k", "scope": "zones", "layer": 0}}
+        )
+
+
+def test_normalise_zoned_raises_on_max_zones(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_zoned_parameterisation
+
+    name = _build_zoned_model(tmp_path)
+    with pytest.raises(ValueError, match="max_zones"):
+        _normalise_zoned_parameterisation(
+            name,
+            {"k": {"target": "npf:k", "scope": "zones", "layer": 0, "max_zones": 1}},
+        )
+
+
+def test_normalise_zoned_disv_layer(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_add_disv_package
+    from groundwater_mcp.tools.calibration import _normalise_zoned_parameterisation
+
+    name = "zoned_disv"
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "METERS", "DAYS")
+    _impl_set_simulation(name, 1, [1.0], [1], "simple")
+    vertices = [[0, 0.0, 0.0], [1, 100.0, 0.0], [2, 100.0, 100.0], [3, 0.0, 100.0]]
+    cell2d = [[0, 33.3, 33.3, 3, 0, 1, 2], [1, 66.6, 66.6, 3, 0, 2, 3]]
+    _impl_add_disv_package(name, 1, vertices, cell2d, [50.0, 50.0], [[40.0, 40.0]])
+    _impl_add_npf_package(name, icelltype=0, k=np.array([[1.0, 4.0]]), k33=None, save_flows=True)
+    norm = _normalise_zoned_parameterisation(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert norm["grid"]["type"] == "DISV"
+    assert norm["grid"]["ncpl"] == 2
+    assert [z["base_k"] for z in norm["zones"]] == [1.0, 4.0]

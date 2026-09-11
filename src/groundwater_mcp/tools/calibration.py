@@ -867,6 +867,157 @@ def _apply_k_multipliers(base_path, zone_path, mult_path, out_path) -> np.ndarra
     return k
 
 
+def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dict:
+    """Validate and normalise a ``setup_calibration`` zoned parameterisation.
+
+    Every spec must use ``scope="zones"`` with a ``layer``; zones are derived
+    from equal positive K values within that layer. Zone indices are global,
+    contiguous and ordered by ``(layer ascending, base K ascending)``.
+    """
+    if not parameterisation:
+        raise ValueError("parameterisation must name at least one parameter.")
+    gwf = get_gwf(model)
+    npf = gwf.get_package("npf")
+    if npf is None:
+        raise ValueError(
+            "No NPF package found; run add_npf_package before zoned parameterisation."
+        )
+    dis = gwf.get_package("dis")
+    disv = gwf.get_package("disv")
+    if dis is not None and disv is None:
+        nlay = int(dis.nlay.data)
+        nrow = int(dis.nrow.data)
+        ncol = int(dis.ncol.data)
+        per_layer = nrow * ncol
+        grid = {
+            "type": "DIS",
+            "nlay": nlay,
+            "nrow": nrow,
+            "ncol": ncol,
+            "per_layer": per_layer,
+            "ncell": nlay * per_layer,
+        }
+    elif disv is not None:
+        nlay = int(disv.nlay.data)
+        ncpl = int(disv.ncpl.data)
+        per_layer = ncpl
+        grid = {
+            "type": "DISV",
+            "nlay": nlay,
+            "ncpl": ncpl,
+            "per_layer": per_layer,
+            "ncell": nlay * per_layer,
+        }
+    else:
+        raise ValueError("No grid package (DIS/DISV) found on the model.")
+
+    k_base = np.asarray(npf.k.array, dtype=float).reshape(-1)
+    if k_base.size != grid["ncell"]:
+        raise ValueError(
+            f"NPF k has {k_base.size} values; grid has {grid['ncell']} cells."
+        )
+
+    specs: list[tuple[str, dict, int]] = []
+    for name, spec in parameterisation.items():
+        key = str(name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits and underscores."
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{key}' must be a spec dict.")
+        scope = spec.get("scope", "all")
+        if scope != "zones":
+            raise ValueError(
+                "Zoned parameterisation cannot be combined with scope "
+                f"'{scope}' (parameter '{key}'); all specs must use scope='zones'."
+            )
+        target = spec.get("target")
+        if target not in _SUPPORTED_TARGETS:
+            raise ValueError(
+                f"Unsupported parameterisation target '{target}'. Supported: "
+                f"{list(_SUPPORTED_TARGETS)}."
+            )
+        layer = spec.get("layer")
+        if layer is None:
+            raise ValueError(f"Parameter '{key}' scope=zones requires 'layer'.")
+        layer = int(layer)
+        if not (0 <= layer < nlay):
+            raise ValueError(
+                f"Parameter '{key}' layer {layer} out of range (nlay={nlay})."
+            )
+        specs.append((key, spec, layer))
+
+    if len({s[2] for s in specs}) != len(specs):
+        raise ValueError("Each layer may appear in at most one zones spec.")
+
+    zone_map = np.zeros(grid["ncell"], dtype=int)
+    parameters: list[dict] = []
+    zones_out: list[dict] = []
+    next_index = 1
+    for key, spec, layer in sorted(specs, key=lambda s: s[2]):
+        max_zones = int(spec.get("max_zones", 50))
+        if max_zones < 1:
+            raise ValueError(f"Parameter '{key}' max_zones must be >= 1.")
+        initial = float(spec.get("initial", 1.0))
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"Parameter '{key}' initial multiplier must be positive.")
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+            )
+        partrans = str(spec.get("partrans", "log")).lower()
+
+        offset = layer * per_layer
+        slice_ids, zone_vals = _derive_zones(
+            k_base[offset : offset + per_layer], max_zones
+        )
+        for local_id, (base_k, n_cells) in enumerate(zone_vals, start=1):
+            pname = f"{key}_z{next_index}"
+            if len(pname) > 12:
+                raise ValueError(
+                    f"Zone parameter name '{pname}' is {len(pname)} characters; "
+                    "PEST caps parameter names at 12. Use a shorter prefix."
+                )
+            zone_map[offset : offset + per_layer][slice_ids == local_id] = next_index
+            parameters.append(
+                {
+                    "name": pname,
+                    "target": "npf:k",
+                    "scope": "zones",
+                    "layer": layer,
+                    "initial": initial,
+                    "lower_bound": initial * lower_factor,
+                    "upper_bound": initial * upper_factor,
+                    "partrans": partrans,
+                }
+            )
+            zones_out.append(
+                {
+                    "name": pname,
+                    "index": next_index,
+                    "layer": layer,
+                    "base_k": base_k,
+                    "n_cells": n_cells,
+                    "initial": initial,
+                    "lower_bound": initial * lower_factor,
+                    "upper_bound": initial * upper_factor,
+                    "partrans": partrans,
+                }
+            )
+            next_index += 1
+
+    return {
+        "grid": grid,
+        "k_base": k_base,
+        "zone_map": zone_map,
+        "zones": zones_out,
+        "parameters": parameters,
+    }
+
+
 def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     """Validate and normalise a ``setup_calibration`` parameterisation spec.
 
