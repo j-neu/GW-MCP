@@ -596,21 +596,22 @@ def _impl_check_parameter_sensitivity(
 ) -> dict:
     """Cheap n+1 forward-run sensitivity screen (7f-H3.1).
 
-    ``parameters`` maps parameter name → base value (one entry per template).
-    Each template's target file must be one the model actually reads (e.g. an
-    NPF ``k`` array via ``OPEN/CLOSE hk.dat`` with template ``hk.dat.tpl``).
-    Runs the base model, then each parameter at ``base * (1 + delta)``, and
-    reports per-parameter sensitivity = mean relative change of the simulated
-    observation set.
+    ``parameters`` maps parameter name → base value. A template may define one
+    token per parameter (the legacy one-template-per-parameter case) or several
+    tokens (e.g. a zoned ``<gwf>_k_mult.dat.tpl`` with a token per zone). Each
+    template's target file must be one the model actually reads (e.g. an NPF
+    ``k`` array via ``OPEN/CLOSE hk.dat`` with template ``hk.dat.tpl``). Runs the
+    base model, then each parameter at ``base * (1 + delta)`` with every other
+    token at its base value, and reports per-parameter sensitivity = mean
+    relative change of the simulated observation set.
     """
     from groundwater_mcp.tools.postprocess import _read_simulated_observations_values
     from groundwater_mcp.tools.runner import _impl_run_simulation
 
     ws = resolve_workspace(model)
-    if len(parameters) != len(template_files):
-        raise ValueError("len(parameters) must equal len(template_files).")
 
     tpl_targets: list[tuple[Path, Path]] = []
+    all_tokens: list[str] = []
     for tpl_name in template_files:
         tpl = Path(tpl_name) if Path(tpl_name).is_absolute() else ws / tpl_name
         if not tpl.exists():
@@ -619,11 +620,15 @@ def _impl_check_parameter_sensitivity(
         if not first.startswith(("ptf", "jtf")):
             raise ValueError(f"Template file must start with [ptf,jtf]: {tpl}")
         names = pyemu.pst_utils.parse_tpl_file(str(tpl))
-        if not set(names).issubset(parameters):
+        unknown = [n for n in names if n not in parameters]
+        if unknown:
             raise ValueError(
-                f"Template {tpl.name} defines tokens {list(names)}; expected "
-                f"subset of parameters {list(parameters)}."
+                f"Template {tpl.name} defines tokens {unknown} not in "
+                f"parameters {list(parameters)}."
             )
+        for n in names:
+            if n not in all_tokens:
+                all_tokens.append(n)
         tpl_targets.append((tpl, tpl.with_suffix("")))
 
     base_run = _impl_run_simulation(model, silent=True)
@@ -643,16 +648,28 @@ def _impl_check_parameter_sensitivity(
         )
 
     results: dict = {}
-    for (tpl, target), (name, base_value) in zip(tpl_targets, parameters.items()):
-        original = target.read_bytes() if target.exists() else None
-        _tpl_substitute(tpl, target, {name: base_value * (1.0 + delta)})
-        _maybe_apply_zone_multipliers(model, target)
+    for name in parameters:
+        # Perturb one parameter while holding every other template token at its
+        # base value, so multi-token (zoned) templates stay valid on disk.
+        substituted = {
+            tok: (parameters[tok] * (1.0 + delta) if tok == name else parameters[tok])
+            for tok in all_tokens
+        }
+        originals = {
+            target: (target.read_bytes() if target.exists() else None)
+            for _, target in tpl_targets
+        }
         try:
+            for tpl, target in tpl_targets:
+                _tpl_substitute(tpl, target, substituted)
+                _maybe_apply_zone_multipliers(model, target)
             run = _impl_run_simulation(model, silent=True)
         finally:
-            if original is not None:
-                target.write_bytes(original)
-            _maybe_apply_zone_multipliers(model, target)
+            for _, target in tpl_targets:
+                original = originals[target]
+                if original is not None:
+                    target.write_bytes(original)
+                _maybe_apply_zone_multipliers(model, target)
             flush_model(model)
         if not run["success"]:
             results[name] = {"sensitivity": None, "run_succeeded": False}
