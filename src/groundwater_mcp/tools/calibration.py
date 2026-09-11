@@ -808,6 +808,52 @@ _SUPPORTED_TARGETS = ("npf:k",)
 _TPL_TOKEN_WIDTH = 15
 
 
+def _round_sig_array(values: np.ndarray, sig: int = 6) -> np.ndarray:
+    """Round an array to `sig` significant figures, element-wise.
+
+    Used to group K cells into zones: float representation noise must not
+    split a shipped zone value into two zones, while the shipped values
+    (0.050292, 0.16764, ...) stay distinct.
+    """
+    arr = np.asarray(values, dtype=float)
+    out = np.array(arr, dtype=float, copy=True)
+    nz = np.isfinite(arr) & (arr != 0)
+    x = np.abs(arr[nz])
+    exp = np.floor(np.log10(x))
+    factor = 10.0 ** (sig - 1 - exp)
+    out[nz] = np.sign(arr[nz]) * (np.round(x * factor) / factor)
+    return out
+
+
+def _derive_zones(k_layer, max_zones: int) -> tuple[np.ndarray, list[tuple[float, int]]]:
+    """Group a layer's cells into zones of equal positive K value.
+
+    Returns ``(zone_ids, zones)``: zone_ids is an int array the same shape as
+    ``k_layer`` with 0 for fixed (non-positive/non-finite) cells, and zones is
+    a list of ``(base_k, n_cells)`` sorted ascending by base_k.
+    """
+    k_arr = np.asarray(k_layer, dtype=float)
+    flat = k_arr.reshape(-1)
+    positive = np.isfinite(flat) & (flat > 0)
+    if not positive.any():
+        raise ValueError("layer has no positive K cells to zone.")
+    rounded = _round_sig_array(flat, 6)
+    values = np.unique(rounded[positive])
+    if len(values) > max_zones:
+        raise ValueError(
+            f"layer has {len(values)} distinct K values, more than "
+            f"max_zones={max_zones}; use a coarser zone input or raise max_zones."
+        )
+    zone_ids = np.zeros(k_arr.shape, dtype=int)
+    zone_ids_flat = zone_ids.reshape(-1)
+    zones: list[tuple[float, int]] = []
+    for i, v in enumerate(values, start=1):
+        mask = positive & (rounded == v)
+        zone_ids_flat[mask] = i
+        zones.append((float(v), int(mask.sum())))
+    return zone_ids, zones
+
+
 def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     """Validate and normalise a ``setup_calibration`` parameterisation spec.
 
