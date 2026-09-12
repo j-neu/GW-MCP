@@ -1529,6 +1529,8 @@ def _impl_import_obs_from_csv(
     layer: int,
 ) -> dict:
     """Read head/flow observations from CSV and write a MODFLOW 6 OBS file."""
+    from pathlib import Path
+
     import flopy.mf6 as mf6
     import pandas as pd
 
@@ -1598,12 +1600,26 @@ def _impl_import_obs_from_csv(
         records.append((obsname, obs_type_str, cellid))
     obsdata[obs_filename] = records
 
-    # Remove existing OBS package if present
+    # Replace the model's existing OBS package. A shipped model can carry
+    # several continuous OBS6 files (e.g. a head-observation package plus an
+    # SFR gage-observation package), so gwf.get_package("obs") returns a
+    # single package, a list, or None — never assume one (7f-G). Only the
+    # package(s) whose observation file we are about to reuse
+    # (<gwf.name>.obs) are removed; obs files owned by other packages are
+    # left untouched.
+    obs_pkg_file = f"{gwf.name}.obs"
     existing_obs = gwf.get_package("obs")
     if existing_obs is not None:
-        gwf.remove_package(existing_obs)
+        if not isinstance(existing_obs, list):
+            existing_obs = [existing_obs]
+        for obs_pkg in existing_obs:
+            if obs_pkg is None:
+                continue
+            pkg_file = Path(str(getattr(obs_pkg, "filename", "") or ""))
+            if pkg_file.name.lower() == obs_pkg_file.lower():
+                gwf.remove_package(obs_pkg)
 
-    mf6.ModflowUtlobs(gwf, filename=f"{gwf.name}.obs", continuous=obsdata)
+    mf6.ModflowUtlobs(gwf, filename=obs_pkg_file, continuous=obsdata)
     written = save_sim(model, gwf.simulation)
 
     # Also write a summary CSV of what was imported

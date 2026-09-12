@@ -168,6 +168,71 @@ def test_summarise_model_reports_registered_targets(tmp_path, obs_csv_at_centroi
     }
 
 
+def test_import_obs_replaces_existing_obs_package_when_model_ships_multiple(
+    tmp_path, obs_csv_at_centroids
+):
+    """Regression (6d neversink/mf6_freyberg): a model shipping a continuous
+    OBS6 package plus a second obs file (e.g. an SFR gage obs) makes
+    gwf.get_package("obs") return a *list*; import_obs_from_csv used to crash
+    with "'list' object has no attribute 'lower'" and never registered the
+    targets. It must replace only the obs package whose file it reuses and
+    leave the others (the SFR gage obs) untouched."""
+    import flopy.mf6 as mf6
+
+    from groundwater_mcp.utils.model_store import flush_model, get_gwf
+
+    name = _build_small_model(tmp_path)
+    gwf = get_gwf(name)
+
+    # Reproduce the shipped OBS layout of the neversink model: a model-level
+    # continuous obs file <gwf.name>.obs plus a second OBS6 file.
+    mf6.ModflowUtlobs(
+        gwf,
+        filename=f"{name}.obs",
+        continuous={f"{name}_shipped.obs.csv": [("s1", "HEAD", (0, 0, 0))]},
+    )
+    mf6.ModflowUtlobs(
+        gwf,
+        filename=f"{name}_extra.obs",
+        continuous={f"{name}_extra.obs.csv": [("g1", "HEAD", (0, 0, 1))]},
+    )
+    flush_model(name)
+    invalidate(name)
+    gwf = get_gwf(name)
+
+    existing = gwf.get_package("obs")
+    assert isinstance(existing, list)  # the pre-fix crash precondition
+    assert len(existing) == 2
+
+    result = _impl_import_obs_from_csv(
+        model=name,
+        csv_file=obs_csv_at_centroids,
+        obs_type="HEAD",
+        site_col="site",
+        date_col="date",
+        value_col="value",
+        x_col="x",
+        y_col="y",
+        layer=0,
+    )
+    assert "error" not in result, result.get("message", "")
+    assert result["site_count"] == 5
+
+    remaining = gwf.get_package("obs")
+    if not isinstance(remaining, list):
+        remaining = [remaining]
+    filenames = sorted(str(p.filename) for p in remaining)
+    # The colliding package was replaced with the imported target file…
+    assert f"{name}.obs" in filenames
+    # …while the non-colliding shipped obs file survives.
+    assert f"{name}_extra.obs" in filenames
+
+    flush_model(name)
+    text = (resolve_workspace(name) / f"{name}.obs").read_text()
+    assert f"{name}_head.obs.csv" in text
+    assert all(s in text for s in ("S01", "S02", "S03", "S04", "S05"))
+
+
 # ---------------------------------------------------------------------------
 # F1.2 — read_simulated_observations
 # ---------------------------------------------------------------------------
