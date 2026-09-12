@@ -11,6 +11,7 @@ import numpy as np
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_sim,
+    clear_k_base_snapshot,
     consume_reload_flag,
     flush_model,
     get_gwf,
@@ -452,6 +453,7 @@ def _impl_add_npf_package(
 
     mf6.ModflowGwfnpf(gwf, **kwargs)
     written = save_sim(model, gwf.simulation)
+    clear_k_base_snapshot(model, gwf.name)
     return {
         "model": model,
         "package": "NPF",

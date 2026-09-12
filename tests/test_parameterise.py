@@ -407,6 +407,26 @@ def test_assign_k_from_raster_single_layer(dis_model, dem_raster):
     assert float(k[1, 0, 0]) == pytest.approx(1.0)
 
 
+def test_assign_k_from_raster_clears_setup_k_snapshot(dis_model, dem_raster):
+    """A K assignment must invalidate setup_calibration's pristine-base
+    snapshot, so a later setup re-snapshots the new field instead of reverting
+    it to the previous base."""
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
+    from groundwater_mcp.utils.model_store import get_gwf
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    gwf = get_gwf(dis_model)
+    snapshot = resolve_workspace(dis_model) / f"{gwf.name}_k_pristine.npy"
+    np.save(snapshot, np.asarray(gwf.npf.k.array, dtype=float))
+    assert snapshot.exists()
+
+    result = _impl_assign_k_from_raster(
+        dis_model, str(dem_raster), None, 0, "nearest", "error", 0.1
+    )
+    assert "error" not in result
+    assert not snapshot.exists()
+
+
 def test_assign_k_from_raster_multiple_layers(dis_model, dem_raster):
     from groundwater_mcp.tools.parameterise import _impl_assign_k_from_raster
     from groundwater_mcp.utils.model_store import get_gwf

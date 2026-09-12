@@ -256,6 +256,21 @@ def flush_model(name: str) -> bool:
     return True
 
 
+def clear_k_base_snapshot(model: str, gwf_name: str) -> bool:
+    """Delete ``setup_calibration``'s pristine NPF-k snapshot, if present.
+
+    Any tool that deliberately changes NPF ``k`` (``assign_k_from_raster``,
+    ``assign_k_from_zones``, ``add_npf_package``) calls this so a later
+    ``setup_calibration`` re-snapshots the new field instead of restoring the
+    previous base. Returns ``True`` when a snapshot was removed.
+    """
+    path = resolve_workspace(model) / f"{gwf_name}_k_pristine.npy"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
 def is_dirty(name: str) -> bool:
     """Return whether a model has staged in-memory changes not yet flushed."""
     return bool(_dirty.get(name))

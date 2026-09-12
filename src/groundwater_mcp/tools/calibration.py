@@ -839,16 +839,20 @@ _TPL_TOKEN_WIDTH = 15
 
 
 def _restore_or_snapshot_k_base(model: str) -> np.ndarray:
-    """Return the model's pristine NPF ``k`` array, snapshotting it on first use.
+    """Return the base NPF ``k`` array, snapshotting it on first use.
 
     ``setup_calibration`` rewires NPF ``k`` to an external file that a later
-    setup call (or a forward run) may overwrite. Without a snapshot, a repeated
-    or mixed-scope setup parameterises a mutated field and can silently flatten
-    K (the neversink rerun-2 finding: a layer-scope setup wrote its absolute
+    setup call may overwrite. Without a snapshot, a repeated or mixed-scope
+    setup parameterises a mutated field and can silently flatten K (the
+    neversink rerun-2 finding: a layer-scope setup wrote its absolute
     ``initial`` into the shared external array, and a later zones setup then saw
-    a single uniform zone). The pristine array is captured once in
-    ``<gwf>_k_pristine.npy`` and restored into NPF before every setup, so
-    ``setup_calibration`` is safely re-runnable.
+    a single uniform zone).
+
+    The base array is captured once in ``<gwf>_k_pristine.npy`` and restored
+    into NPF before every setup, which makes ``setup_calibration`` safely
+    re-runnable. A tool that deliberately changes ``k`` clears the snapshot via
+    ``model_store.clear_k_base_snapshot`` so the next setup re-snapshots the new
+    field rather than reverting the edit.
     """
     gwf = get_gwf(model)
     npf = gwf.get_package("npf")
@@ -860,14 +864,14 @@ def _restore_or_snapshot_k_base(model: str) -> np.ndarray:
     current = np.asarray(npf.k.array, dtype=float)
     if path.exists():
         k = np.load(path)
+        if current.shape != k.shape:
+            raise ValueError(
+                f"NPF k shape {current.shape} does not match the pristine "
+                f"snapshot shape {k.shape}."
+            )
     else:
         k = current.copy()
         np.save(path, k)
-    if current.shape != k.shape:
-        raise ValueError(
-            f"NPF k shape {current.shape} does not match the pristine snapshot "
-            f"shape {k.shape}."
-        )
     npf.k.set_data(k)
     return k
 

@@ -757,3 +757,39 @@ def test_setup_calibration_repeatable_preserves_base_k(tmp_path):
     assert list(np.loadtxt(ws / f"{gwf_name}_k_base.dat")) == pytest.approx(
         list(pristine_base)
     )
+
+
+@requires_mf6
+def test_setup_calibration_re_snapshots_after_k_change(tmp_path):
+    """Once a K-mutating tool clears the snapshot, the next setup re-snapshots
+    the new field instead of reverting it to the previous base."""
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+    from groundwater_mcp.utils.model_store import (
+        clear_k_base_snapshot,
+        get_gwf,
+        invalidate,
+        save_sim,
+    )
+
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name)
+    _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+
+    # Change K the way assign_k_from_raster does, then clear the base snapshot
+    # exactly as that tool does.
+    invalidate(name)
+    gwf = get_gwf(name)
+    new_k = np.full((1, 5, 5), 2.0)
+    new_k[0, :, 0] = 7.0
+    gwf.get_package("npf").k.set_data(new_k)
+    save_sim(name, gwf.simulation)
+    clear_k_base_snapshot(name, gwf.name)
+
+    invalidate(name)
+    r = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert "error" not in r, r
+    assert [z["base_k"] for z in r["zones"]] == [2.0, 7.0], r["zones"]
