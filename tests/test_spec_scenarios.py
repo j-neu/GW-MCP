@@ -240,6 +240,42 @@ def test_export_apply_roundtrip_reproduces_heads(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# G1.5 — export_model_spec with string boundary columns
+# ---------------------------------------------------------------------------
+
+
+def test_export_model_spec_preserves_string_boundary_columns(tmp_path):
+    """Regression (6d neversink): export_model_spec float()-cast every
+    boundary-record column, but shipped WEL files carry a string boundname
+    column (well/site ids like 'sv_193'), so exporting crashed with
+    "could not convert string to float". String columns must be preserved."""
+    import flopy.mf6 as mf6
+
+    from groundwater_mcp.utils.model_store import flush_model, get_gwf, invalidate
+
+    name = _build_small_model(tmp_path, name="welbnd")
+    gwf = get_gwf(name)
+    wel = gwf.get_package("wel")
+    if wel is not None:
+        gwf.remove_package(wel)
+    mf6.ModflowGwfwel(
+        gwf,
+        boundnames=True,
+        stress_period_data={
+            0: [[(0, 5, 5), -500.0, "sv_193"], [(0, 4, 4), -200.0, "sv_194"]]
+        },
+        save_flows=True,
+    )
+    flush_model(name)
+    invalidate(name)
+
+    spec = _impl_export_model_spec(name)["spec"]
+    records = spec["boundaries"]["WEL"]["0"]
+    assert records[0] == [[0, 5, 5], -500.0, "sv_193"]
+    assert records[1] == [[0, 4, 4], -200.0, "sv_194"]
+
+
+# ---------------------------------------------------------------------------
 # G2.1 — provenance ledger (through the MCP layer)
 # ---------------------------------------------------------------------------
 

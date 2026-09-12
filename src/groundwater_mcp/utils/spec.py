@@ -347,7 +347,22 @@ def _export_boundaries(model: str) -> dict[str, dict]:
                 row_dict = {name: row[name] for name in rec.dtype.names}
                 cellid = row_dict.pop("cellid", None)
                 entry: list[object] = [list(cellid)] if cellid is not None else []
-                entry += [float(v) for v in row_dict.values()]
+                for name, v in row_dict.items():
+                    kind = rec.dtype.fields[name][0].kind
+                    if kind in "iuf":
+                        entry.append(float(v))
+                    elif kind == "b":
+                        entry.append(bool(v))
+                    else:
+                        # Text columns (e.g. WEL boundname, string aux) are
+                        # preserved as strings rather than float()-cast.
+                        if isinstance(v, (bytes, bytearray)):
+                            v = v.decode("utf-8", "replace")
+                        if v is None:
+                            s = ""
+                        else:
+                            s = str(v)
+                        entry.append("" if s.strip() == "" else s)
                 records.append(entry)
             spd[str(sp_key)] = records
         if spd:
