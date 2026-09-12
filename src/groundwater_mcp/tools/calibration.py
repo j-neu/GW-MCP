@@ -838,6 +838,40 @@ _SUPPORTED_TARGETS = ("npf:k",)
 _TPL_TOKEN_WIDTH = 15
 
 
+def _restore_or_snapshot_k_base(model: str) -> np.ndarray:
+    """Return the model's pristine NPF ``k`` array, snapshotting it on first use.
+
+    ``setup_calibration`` rewires NPF ``k`` to an external file that a later
+    setup call (or a forward run) may overwrite. Without a snapshot, a repeated
+    or mixed-scope setup parameterises a mutated field and can silently flatten
+    K (the neversink rerun-2 finding: a layer-scope setup wrote its absolute
+    ``initial`` into the shared external array, and a later zones setup then saw
+    a single uniform zone). The pristine array is captured once in
+    ``<gwf>_k_pristine.npy`` and restored into NPF before every setup, so
+    ``setup_calibration`` is safely re-runnable.
+    """
+    gwf = get_gwf(model)
+    npf = gwf.get_package("npf")
+    if npf is None:
+        raise ValueError(
+            "No NPF package found; run add_npf_package before setup_calibration."
+        )
+    path = resolve_workspace(model) / f"{gwf.name}_k_pristine.npy"
+    current = np.asarray(npf.k.array, dtype=float)
+    if path.exists():
+        k = np.load(path)
+    else:
+        k = current.copy()
+        np.save(path, k)
+    if current.shape != k.shape:
+        raise ValueError(
+            f"NPF k shape {current.shape} does not match the pristine snapshot "
+            f"shape {k.shape}."
+        )
+    npf.k.set_data(k)
+    return k
+
+
 def _round_sig_array(values: np.ndarray, sig: int = 6) -> np.ndarray:
     """Round an array to `sig` significant figures, element-wise.
 
@@ -1453,6 +1487,7 @@ def _impl_setup_calibration_zoned(
     multiplier 1.0 the written K field equals the base field.
     """
     ws = resolve_workspace(model)
+    _restore_or_snapshot_k_base(model)
     norm = _normalise_zoned_parameterisation(model, parameterisation)
     gwf_name = get_gwf(model).name
 
@@ -1600,8 +1635,8 @@ def _impl_setup_calibration(
     """
     if not isinstance(parameterisation, dict):
         raise ValueError(
-            "parameterisation must be a dict mapping parameter name → spec, "
-            f"got {type(parameterisation).__name__}."
+            "parameterisation must be a dict mapping parameter name → "
+            f"spec, got {type(parameterisation).__name__}."
         )
     zone_specs = {
         str(n): s
@@ -1617,6 +1652,7 @@ def _impl_setup_calibration(
         return _impl_setup_calibration_zoned(model, parameterisation, obs_source, noptmax)
     ws = resolve_workspace(model)
     norm = _normalise_parameterisation(model, parameterisation)
+    _restore_or_snapshot_k_base(model)
 
     # 1. Rewire NPF k to an external array so the template can target it.
     ext_file = None

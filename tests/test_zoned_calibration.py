@@ -712,3 +712,48 @@ def test_zoned_sensitivity_perturbs_and_restores_k(tmp_path):
     assert sens and max(sens) > 0, result
     # The screen restores the unperturbed (multiplier 1.0) K file.
     assert list(np.loadtxt(ws / f"{gwf_name}_k.dat")) == pytest.approx(list(base_k))
+
+
+@requires_mf6
+def test_setup_calibration_repeatable_preserves_base_k(tmp_path):
+    """A repeated (or mixed-scope) setup_calibration must not poison the base K
+    field used by later setups.
+
+    Reproduces the neversink rerun-2 corruption: after a zoned setup, a
+    differently-scoped setup wrote its absolute ``initial`` into the shared
+    external K file, and a later zoned setup then reloaded that flattened field
+    and saw a single uniform zone.
+    """
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+    from groundwater_mcp.utils.model_store import get_gwf, invalidate
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name)
+    gwf_name = get_gwf(name).name
+    ws = resolve_workspace(name)
+
+    r1 = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert "error" not in r1, r1
+    assert len(r1["zones"]) == 2
+    pristine_base = np.loadtxt(ws / f"{gwf_name}_k_base.dat")
+
+    # A second, differently-scoped setup with an absolute initial must not
+    # destroy the base field that later setups parameterise from.
+    invalidate(name)
+    r2 = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "all", "initial": 1.0}}
+    )
+    assert "error" not in r2, r2
+
+    invalidate(name)
+    r3 = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}
+    )
+    assert "error" not in r3, r3
+    assert len(r3["zones"]) == 2, r3["zones"]
+    assert list(np.loadtxt(ws / f"{gwf_name}_k_base.dat")) == pytest.approx(
+        list(pristine_base)
+    )
