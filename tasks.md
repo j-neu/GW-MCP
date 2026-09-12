@@ -174,8 +174,8 @@ pattern (dry-run → rerun-2/3/4 with fixes between) applied at scale:
 
 | Target | What it validates | Status |
 |---|---|---|
-| mf6brabant (Brabant NL regional) | build-from-data (raster/CSV), multi-layer regional, run, postprocess | ⛔ run 1 CANCELLED (2026-08-17d, owner); rerun loop restarts after 7e+7f gate work |
-| Zenodo 21381071 (Nature Sust. 2026 ensemble) | adopt real calibrated model, run, PEST++-IES + uncertainty chain | ⏳ run 1 **green** (2026-08-17); rerun-2 stalled (pif format, no MCP defect) → rerun-3 **held until 7e+7f done** |
+| mf6brabant (Brabant NL regional) | build-from-data (raster/CSV), multi-layer regional, run, postprocess | ✅ **PASSED 2026-09-06** (rerun-3 + rerun-4 green, incl. the full 250 m reference-resolution build) |
+| Zenodo 21381071 (Nature Sust. 2026 ensemble) | adopt real calibrated model, run, PEST++-IES + uncertainty chain | ✅ **PASSED 2026-08-30** (rerun-4 + rerun-5 green set-and-forget; strict reading would add a clean rerun-6) |
 | Aare Valley (Zenodo 8047723, WRR 2023) | build/run real model, PEST++ calibrate, **compare to published posterior** | ✅ **PASSED 2026-09-07** (run-1 + rerun-2 green) |
 | GMS MODFLOW 6 tutorial `mf6_pest_obs_ss` | adopt shipped MF6 + PEST obs interface, run, calibrate vs solved reference | ⏳ run-1 partial 2026-09-07 — adopt/run/postprocess green + exact reference reproduction; **calibration BLOCKED by DISV obs/calibration tool gap** |
 | mf6_freyberg (usgs/pestpp TM7C26) | sen/ies/glm/opt/sweep PEST++ chain on authoritative benchmark | ✅ **PASSED 2026-09-07** (run-1 + rerun-2 green) |
@@ -2280,7 +2280,7 @@ silently running as steady state — no STO tool, no warning). See
 - [x] Mode A holdout replay green (dry-run; official run at the freeze)
 - [x] Mode B manual Layer-3 sessions completed (dry-run 1 + closed-book rerun-2/3/4, 0 reprompts each)
 - [x] Mode B tutorial 05 re-run against the fixed calibration chain (post-fix verification) — rerun-4 (2026-08-16): clean `setup_pest_control → run_pestpp_glm → summarise_calibration`, K=36.28 m/d, RMSE 5.26 m; set-and-forget run (zero permission prompts, ~29 min)
-- [ ] **6d Tier-1 gate passed (release gate policy, 2026-08-16):** every Tier-1 target above has completed ≥2 consecutive green closed-book reruns (last = set-and-forget, zero permission prompts) — mf6brabant, zenodo-21381071, aare-valley, GMS `mf6_pest_obs_ss`, mf6_freyberg, neversink_workflow, 1DSubsidenceModeling-MF6CSUB, MF6_EnKF_DISU. *(4 of 8 targets passed: zenodo-21381071 2026-08-30, mf6brabant 2026-09-06, aare-valley 2026-09-07, mf6_freyberg 2026-09-07; 4 remaining — GMS mf6_pest_obs_ss run-1 partial (DISV gap), neversink_workflow run-1 + rerun-1 partial (import defect fixed 2026-09-08; calibration now blocked by `setup_calibration` uniform-only `npf:k` tokenisation — same decision class as GMS), 1DSubsidenceModeling-MF6CSUB + MF6_EnKF_DISU not started.)*
+- [ ] **6d Tier-1 gate passed (release gate policy, 2026-08-16):** every Tier-1 target above has completed ≥2 consecutive green closed-book reruns (last = set-and-forget, zero permission prompts) — mf6brabant, zenodo-21381071, aare-valley, GMS `mf6_pest_obs_ss`, mf6_freyberg, neversink_workflow, 1DSubsidenceModeling-MF6CSUB, MF6_EnKF_DISU. *(5 of 8 targets passed: zenodo-21381071 2026-08-30, mf6brabant 2026-09-06, aare-valley 2026-09-07, mf6_freyberg 2026-09-07, neversink_workflow 2026-09-12; 3 remaining — GMS mf6_pest_obs_ss (DISV obs/calibration gap), 1DSubsidenceModeling-MF6CSUB + MF6_EnKF_DISU not started.)*
 - [ ] **7e+7f gate passed (owner decision 2026-08-17d):** every task in § 7e (Tiers A–C) and § 7f (Tiers D–I) is complete with its stated test passing and `tools.md`/`README.md`/`capability-matrix.md` updated in the same commit
 - [ ] README + CONTRIBUTING + CHANGELOG documentation in place
 - [ ] PyPI package published and installable
