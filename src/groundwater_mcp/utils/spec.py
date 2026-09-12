@@ -13,6 +13,7 @@ import hashlib
 
 import numpy as np
 
+from groundwater_mcp.utils.grid import get_dis, get_disv
 from groundwater_mcp.utils.model_store import flush_model, get_gwf, get_sim, read_meta
 
 _TOP_KEYS = {
@@ -382,8 +383,8 @@ def export_spec(model: str) -> dict:
         "time_units": meta.get("time_units", "DAYS"),
     }
 
-    dis = gwf.get_package("dis")
-    disv = gwf.get_package("disv")
+    dis = get_dis(gwf)
+    disv = get_disv(gwf)
     if dis is not None:
         spec["grid"] = {
             "type": "DIS",

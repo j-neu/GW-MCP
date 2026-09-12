@@ -9,6 +9,7 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
+from groundwater_mcp.utils.grid import get_dis, get_disv
 from groundwater_mcp.utils.model_store import get_gwf, read_meta
 from groundwater_mcp.utils.workspace import resolve_workspace
 
@@ -47,32 +48,62 @@ def _oc_file_record(gwf, record_name: str) -> str | None:
         return None
 
 
+_HEAD_EXTENSIONS = (".hds", ".hed")
+_BUDGET_EXTENSIONS = (".cbb", ".cbc", ".ccf")
+
+
+def _resolve_declared_file(workspace: Path, declared: str | None) -> Path | None:
+    """Resolve an OC-declared output path against the workspace.
+
+    MODFLOW writes the file relative to the model working directory, so the
+    declared record can carry a subdirectory (e.g.
+    ``GWF_Model_output/GWF_Model.hds``); the old ``Path(declared).name``
+    dropped that directory and failed to find the file. An absolute declared
+    path is honoured as-is. Returns None when the declared file is absent (so
+    the caller can fall back to a recursive glob).
+    """
+    if not declared:
+        return None
+    p = Path(declared)
+    cand = p if p.is_absolute() else workspace / p
+    return cand if cand.exists() else None
+
+
 def _find_output_file(model: str, workspace: Path, extension: str) -> tuple[Path, str | None]:
     """Return (path, warning) for the head output file.
 
-    The file declared in the OC package's ``head_filerecord`` wins; otherwise
-    a single glob match is used. With several undeclared candidates a warning
-    naming them all is returned (7e-B13).
+    The file declared in the OC package's ``head_filerecord`` wins — resolved
+    relative to the workspace so subdirectory output is found, and accepting
+    the GMS ``.hed`` spelling as well as ``.hds``. Otherwise a recursive glob
+    match is used. With several undeclared candidates a warning naming them all
+    is returned (7e-B13).
 
     Raises
     ------
     FileNotFoundError
         If no matching file exists.
     """
-    declared = _oc_file_record(get_gwf(model), "head_filerecord") if extension == ".hds" else None
-    matches = list(workspace.glob(f"*{extension}"))
+    exts = _HEAD_EXTENSIONS if extension in _HEAD_EXTENSIONS else (extension,)
+    declared = (
+        _oc_file_record(get_gwf(model), "head_filerecord")
+        if extension in _HEAD_EXTENSIONS
+        else None
+    )
+    declared_path = _resolve_declared_file(workspace, declared)
+    if declared_path is not None:
+        return declared_path, None
+
+    matches: list[Path] = []
+    for ext in exts:
+        matches.extend(workspace.rglob(f"*{ext}"))
     if not matches:
         raise FileNotFoundError(
-            f"No {extension} file found in {workspace}. "
+            f"No {'/'.join(exts)} file found in {workspace}. "
             "Run the simulation first with run_simulation."
         )
-    if declared:
-        cand = workspace / Path(declared).name
-        if cand.exists():
-            return cand, None
     if len(matches) > 1:
         return matches[0], (
-            f"Multiple {extension} files found; using {matches[0].name}. "
+            f"Multiple head files found; using {matches[0].name}. "
             f"Declared in OC: {declared or 'none'}. "
             f"Candidates: {[m.name for m in matches]}"
         )
@@ -80,24 +111,25 @@ def _find_output_file(model: str, workspace: Path, extension: str) -> tuple[Path
 
 
 def _find_budget_file(model: str, workspace: Path) -> tuple[Path, str | None]:
-    """Locate the cell-by-cell budget file (.cbb or .cbc).
+    """Locate the cell-by-cell budget file (.cbb/.cbc/.ccf).
 
-    Prefers the OC ``budget_filerecord``; warns when several undeclared
-    candidates exist (7e-B13).
+    Prefers the OC ``budget_filerecord`` (resolved relative to the workspace,
+    so subdirectory output is found, and accepting the GMS ``.ccf`` spelling);
+    warns when several undeclared candidates exist (7e-B13).
     """
     declared = _oc_file_record(get_gwf(model), "budget_filerecord")
+    declared_path = _resolve_declared_file(workspace, declared)
+    if declared_path is not None:
+        return declared_path, None
+
     matches: list[Path] = []
-    for ext in (".cbb", ".cbc"):
-        matches.extend(workspace.glob(f"*{ext}"))
+    for ext in _BUDGET_EXTENSIONS:
+        matches.extend(workspace.rglob(f"*{ext}"))
     if not matches:
         raise FileNotFoundError(
-            f"No .cbb/.cbc budget file found in {workspace}. "
+            f"No .cbb/.cbc/.ccf budget file found in {workspace}. "
             "Run the simulation first with run_simulation."
         )
-    if declared:
-        cand = workspace / Path(declared).name
-        if cand.exists():
-            return cand, None
     if len(matches) > 1:
         return matches[0], (
             f"Multiple budget files found; using {matches[0].name}. "
@@ -147,10 +179,10 @@ def _array_stats(arr: np.ndarray) -> dict:
 def _model_nlay(model: str) -> int:
     """Return the number of layers declared by the model's grid (0 if unknown)."""
     gwf = get_gwf(model)
-    dis = gwf.get_package("dis")
+    dis = get_dis(gwf)
     if dis is not None:
         return int(dis.nlay.data)
-    disv = gwf.get_package("disv")
+    disv = get_disv(gwf)
     if disv is not None:
         return int(disv.nlay.data)
     return 0
@@ -676,7 +708,7 @@ def _require_dis_and_crs(gwf):
     structured DIS grid — shared by the export tools (7e-C5)."""
     from groundwater_mcp.utils.spatial import CRSError
 
-    dis = gwf.get_package("dis")
+    dis = get_dis(gwf)
     if dis is None:
         raise ValueError(
             "This export requires a structured DIS grid (DISV/DISU are not supported)."

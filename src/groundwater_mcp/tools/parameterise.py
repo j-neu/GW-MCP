@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from groundwater_mcp.utils.grid import get_dis, get_disv
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     clear_k_base_snapshot,
@@ -99,9 +100,11 @@ def _impl_import_grid_from_shapefile(
 
         idomain = np.broadcast_to(props["idomain"][np.newaxis, :, :], (nlay, nrow, ncol)).copy()
 
-        pkg = gwf.get_package("dis")
-        if pkg is not None:
-            gwf.remove_package(pkg)
+        # Replacing the grid must remove either discretisation type (a DISV
+        # model's package also prefix-matches get_package("dis")).
+        for existing in (get_dis(gwf), get_disv(gwf)):
+            if existing is not None:
+                gwf.remove_package(existing)
 
         mf6.ModflowGwfdis(
             gwf,
@@ -154,9 +157,9 @@ def _impl_import_grid_from_shapefile(
         top = np.zeros(ncpl, dtype=float)
         botm = [np.full(ncpl, float(-(i + 1))) for i in range(nlay)]
 
-        pkg = gwf.get_package("disv")
-        if pkg is not None:
-            gwf.remove_package(pkg)
+        for existing in (get_dis(gwf), get_disv(gwf)):
+            if existing is not None:
+                gwf.remove_package(existing)
 
         mf6.ModflowGwfdisv(
             gwf,
@@ -335,8 +338,8 @@ def _raster_values_for_grid(
             "cell values are sampled in a known coordinate space."
         )
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
 
     if dis_pkg is not None:
         nrow = int(dis_pkg.nrow.data)
@@ -603,8 +606,8 @@ def _impl_assign_layer_array_from_raster(
             f"that creates it first (add_npf_package / add_ic_package / "
             "add_sto_package)."
         )
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     nlay = _grid_nlay(gwf)
 
     layers = _checked_layers(layer, nlay)
@@ -749,8 +752,8 @@ def _impl_assign_period_array_from_raster(
             "Use 0-based indices matching set_simulation."
         )
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     if dis_pkg is None and disv_pkg is None:
         raise RuntimeError("No DIS or DISV package found.")
     nlay = _grid_nlay(gwf)
@@ -912,8 +915,8 @@ def _impl_assign_top_from_raster(
             "elevations are sampled in a known coordinate space."
         )
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
 
     if dis_pkg is not None:
         nrow = int(dis_pkg.nrow.data)
@@ -1042,8 +1045,8 @@ def _impl_assign_k_from_zones(
     # Determine which layers to update
     layers = layer if isinstance(layer, list) else [layer]
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     npf_pkg = gwf.get_package("npf")
 
     if npf_pkg is None:
@@ -1134,8 +1137,8 @@ def _impl_assign_k_from_raster(
     if npf_pkg is None:
         raise RuntimeError("NPF package not found. Run add_npf_package first.")
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     if dis_pkg is not None:
         nlay = int(dis_pkg.nlay.data)
     elif disv_pkg is not None:
@@ -1276,8 +1279,8 @@ def _impl_assign_ic_from_raster(
     if ic_pkg is None:
         raise RuntimeError("IC package not found. Run add_ic_package first.")
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     if dis_pkg is not None:
         nlay = int(dis_pkg.nlay.data)
     elif disv_pkg is not None:
@@ -1383,7 +1386,7 @@ def _impl_import_river_from_shapefile(
 
     gwf = get_gwf(model)
     mg = gwf.modelgrid
-    dis_pkg = gwf.get_package("dis")
+    dis_pkg = get_dis(gwf)
     if dis_pkg is None:
         raise RuntimeError("import_river_from_shapefile currently supports DIS grids only.")
 
@@ -1571,7 +1574,7 @@ def _impl_import_obs_from_csv(
         for site, sx, sy in zip(site_coords.index, xcoords, ycoords):
             dist = np.hypot(xc - sx, yc - sy)
             nearest = int(np.argmin(dist))
-            dis_pkg = gwf.get_package("dis")
+            dis_pkg = get_dis(gwf)
             if dis_pkg is not None:
                 ncol = int(dis_pkg.ncol.data)
                 row_idx = nearest // ncol
@@ -1581,9 +1584,16 @@ def _impl_import_obs_from_csv(
                 cellid = (layer, nearest)
             site_to_cellid[site] = cellid
     else:
-        # No coordinates — create placeholder observations keyed by site name
+        # No coordinates — create placeholder observations keyed by site name,
+        # sequentially through the cell ids. DIS cell ids are
+        # (layer, row, col); DISV cell ids are (layer, node) — a 3-tuple is
+        # invalid in an OBS6 file on a DISV grid.
+        dis_only = get_dis(gwf)
         for i, site in enumerate(sites):
-            site_to_cellid[site] = (layer, i, 0)
+            if dis_only is not None:
+                site_to_cellid[site] = (layer, i, 0)
+            else:
+                site_to_cellid[site] = (layer, i)
 
     # Write MODFLOW 6 OBS file
     obs_file = ws / f"{gwf.name}.obs"
@@ -2055,7 +2065,9 @@ def register(mcp) -> None:
         """Import head or flow observations from a CSV file.
 
         Sites are mapped to model cells by (x, y) coordinate (nearest centroid) if
-        x_col and y_col are provided, otherwise by sequential order. Writes a
+        x_col and y_col are provided, otherwise by sequential order. Works on
+        structured DIS grids (cell ids are ``(layer, row, col)``) and
+        unstructured DISV grids (cell ids are ``(layer, node)``). Writes a
         MODFLOW 6 OBS file and a summary CSV of site-to-cell mappings.
         """
         try:

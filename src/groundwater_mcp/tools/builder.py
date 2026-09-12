@@ -8,6 +8,7 @@ from pathlib import Path
 import flopy.mf6 as mf6
 import numpy as np
 
+from groundwater_mcp.utils.grid import get_dis, get_disv
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_sim,
@@ -290,13 +291,13 @@ def _impl_set_model_crs(
     angrot = angrot if angrot is not None else 0.0
     gwf.modelgrid.set_coord_info(xoff=xorigin, yoff=yorigin, angrot=angrot, crs=crs)
 
-    dis_pkg = gwf.get_package("dis")
+    dis_pkg = get_dis(gwf)
     if dis_pkg is not None:
         if xorigin is not None:
             dis_pkg.xorigin.set_data(xorigin)
         if yorigin is not None:
             dis_pkg.yorigin.set_data(yorigin)
-    disv_pkg = gwf.get_package("disv")
+    disv_pkg = get_disv(gwf)
     if disv_pkg is not None:
         if xorigin is not None:
             disv_pkg.xorigin.set_data(xorigin)
@@ -338,9 +339,9 @@ def _impl_add_dis_package(
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
 
     gwf = get_gwf(model)
-    pkg = gwf.get_package("dis")
-    if pkg is not None:
-        gwf.remove_package(pkg)
+    for existing in (get_dis(gwf), get_disv(gwf)):
+        if existing is not None:
+            gwf.remove_package(existing)
 
     dis_kwargs: dict = {
         "nlay": nlay,
@@ -400,9 +401,9 @@ def _impl_add_disv_package(
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
 
     gwf = get_gwf(model)
-    pkg = gwf.get_package("disv")
-    if pkg is not None:
-        gwf.remove_package(pkg)
+    for existing in (get_dis(gwf), get_disv(gwf)):
+        if existing is not None:
+            gwf.remove_package(existing)
 
     mf6.ModflowGwfdisv(
         gwf,
@@ -777,8 +778,8 @@ def _impl_summarise_model(model: str) -> dict:
 
     # Grid info
     grid_info: dict = {}
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     if dis_pkg is not None:
         grid_info = {
             "type": "DIS",
@@ -880,8 +881,8 @@ def _compute_model_status(model: str) -> dict:
     sim = get_sim(model)
     gwf = get_gwf(model)
 
-    dis_pkg = gwf.get_package("dis")
-    disv_pkg = gwf.get_package("disv")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
     has_grid = dis_pkg is not None or disv_pkg is not None
     tdis = sim.get_package("tdis")
     ims = sim.get_package("ims")

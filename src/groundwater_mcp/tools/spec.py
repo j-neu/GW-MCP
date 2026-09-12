@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 
 from groundwater_mcp.tools.builder import _impl_summarise_model
 from groundwater_mcp.utils import ledger
+from groundwater_mcp.utils.grid import get_grid
 from groundwater_mcp.utils.model_store import cache_sim, flush_model, read_meta, write_meta
 from groundwater_mcp.utils.spec import apply_spec, export_spec
 from groundwater_mcp.utils.workspace import create_workspace, resolve_workspace
@@ -191,11 +192,12 @@ def _default_valued_packages(model: str) -> list[str]:
         k = np.asarray(npf.k.array)
         if k.ndim == 0 or float(np.ptp(k)) == 0.0:
             defaults.append("npf.k (uniform/default)")
-    dis = gwf.get_package("dis")
+    dis = get_grid(gwf)
     if dis is not None and "top" not in provenance:
         top = np.asarray(dis.top.array)
         if top.ndim == 0 or float(np.ptp(top)) == 0.0:
-            defaults.append("dis.top (uniform/default)")
+            pkg_type = str(getattr(dis, "package_type", "dis")).lower()
+            defaults.append(f"{pkg_type}.top (uniform/default)")
     return defaults
 
 
@@ -206,7 +208,7 @@ def _impl_describe_model(model: str) -> dict:
     provenance = meta.get("provenance", {})
     records = ledger.read_records(model)
 
-    has_run = bool(list(ws.glob("*.hds")))
+    has_run = any(p for ext in (".hds", ".hed") for p in ws.rglob(f"*{ext}"))
     last_run = None
     for r in reversed(records):
         if r.get("tool") == "run_simulation":

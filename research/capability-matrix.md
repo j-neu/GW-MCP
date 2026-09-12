@@ -153,13 +153,23 @@ No capability-coverage rows changed.
 `builder.py:_BOUNDARY_PKG_CLASSES` (CHD, WEL, RIV, DRN, RCH, EVT, GHB, SFR).
 "catalog example refs" are filled from discovery round 1
 (`discovery/catalog.md`); a gap row with zero refs is a red flag.
+**DISV obs/calibration/reporting fix (2026-09-12):** the obs/calibration layer
+was silently structured-only because FloPy's `gwf.get_package("dis")`
+prefix-matches the DISV package (`"disv"` → `"dis"`), so `import_obs_from_csv`
+(coords), `setup_calibration`, `summarise_model`, `describe_model`, and
+`export_model_spec` dereferenced the missing `nrow`/`ncol` on `ModflowGwfdisv`.
+`utils/grid.py` now type-gates the resolvers (`get_dis`/`get_disv`/`get_grid`)
+across all 22 call sites, coordinate obs map to `(layer, node)` on DISV, and
+`_find_output_file`/`_find_budget_file` resolve OC-declared subdirectory paths
+and the GMS `.hed`/`.ccf` extensions. DISV obs/calibration row (formerly an
+implicit gap) is now covered; `tests/test_disv_support.py`.
 
 ## GWF — flow (discretisation + stress packages)
 
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
 |---|---|---|---|---|
 | DIS (rectangular grid) | covered | `add_dis_package` | test005_advgw_tidal, ex-gwf-hani, mf6-training | `idomain` support (7e-B9) |
-| DISV (layered vertex grid) | covered | `add_disv_package` | test006_gwf3_disv, ex-gwf-u1disv, mf6Voronoi, Modflow-API-Ag-Package | |
+| DISV (layered vertex grid) | covered | `add_disv_package` | test006_gwf3_disv, ex-gwf-u1disv, mf6Voronoi, Modflow-API-Ag-Package | obs import (coords → `(layer, node)`), `summarise_model`, `export_model_spec`, and non-zoned/zoned `setup_calibration` all work on DISV (fix 2026-09-12) |
 | DISU (fully unstructured) | **gap** | — | test009_3lay-disu, test006_gwf3_gnc, ex-gwf-radial, MF6_EnKF_DISU, GMS Quadtree | User-flagged; first v0.2.0 item |
 | TDIS / IMS (time + solver) | covered | `set_simulation` | all testmodels/examples (mfsim.nam) | nper, perlen, nstp, tsmult, ims_complexity |
 | STO (storage) | covered | `add_sto_package` | test003_gwfs_tr, test020_NevilleTonkinTransient, ex-gwf-advtidal | v0.1.0 gate (2026-08-16): iconvert/ss/sy + steady/transient periods |

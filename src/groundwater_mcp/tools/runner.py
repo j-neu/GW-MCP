@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from groundwater_mcp.tools.builder import _transient_like_without_sto
 from groundwater_mcp.tools.postprocess import _compute_obs_fit
 from groundwater_mcp.utils import jobs
+from groundwater_mcp.utils.grid import get_dis
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     flush_model,
@@ -590,7 +591,7 @@ def _classify_convergence_failure(sim, gwf) -> tuple[str, list[str], dict]:
                     {attr: value},
                 )
 
-    dis = gwf.get_package("dis")
+    dis = get_dis(gwf)
     if dis is not None:
         idomain = getattr(dis, "idomain", None)
         if idomain is not None:
@@ -837,7 +838,7 @@ def _impl_validate_model(model: str) -> dict:
 
     findings: list[dict] = []
 
-    dis = gwf.get_package("dis")
+    dis = get_dis(gwf)
     idomain = None
     top = None
     botm = None

@@ -61,6 +61,8 @@ Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter es
 
 Zoned K multiplier calibration (2026-09-11): `setup_calibration(scope="zones")` auto-derives zones from groups of equal positive per-layer `npf:k` values and turns each zone into a dimensionless multiplier parameter (`<prefix>_z<index>`). It writes `<gwf>_k_base.dat`, `<gwf>_k_zone.dat` and `<gwf>_k_mult.dat.tpl` and forces a forward wrapper that computes `k = base_k × multiplier[zone]` before each MODFLOW 6 run, so the base spatial K pattern is preserved and only zone magnitudes are calibrated. This closes the neversink `setup_calibration` uniform-only (whole-scope per-layer replacement) parameterisation gap.
 
+DISV support in the obs/calibration/reporting layer (2026-09-12): FloPy's `gwf.get_package("dis")` falls back to a partial package-type match, so on a DISV model it returns the `ModflowGwfdisv` package for `"dis"` too — every `if dis is not None` branch silently took the structured-DIS path and dereferenced the missing `nrow`/`ncol`. `utils/grid.py` (`get_dis`/`get_disv`/`get_grid`) now returns a package only when it is the requested grid type; all 22 call sites use it. `import_obs_from_csv` coordinate mode maps sites to `(layer, node)` on DISV, and `summarise_model`/`describe_model`/`export_model_spec`/non-zoned `setup_calibration` work on unstructured grids. Output discovery (`_find_output_file`/`_find_budget_file`) also resolves OC-declared paths relative to the workspace (subdirectories) and accepts the GMS `.hed`/`.ccf` extensions. This closes the GMS `mf6_pest_obs_ss` Tier-1 blocker.
+
 ---
 
 ## File structure

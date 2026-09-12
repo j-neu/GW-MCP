@@ -319,35 +319,29 @@ def test_apply_k_multipliers_disv_node_ordering(tmp_path):
     assert list(k) == pytest.approx([6.0, 36.0])
 
 
-def _seed_obs_meta_disv(name, nodes):
-    """Seed the registered-observation metadata directly.
+def _register_disv_obs(tmp_path, name, nodes):
+    """Register DISV head observations through the real import path.
 
-    ``import_obs_from_csv`` cannot currently register observations on a DISV
-    grid: ``parameterise.py`` resolves the grid with ``get_package("dis")``,
-    which prefix-matches the DISV package, and then reads the non-existent
-    ``.ncol``. That is an unrelated pre-existing bug, so this test seeds the
-    meta directly to exercise the zoned DISV path without depending on it.
+    Historically this test seeded the metadata directly because
+    ``import_obs_from_csv`` resolved the grid with ``get_package("dis")``,
+    which prefix-matches the DISV package; that root cause is fixed, so the
+    real tool must now work on a DISV grid.
     """
-    from groundwater_mcp.utils.model_store import read_meta, write_meta
-
-    meta = read_meta(name)
-    meta["observations"] = {
-        "type": "HEAD",
-        "layer": 0,
-        "obs_file": f"{name}.obs",
-        "output_csv": f"{name}_head.obs.csv",
-        "sites": [
-            {
-                "site": f"S{i + 1:02d}",
-                "cellid": [0, int(n)],
-                "n_records": 1,
-                "values": [30.0],
-                "dates": ["2020-01-01"],
-            }
-            for i, n in enumerate(nodes)
-        ],
-    }
-    write_meta(name, meta)
+    gwf = get_gwf(name)
+    mg = gwf.modelgrid
+    xc = np.asarray(mg.xcellcenters).ravel()
+    yc = np.asarray(mg.ycellcenters).ravel()
+    csv_path = tmp_path / f"{name}_obs.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "x", "y"])
+        for i, node in enumerate(nodes):
+            writer.writerow(
+                [f"S{i + 1:02d}", "2020-01-01", 30.0, float(xc[node]), float(yc[node])]
+            )
+    _impl_import_obs_from_csv(
+        name, str(csv_path), "HEAD", "site", "date", "value", "x", "y", 0
+    )
 
 
 @requires_mf6
@@ -392,7 +386,7 @@ def test_setup_calibration_zoned_disv_executes_wrapper(tmp_path):
     chd = [[[0, 0], 40.0], [[0, 3], 10.0]]
     _impl_add_boundary_package(name, "CHD", {"0": chd}, None)
     _impl_add_oc_package(name, None, None, None, None)
-    _seed_obs_meta_disv(name, [0, 1])
+    _register_disv_obs(tmp_path, name, [0, 1])
 
     result = _impl_setup_calibration(
         name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0}}

@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 from groundwater_mcp.tools.runner import _find_mf6_binary
 from groundwater_mcp.utils import jobs
+from groundwater_mcp.utils.grid import get_dis, get_disv
 from groundwater_mcp.utils.model_store import (
     flush_model,
     get_gwf,
@@ -985,8 +986,8 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
         raise ValueError(
             "No NPF package found; run add_npf_package before zoned parameterisation."
         )
-    dis = gwf.get_package("dis")
-    disv = gwf.get_package("disv")
+    dis = get_dis(gwf)
+    disv = get_disv(gwf)
     if dis is not None and disv is None:
         nlay = int(dis.nlay.data)
         nrow = int(dis.nrow.data)
@@ -1151,8 +1152,8 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     if not parameterisation:
         raise ValueError("parameterisation must name at least one parameter.")
     gwf = get_gwf(model)
-    dis = gwf.get_package("dis")
-    disv = gwf.get_package("disv")
+    dis = get_dis(gwf)
+    disv = get_disv(gwf)
     if dis is not None:
         nlay, nrow, ncol = (
             int(dis.nlay.data),
