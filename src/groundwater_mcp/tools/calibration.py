@@ -2144,12 +2144,17 @@ def _impl_run_pestpp_da(
     num_reals: int = 50,
     num_workers: int = 1,
     da_options: dict | None = None,
+    noptmax: int | None = None,
 ) -> dict:
     """Run PESTPP-DA (generalized sequential/batch data assimilation).
 
-    The caller must supply a DA-ready PST (observation/parameter/weight cycle
-    tables, or ``da_*`` options via ``da_options``). In PEST++ DA the control
-    ``noptmax`` is the ensemble size, so ``num_reals`` is written there.
+    The caller supplies a DA-ready PST. The ensemble size is the
+    ``da_num_reals`` ``++`` option (written from ``num_reals``); the PEST
+    control ``noptmax`` is the number of update *iterations per assimilation
+    cycle*, not the ensemble size — ``0`` performs a single (non-iterative)
+    update per cycle, the standard ensemble-Kalman case. When ``noptmax`` is
+    omitted the PST's own value is preserved. (PEST++ manual §12;
+    ``pestpp/pestpp-da_benchmarks`` reference PST.)
 
     Parameters
     ----------
@@ -2158,12 +2163,20 @@ def _impl_run_pestpp_da(
     pst_file:
         Path to the PST control file.
     num_reals:
-        Number of realisations (written to ``noptmax``).
+        Ensemble size, written to ``da_num_reals``.
     num_workers:
         Number of parallel workers (see run_pestpp_glm note on parallelism).
     da_options:
-        Extra ``++`` options (e.g. ``{"da_cycle": 1,
-        "da_obs_cycle_table": "..."}``) written into the PST.
+        Extra ``++`` options written into the PST. PEST++-DA recognises the
+        cycle options ``da_observation_cycle_table``,
+        ``da_parameter_cycle_table``, ``da_weight_cycle_table``,
+        ``da_parameter_ensemble``, ``da_hotstart_cycle``, ``da_stop_cycle``,
+        ``da_use_simulated_states`` and ``da_noptmax_schedule``. There is no
+        ``da_cycle`` / ``da_obs_cycle_table`` / ``da_ensemble`` — an
+        unrecognised ``++`` arg is a fatal control-file parse error.
+    noptmax:
+        Update iterations per assimilation cycle. ``None`` leaves the PST's
+        existing ``noptmax`` unchanged.
     """
     exe = _find_pestpp_binary("pestpp-da")
     ws = resolve_workspace(model)
@@ -2176,7 +2189,9 @@ def _impl_run_pestpp_da(
     flush_model(model)
 
     pst = pyemu.Pst(str(pst_path))
-    pst.control_data.noptmax = int(num_reals)
+    if noptmax is not None:
+        pst.control_data.noptmax = int(noptmax)
+    pst.pestpp_options["da_num_reals"] = int(num_reals)
     for key, value in (da_options or {}).items():
         pst.pestpp_options[key] = value
     pst.write(str(pst_path))
@@ -2213,6 +2228,7 @@ def _impl_run_pestpp_da(
         "final_phi_std": final_phi_std,
         "cycles": cycles,
         "num_reals": num_reals,
+        "noptmax": int(pst.control_data.noptmax),
         "stdout": result.stdout[-3000:] if result.stdout else "",
         "stderr": result.stderr[-1000:] if result.stderr else "",
     }
@@ -2766,15 +2782,22 @@ def register(mcp: FastMCP) -> None:
         num_reals: int = 50,
         num_workers: int = 1,
         da_options: dict | None = None,
+        noptmax: int | None = None,
     ) -> dict:
         """Run PESTPP-DA (ensemble data assimilation) and return phi statistics.
 
-        Requires a DA-ready PST: pass cycle-table options (e.g.
-        ``{"da_cycle": 1, "da_obs_cycle_table": "...",
-        "da_parameter_cycle_table": "..."}``) or a PST already carrying ``da_*``
-        options. ``num_reals`` is written to ``noptmax`` (the DA ensemble size)."""
+        Requires a DA-ready PST: pass cycle options (e.g.
+        ``{"da_observation_cycle_table": "obs_cycle_tbl.csv",
+        "da_parameter_cycle_table": "par_cycle_tbl.csv",
+        "da_weight_cycle_table": "weight_cycle_tbl.csv"}``) or a PST already
+        carrying ``da_*`` options. ``num_reals`` is the ensemble size (written
+        to ``da_num_reals``); the optional ``noptmax`` sets the number of update
+        iterations per assimilation cycle (0 = a single standard Kalman update)
+        and preserves the PST's own value when omitted."""
         try:
-            return _impl_run_pestpp_da(model, pst_file, num_reals, num_workers, da_options)
+            return _impl_run_pestpp_da(
+                model, pst_file, num_reals, num_workers, da_options, noptmax
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except FileNotFoundError as exc:

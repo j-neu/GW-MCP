@@ -1,8 +1,9 @@
 """PESTPP-DA engine exposure (run_pestpp_da).
 
 The engine wrapper runs the DA binary against a caller-supplied DA-ready PST.
-These tests pin the option injection (num_reals -> noptmax, da_* passthrough)
-and the return schema without launching a real assimilation run.
+These tests pin the option injection (num_reals -> da_num_reals, da_* option
+passthrough, noptmax = iterations/cycle and NOT the ensemble size) and the
+return schema without launching a real assimilation run.
 """
 
 from __future__ import annotations
@@ -73,16 +74,44 @@ def test_run_pestpp_da_injects_options(tmp_path, monkeypatch):
     monkeypatch.setattr(cal.subprocess, "run", fake_run)
 
     result = _impl_run_pestpp_da(
-        name, str(pst_file), num_reals=7, da_options={"da_cycle": 1}
+        name,
+        str(pst_file),
+        num_reals=7,
+        da_options={"da_observation_cycle_table": "obs_cycle_tbl.csv"},
+        noptmax=0,
     )
 
     assert "pestpp-da" in str(seen["cmd"][0])
     assert result["num_reals"] == 7
+    assert result["noptmax"] == 0
     assert result["converged"] is True
 
     pst = pyemu.Pst(str(pst_file))
-    assert int(pst.control_data.noptmax) == 7
-    assert str(pst.pestpp_options["da_cycle"]) == "1"
+    # Ensemble size is da_num_reals, NOT noptmax (which is iterations/cycle).
+    assert str(pst.pestpp_options["da_num_reals"]) == "7"
+    assert int(pst.control_data.noptmax) == 0
+    assert str(pst.pestpp_options["da_observation_cycle_table"]) == "obs_cycle_tbl.csv"
+
+
+def test_run_pestpp_da_noptmax_is_not_ensemble_size(tmp_path, monkeypatch):
+    """Regression: noptmax must not be overwritten from num_reals, and an
+    omitted noptmax leaves the DA-ready PST's own value untouched (7f-DA)."""
+    name, pst_file = _model_with_pst(tmp_path, "dapst3")
+    from groundwater_mcp.tools import calibration as cal
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(cal.subprocess, "run", lambda *a, **k: _Result())
+
+    _impl_run_pestpp_da(name, str(pst_file), num_reals=25)
+
+    pst = pyemu.Pst(str(pst_file))
+    # Fixture PST was built with setup_calibration(noptmax=1); it must survive.
+    assert int(pst.control_data.noptmax) == 1
+    assert str(pst.pestpp_options["da_num_reals"]) == "25"
 
 
 def test_run_pestpp_da_missing_pst_raises(tmp_path):
