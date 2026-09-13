@@ -720,6 +720,84 @@ Work step by step and explain what you are doing at each step.
 
 ---
 
+## Target 7 — DISU capability row (test009_3lay-disu)
+
+**What it validates:** fully-unstructured (DISU) grid build/adopt/run/report —
+the v0.2.0 DISU capability row and the prerequisite for the `MF6_EnKF_DISU`
+Tier-1 target. Introduced 2026-09-13 with the `add_disu_package` capability
+(commit `839ebb7`).
+
+**Criteria:** adopt a shipped DISU model and run it; recognise the DISU grid in
+`summarise_model`/`model_status`; register observations by sequential node id;
+calibrate with `setup_calibration`; build a fresh DISU model with
+`add_disu_package`; and report the exact behaviour of the x/y-dependent tools
+(which cannot work on a DISU grid defined without vertices).
+
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\test009_3lay-disu\`
+(MODFLOW 6 test009: 3 layers, 228 nodes, nested grid in layer 2, GNC).
+Additional gate refs (future reruns): `ex-gwf-radial` (flopy builder script in
+`pools/modflow6-examples/scripts/`) and GMS Quadtree
+(`initial-local/GMS Tutorials/MODFLOW-USG/Quadtree.zip`).
+
+### Prompt (paste verbatim into the Agent Manager session)
+
+```
+CLOSED-BOOK VALIDATION RUN — Phase 6d capability row: DISU (fully unstructured grid).
+
+You are a groundwater modelling assistant validating an MCP toolchain on a
+published MODFLOW 6 DISU model. Do NOT read the groundwater-mcp repository
+source code, its tests, .kilo plans, or prior research session logs. You MAY
+read the model's own input files — they are the model specification.
+
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\test009_3lay-disu\
+A complete MODFLOW 6 DISU model: a 3-layer model with a nested grid in layer 2
+(MODFLOW 6 test problem test009). Files: mfsim.nam, flow.nam, flow.disu (228
+nodes, NJA 1372), flow.ic, flow.npf, flow.chd, flow.gnc (ghost-node
+corrections), flow.oc, flow.tdis, flow.ims, readme.txt.
+
+SUCCESS CRITERIA:
+1) check_environment first; report the stack.
+2) Copy the model into this session folder, then adopt it into an MCP workspace
+   with the adopt_model tool (model name <= 16 chars, allow_modify=true, and the
+   units/time units the model declares). Do NOT rebuild the grid.
+3) check_model clean (or documented).
+4) run_simulation converges / normal termination. Verify via get_run_log if a
+   client timeout occurs.
+5) Postprocess on the adopted model: read_heads (report the head statistics),
+   compute_water_balance (must close), and summarise_model (report the grid
+   block verbatim). Also call model_status and validate_model and report what
+   they return for this DISU model.
+6) Test the DISU builder path: create a SECOND, brand-new small DISU model with
+   add_disu_package (a 3-node line is fine: nodes 1-2-3, IAC [2,3,2], JA
+   [0,1,1,0,2,2,1]), add NPF/IC/CHD/OC, flush it, then check_model and
+   run_simulation it. On that model register observations with
+   import_obs_from_csv using a CSV WITHOUT x/y columns (sequential node
+   mapping), then call setup_calibration with a single spec
+   {"k": {"target": "npf:k", "scope": "all", "initial": 1.0}} and
+   obs_source="model". Report the results and any errors.
+7) Explicitly note how the tools behave for operations that need cell x/y on a
+   DISU grid with no vertices (plot_heads_map and coordinate-based
+   import_obs_from_csv): report the exact error/behaviour, and state whether the
+   head map is produced.
+8) Write run-log.md in the session folder: tool-call sequence, reprompts,
+   decisions, deviations from the source model, convergence evidence, and the
+   results of each criterion above.
+
+MCP-ONLY CONSTRAINT: every action that builds, adopts, runs, post-processes, or
+calibrates an MF6 MODEL must go through a groundwater-mcp tool call — do NOT
+call flopy/pyemu MODFLOW classes directly, and do NOT hand-edit MODFLOW files
+with a text editor or shell command. Ordinary Python to READ a model file or the
+solution outputs is fine — that is reading the specification, not building your
+model. If a groundwater-mcp tool cannot do something you need, STOP and report
+exactly what capability is missing and why — do not work around the gap by
+building/running the model with raw flopy instead. A workaround invalidates
+this run: it is testing whether the MCP tools are sufficient on their own.
+
+Work step by step and explain what you are doing at each step.
+```
+
+---
+
 ## Session log template
 
 `research/discovery/sessions/YYYY-MM-DD-6d-<target>.md`:
