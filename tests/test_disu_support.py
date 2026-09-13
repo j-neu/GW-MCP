@@ -126,6 +126,22 @@ def test_add_disu_package_requires_connection_data(tmp_path):
         )
 
 
+def test_add_boundary_package_rejects_multi_element_cellid_on_disu(tmp_path):
+    """A DISV/DIS-style cellid must not be silently truncated on a DISU grid."""
+    name = _build_disu_model(tmp_path, "disu_chdbad")
+    with pytest.raises(ValueError, match="single node index"):
+        _impl_add_boundary_package(name, "CHD", {"0": [[[0, 0], 1.0]]}, None)
+
+
+def test_add_boundary_package_accepts_one_element_node_on_disu(tmp_path):
+    name = _build_disu_model(tmp_path, "disu_chdok")
+    result = _impl_add_boundary_package(
+        name, "CHD", {"0": [[[0], 1.0], [[2], 0.0]]}, None
+    )
+    assert result.get("error") is not True
+    assert result["package"] == "CHD"
+
+
 @requires_mf6
 def test_disu_model_runs(tmp_path):
     from groundwater_mcp.tools.postprocess import _impl_read_heads

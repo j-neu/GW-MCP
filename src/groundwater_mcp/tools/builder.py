@@ -745,6 +745,13 @@ def _impl_add_boundary_package(
     gwf = get_gwf(model)
     pkg_cls = _BOUNDARY_PKG_CLASSES[pkg_name]
 
+    # DISU boundary cell ids are a single node index. A malformed multi-element
+    # id (e.g. a DISV-style (layer, node)) is silently reduced to its first
+    # element by FloPy, which can collapse two records onto one node — reject it
+    # up front with a clear message instead.
+    if get_disu(gwf) is not None and pkg_name not in _ARRAY_BOUNDARY_PKGS:
+        _validate_disu_boundary_cellids(spd)
+
     # Replacement semantics (7e-B10): with an explicit ``pname`` only that
     # package is replaced (so two CHD sets can coexist, e.g. chd_high +
     # chd_lower); without one, every package of the type is removed first.
@@ -799,6 +806,36 @@ def _impl_add_boundary_package(
                 "and re-add each boundary in its own call."
             )
     return result
+
+
+def _validate_disu_boundary_cellids(spd: dict) -> None:
+    """Reject non-scalar boundary cell ids on a DISU grid.
+
+    On DISU the cell id is a single node index (or a 1-element ``[node]``);
+    ``(layer, row, col)`` and ``(layer, node)`` forms are invalid and FloPy
+    silently truncates them, which can map several records onto one node.
+    """
+    for sp, records in spd.items():
+        for rec in records:
+            try:
+                cellid = rec[0]
+            except (TypeError, IndexError, KeyError):
+                raise ValueError(
+                    f"Malformed boundary record in stress period {sp}: {rec!r}."
+                ) from None
+            if isinstance(cellid, (list, tuple, np.ndarray)):
+                if len(cellid) != 1:
+                    raise ValueError(
+                        "On a DISU grid a boundary cell id must be a single node "
+                        f"index (got {list(cellid)!r} in stress period {sp}). Use a "
+                        "scalar node or a 1-element [node] id; DIS (layer,row,col) "
+                        "and DISV (layer,node) ids are not valid on DISU."
+                    )
+            elif not isinstance(cellid, (int, np.integer)):
+                raise ValueError(
+                    "On a DISU grid a boundary cell id must be a single node "
+                    f"index (got {cellid!r} in stress period {sp})."
+                )
 
 
 def _convert_rate_record(record, rate_units: str, pkg_name: str) -> list:

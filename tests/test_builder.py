@@ -124,6 +124,26 @@ def test_create_model_same_name_different_root_ok(tmp_path):
     assert str(resolve_workspace("m")) in (ws_a, ws_b)
 
 
+def test_resolve_workspace_prefers_most_recently_registered_root(tmp_path):
+    """With the same name under several roots, the newest registration wins.
+
+    Keeps the per-root registry contract but makes resolution deterministic so
+    a model just adopted in a new worktree is the one the tools read (the
+    2026-09-13 DISU rerun friction).
+    """
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    ws_a = str(tmp_path / "project_a" / "m")
+    ws_b = str(tmp_path / "project_b" / "m")
+    ws_c = str(tmp_path / "project_c" / "m")
+    _impl_create_model("m", ws_a, "METERS", "DAYS")
+    _impl_create_model("m", ws_b, "METERS", "DAYS")
+    assert str(resolve_workspace("m")) == ws_b  # most recent
+
+    _impl_create_model("m", ws_c, "METERS", "DAYS")
+    assert str(resolve_workspace("m")) == ws_c
+
+
 def test_create_model_name_too_long_raises(tmp_path):
     long_name = "tutorial05_catchment"  # 21 chars — exceeds MF6's 16-char MODELNAME cap
     with pytest.raises(ValueError, match="16 characters"):

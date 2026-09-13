@@ -10,7 +10,9 @@ registered in external roots.
 
 Re-registering the *same* name+path is idempotent (returns the existing
 workspace); the same name under a different root is legal; the same name
-twice in the same root with different paths is a collision error.
+twice in the same root with different paths is a collision error. When the same
+name exists under several roots, ``resolve_workspace`` prefers the root that
+was registered most recently (known roots are stored most-recent-first).
 """
 
 from __future__ import annotations
@@ -68,14 +70,15 @@ def _load_known_roots() -> list[Path]:
 
 
 def _remember_root(root: Path) -> None:
-    """Add *root* to the known-roots index so resolve_workspace can find it."""
-    known = _load_known_roots()
-    if root in known:
-        return
-    known.append(root)
-    p = _known_roots_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps([str(r) for r in sorted(set(map(str, known)))], indent=2))
+    """Record *root* as the most recently used external registry root.
+
+    Roots are stored most-recent-first so ``resolve_workspace`` prefers the
+    workspace that was registered last when the same model name exists in
+    several roots (e.g. one Agent Manager worktree per run).
+    """
+    known = [r for r in _load_known_roots() if r != root]
+    known.insert(0, root)
+    _save_known_roots(known)
 
 
 def _forget_root_if_empty(root: Path) -> None:
@@ -87,9 +90,15 @@ def _forget_root_if_empty(root: Path) -> None:
 
 
 def _save_known_roots(roots: list[Path]) -> None:
+    """Persist the known-roots index, preserving order (most recent first)."""
+    seen: list[str] = []
+    for r in roots:
+        s = str(r)
+        if s not in seen:
+            seen.append(s)
     p = _known_roots_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps([str(r) for r in sorted(set(map(str, roots)))], indent=2))
+    p.write_text(json.dumps(seen, indent=2))
 
 
 # ---------------------------------------------------------------------------
