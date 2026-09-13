@@ -18,6 +18,7 @@ from groundwater_mcp.utils.model_store import (
     get_gwf,
     get_sim,
     invalidate,
+    restore_oc_period_records,
     save_sim,
 )
 from groundwater_mcp.utils.workspace import (
@@ -204,6 +205,7 @@ def _impl_adopt_model(
             "contain a runnable input set (mfsim.nam + package files)."
         )
     sim = mf6.MFSimulation.load(sim_ws=str(model_dir), verbosity_level=0)
+    restore_oc_period_records(sim, model_dir)
     cache_sim(name, sim)
     _write_meta(model_dir, {
         "name": name,

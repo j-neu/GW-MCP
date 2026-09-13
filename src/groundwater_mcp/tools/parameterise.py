@@ -7,6 +7,8 @@ geodata-mcp server.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 from groundwater_mcp.utils.grid import get_dis, get_disv
@@ -28,6 +30,39 @@ from groundwater_mcp.utils.workspace import resolve_workspace
 
 def _err(code: str, message: str, suggestion: str = "") -> dict:
     return {"error": True, "code": code, "message": message, "suggestion": suggestion}
+
+
+# MODFLOW 6 continuous OBS types accepted by import_obs_from_csv. A compound
+# flux observation (e.g. total river discharge over a cell group) is NOT an
+# OBS6 continuous type — writing one produces a record MF6 rejects
+# ("Observation type not found") — so unsupported types fail loudly instead.
+_MF6_CONTINUOUS_OBS_TYPES = {
+    "HEAD",
+    "DRAWDOWN",
+    "DEPTH",
+    "CONCENTRATION",
+    "TEMPERATURE",
+}
+
+# MODFLOW 6 treats '#' as a comment marker and splits OBS records on whitespace,
+# so a name like GMS's "POINT_#1" is read as "POINT_" and the remainder becomes a
+# comment ("Observation type not found: #").
+_OBS_NAME_INVALID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_obs_name(site: str, used: set[str]) -> str:
+    """Return an MF6-safe, unique OBS name for *site* (<= 40 chars)."""
+    name = _OBS_NAME_INVALID_RE.sub("_", str(site)).strip("_") or "obs"
+    name = re.sub(r"_{2,}", "_", name)
+    name = name[:40]
+    base = name
+    i = 1
+    while name.lower() in used:
+        suffix = f"_{i}"
+        name = base[: 40 - len(suffix)] + suffix
+        i += 1
+    used.add(name.lower())
+    return name
 
 
 def _record_provenance(model: str, key: str, source: str, tool: str, **extra) -> None:
@@ -1541,6 +1576,17 @@ def _impl_import_obs_from_csv(
     mg = gwf.modelgrid
     ws = resolve_workspace(model)
 
+    obs_type_str = obs_type.upper()
+    if obs_type_str not in _MF6_CONTINUOUS_OBS_TYPES:
+        raise ValueError(
+            f"Unsupported obs_type '{obs_type_str}'. MODFLOW 6 OBS continuous "
+            f"types supported here are {sorted(_MF6_CONTINUOUS_OBS_TYPES)}. "
+            "Compound flux observations (e.g. total river discharge over a cell "
+            "group) are not representable by an OBS6 continuous type — evaluate "
+            "them with compute_water_balance instead of registering them as "
+            "observations."
+        )
+
     df = pd.read_csv(
         csv_file,
         parse_dates=[date_col]
@@ -1597,16 +1643,18 @@ def _impl_import_obs_from_csv(
 
     # Write MODFLOW 6 OBS file
     obs_file = ws / f"{gwf.name}.obs"
-    obs_type_str = obs_type.upper()
 
     # Build continuous observation data
     # Format: {obs_file: [(obsname, obs_type, cellid), ...]}
     obsdata = {}
     obs_filename = f"{gwf.name}_{obs_type_str.lower()}.obs.csv"
     records = []
+    used_obs_names: set[str] = set()
+    site_obs_name: dict[str, str] = {}
     for site in sites:
         cellid = site_to_cellid[site]
-        obsname = str(site)[:40]  # MODFLOW obs names limited to 40 chars
+        obsname = _safe_obs_name(str(site), used_obs_names)
+        site_obs_name[str(site)] = obsname
         records.append((obsname, obs_type_str, cellid))
     obsdata[obs_filename] = records
 
@@ -1638,23 +1686,28 @@ def _impl_import_obs_from_csv(
     site_entries = []
     for site in sites:
         site_df = df[df[site_col] == site]
+        obsname = site_obs_name[str(site)]
         summary_rows.append({
             "site": site,
+            "obs_name": obsname,
             "cellid": str(site_to_cellid[site]),
             "n_records": len(site_df),
             "date_min": str(site_df[date_col].min()) if date_col in site_df.columns else "",
             "date_max": str(site_df[date_col].max()) if date_col in site_df.columns else "",
             "value_mean": float(site_df[value_col].mean()),
         })
-        site_entries.append({
-            "site": str(site),
+        entry = {
+            "site": obsname,
             "cellid": list(site_to_cellid[site]),
             "n_records": int(len(site_df)),
             "values": [float(v) for v in site_df[value_col].tolist()],
             "dates": [str(d) for d in site_df[date_col].tolist()]
             if date_col in site_df.columns
             else [],
-        })
+        }
+        if obsname != str(site):
+            entry["original_site"] = str(site)
+        site_entries.append(entry)
     pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
 
     # Persist the observation targets as model state (7f-F1.1): the site →
@@ -1684,6 +1737,7 @@ def _impl_import_obs_from_csv(
         "obs_file": str(obs_file),
         "summary_file": str(summary_path),
         "site_cellid_map": {s: list(cid) for s, cid in site_to_cellid.items()},
+        "obs_names": dict(site_obs_name),
         "written": written,
     }
 

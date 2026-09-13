@@ -175,7 +175,115 @@ def _apply_meta_crs(sim: mf6.MFSimulation, ws: Path) -> None:
 def _load_and_apply(name: str, ws: Path) -> mf6.MFSimulation:
     sim = _load_sim(name, ws)
     _apply_meta_crs(sim, ws)
+    restore_oc_period_records(sim, ws)
     return sim
+
+
+def _parse_oc_record_lines(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Parse bare SAVE/PRINT lines (an OC period file) into record tuples."""
+    saves: list[tuple[str, str]] = []
+    prints: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        kind, atype, freq = parts[0].upper(), parts[1].upper(), parts[2].upper()
+        if kind == "SAVE":
+            saves.append((atype, freq))
+        elif kind == "PRINT":
+            prints.append((atype, freq))
+    return saves, prints
+
+
+def restore_oc_period_records(sim: mf6.MFSimulation, ws: Path) -> None:
+    """Re-populate OC ``saverecord``/``printrecord`` from the on-disk OC file.
+
+    FloPy loads a GWF OC package but does not populate the transient
+    ``saverecord``/``printrecord`` lists when the period block is an external
+    ``OPEN/CLOSE`` file — GMS writes
+    ``BEGIN PERIOD 1 / OPEN/CLOSE GWF_Model_input/GWF_Model.oc_1.txt / END PERIOD``
+    holding ``SAVE HEAD FIRST`` / ``SAVE BUDGET FIRST``. Without this restore the
+    first write of an adopted model drops the period block entirely, so the run
+    produces no heads/budget at all. Only restores when the in-memory lists are
+    empty, so an explicitly-set saverecord is never overridden.
+
+    If a period block exists, a referenced period file is missing, and the OC
+    declares HEAD/BUDGET filerecords, this falls back to saving HEAD and BUDGET
+    at FIRST so an adopted GMS model still writes outputs.
+    """
+    for mname in list(sim.model_names):
+        try:
+            gwf = sim.get_model(mname)
+        except Exception:
+            continue
+        oc = gwf.get_package("oc")
+        if oc is None:
+            continue
+        try:
+            if oc.saverecord.data:
+                continue
+        except Exception:
+            pass
+        oc_path = Path(str(getattr(oc, "filename", "") or ""))
+        if not oc_path.is_absolute():
+            oc_path = ws / oc_path
+        if not oc_path.exists():
+            continue
+
+        text = oc_path.read_text(errors="replace")
+        saverecord: dict[int, list[tuple[str, str]]] = {}
+        printrecord: dict[int, list[tuple[str, str]]] = {}
+        period: int | None = None
+        referenced_missing = False
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith("BEGIN PERIOD"):
+                try:
+                    period = int(line.split()[2]) - 1
+                except (IndexError, ValueError):
+                    period = 0
+                continue
+            if upper.startswith("END PERIOD"):
+                period = None
+                continue
+            if period is None:
+                continue
+            if upper.startswith("OPEN/CLOSE"):
+                toks = line.split(None, 1)
+                if len(toks) != 2:
+                    continue
+                ref = Path(toks[1].strip().strip("'\""))
+                if not ref.is_absolute():
+                    ref = ws / ref
+                if ref.exists():
+                    saves, prints = _parse_oc_record_lines(ref.read_text(errors="replace"))
+                    saverecord.setdefault(period, []).extend(saves)
+                    printrecord.setdefault(period, []).extend(prints)
+                else:
+                    referenced_missing = True
+                continue
+            saves, prints = _parse_oc_record_lines(line)
+            saverecord.setdefault(period, []).extend(saves)
+            printrecord.setdefault(period, []).extend(prints)
+
+        if not saverecord and referenced_missing:
+            # Fall back to the declared filerecords when the external period
+            # file is unavailable (e.g. a clone that did not carry subdirs).
+            if getattr(oc, "head_filerecord", None) is not None or getattr(
+                oc, "budget_filerecord", None
+            ) is not None:
+                saverecord = {0: [("HEAD", "FIRST"), ("BUDGET", "FIRST")]}
+        try:
+            if saverecord:
+                oc.saverecord.set_data(saverecord)
+            if printrecord:
+                oc.printrecord.set_data(printrecord)
+        except Exception:
+            pass
 
 
 def get_sim(name: str) -> mf6.MFSimulation:

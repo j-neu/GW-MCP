@@ -21,7 +21,13 @@ from mcp.server.fastmcp import FastMCP
 from groundwater_mcp.tools.builder import _impl_summarise_model
 from groundwater_mcp.utils import ledger
 from groundwater_mcp.utils.grid import get_grid
-from groundwater_mcp.utils.model_store import cache_sim, flush_model, read_meta, write_meta
+from groundwater_mcp.utils.model_store import (
+    cache_sim,
+    flush_model,
+    read_meta,
+    restore_oc_period_records,
+    write_meta,
+)
 from groundwater_mcp.utils.spec import apply_spec, export_spec
 from groundwater_mcp.utils.workspace import create_workspace, resolve_workspace
 
@@ -353,6 +359,7 @@ def _impl_clone_model(source: str, name: str, workspace: str) -> dict:
     write_meta(name, meta)
 
     sim = mf6.MFSimulation.load(sim_ws=str(dst), verbosity_level=0)
+    restore_oc_period_records(sim, dst)
     cache_sim(name, sim)
     return {
         "model": name,
