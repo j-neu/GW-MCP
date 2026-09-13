@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 
+import numpy as np
 import pytest
 
 from groundwater_mcp.tools.builder import (
@@ -219,6 +220,51 @@ def test_import_obs_from_csv_disu_coords_without_geometry_raises(tmp_path):
         )
 
 
+def test_import_obs_from_csv_disu_coords_maps_to_nodes(tmp_path):
+    """Coordinate mode on a vertex-carrying DISU grid maps to 1-based nodes."""
+    name = _build_vertex_disu_model(tmp_path, "disu_obsxy_ok")
+    path = tmp_path / f"{name}_xy.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "x", "y"])
+        writer.writerow(["W1", "2020-01-01", 1.0, 0.5, 0.5])
+        writer.writerow(["W2", "2020-01-01", 0.5, 1.5, 0.5])
+        writer.writerow(["W3", "2020-01-01", 0.0, 0.5, 1.5])
+    result = _impl_import_obs_from_csv(
+        name, str(path), "HEAD", "site", "date", "value", "x", "y", 0
+    )
+    assert result["site_cellid_map"] == {"W1": 1, "W2": 2, "W3": 3}
+
+
+def test_import_obs_from_csv_disu_cellid_column(tmp_path):
+    """An explicit 0-based node column maps to 1-based DISU OBS nodes."""
+    name = _build_disu_model(tmp_path, "disu_obsid")
+    path = tmp_path / f"{name}_id.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "cellid"])
+        writer.writerow(["N1", "2020-01-01", 1.0, 0])
+        writer.writerow(["N2", "2020-01-01", 0.5, 1])
+        writer.writerow(["N3", "2020-01-01", 0.0, 2])
+    result = _impl_import_obs_from_csv(
+        name, str(path), "HEAD", "site", "date", "value", None, None, 0, "cellid"
+    )
+    assert result["site_cellid_map"] == {"N1": 1, "N2": 2, "N3": 3}
+
+
+def test_import_obs_from_csv_disu_cellid_out_of_range_raises(tmp_path):
+    name = _build_disu_model(tmp_path, "disu_obsidbad")
+    path = tmp_path / f"{name}_idbad.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "cellid"])
+        writer.writerow(["N1", "2020-01-01", 1.0, 99])
+    with pytest.raises(ValueError, match="out of range"):
+        _impl_import_obs_from_csv(
+            name, str(path), "HEAD", "site", "date", "value", None, None, 0, "cellid"
+        )
+
+
 def test_setup_calibration_disu_all_scope(tmp_path):
     name = _build_disu_model(tmp_path, "disu_calall")
     _impl_import_obs_from_csv(
@@ -270,3 +316,71 @@ def test_setup_calibration_disu_zones_scope(tmp_path):
     )
     assert "error" not in result, result
     assert result["n_adjustable_parameters"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# DISU with explicit vertices/cell2d geometry (coordinate ops + plots)
+# ---------------------------------------------------------------------------
+
+_VERTICES = [
+    [0, 0.0, 0.0], [1, 1.0, 0.0], [2, 2.0, 0.0],
+    [3, 0.0, 1.0], [4, 1.0, 1.0], [5, 2.0, 1.0],
+    [6, 0.0, 2.0], [7, 1.0, 2.0],
+]
+_CELL2D = [
+    [0, 0.5, 0.5, 4, 0, 1, 4, 3],
+    [1, 1.5, 0.5, 4, 1, 2, 5, 4],
+    [2, 0.5, 1.5, 4, 3, 4, 7, 6],
+]
+
+
+def _build_vertex_disu_model(tmp_path, name: str = "disu_vtx") -> str:
+    """3-cell L-shaped DISU model carrying vertices/cell2d (has cell x/y).
+
+    Centroids are (0.5, 0.5), (1.5, 0.5), (0.5, 1.5) — deliberately
+    non-collinear so the plan-view triangulation is valid.
+    """
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "METERS", "DAYS")
+    _impl_set_simulation(name, 1, [1.0], [1], "simple")
+    _impl_add_disu_package(
+        name, 3, 9, [0.0] * 3, [-1.0] * 3, area=[1.0] * 3,
+        iac=[3, 3, 3], ja=[0, 1, 2, 1, 0, 2, 2, 0, 1],
+        ihc=[1] * 9, cl12=[1.0] * 9, hwva=[1.0] * 9,
+        vertices=_VERTICES, cell2d=_CELL2D,
+    )
+    _impl_add_npf_package(name, icelltype=0, k=1.0, k33=None, save_flows=True)
+    _impl_add_ic_package(name, strt=0.5)
+    _impl_add_boundary_package(name, "CHD", {"0": [[0, 1.0], [2, 0.0]]}, None)
+    _impl_add_oc_package(name, None, None, None, None)
+    flush_model(name)
+    return name
+
+
+def test_add_disu_package_with_vertices_gives_cell_centroids(tmp_path):
+    from groundwater_mcp.utils.spatial import grid_centroids
+
+    name = _build_vertex_disu_model(tmp_path, "disu_vtxc")
+    xc, yc = grid_centroids(get_gwf(name).modelgrid)
+    assert xc.size == 3
+    assert list(np.round(xc, 3)) == [0.5, 1.5, 0.5]
+    assert list(np.round(yc, 3)) == [0.5, 0.5, 1.5]
+
+
+@requires_mf6
+def test_plot_heads_map_disu_with_vertices_produces_png(tmp_path):
+    from pathlib import Path
+
+    from groundwater_mcp.tools.postprocess import _impl_plot_heads_map
+    from groundwater_mcp.tools.runner import _impl_run_simulation
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_vertex_disu_model(tmp_path, "disu_vtxplot")
+    run = _impl_run_simulation(name)
+    assert run.get("success") is True, run
+    result = _impl_plot_heads_map(name)
+    assert result.get("error") is not True, result
+    p = Path(result["output_file"])
+    if not p.is_absolute():
+        p = resolve_workspace(name) / p
+    assert p.exists() and p.stat().st_size > 0

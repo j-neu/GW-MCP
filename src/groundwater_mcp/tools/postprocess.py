@@ -932,17 +932,43 @@ def _impl_plot_heads_map(
 
     with figure() as fig:
         ax = fig.add_subplot(1, 1, 1)
-        pmv = fplot.PlotMapView(model=gwf, layer=layer, ax=ax)
-        pmv.plot_grid(alpha=0.3, lw=0.4)
-        head_layer = heads[layer]
-        valid = head_layer[np.abs(head_layer) < 1e20]
-        if valid.size > 1:
-            levels = np.linspace(valid.min(), valid.max(), contour_intervals + 1)
-            pmv.contour_array(head_layer, levels=levels, colors="navy", linewidths=0.8)
-        pmv.plot_array(head_layer, alpha=0.6, cmap="viridis")
-        ax.set_title(f"{model} — heads layer {layer}, kstpkper {target}")
-        ax.set_xlabel("Column")
-        ax.set_ylabel("Row")
+        head_layer = np.asarray(heads[layer])
+        disu = get_disu(gwf)
+        if disu is not None:
+            # FloPy's PlotMapView layer helpers derive nlay=nnodes for some
+            # DISU grids (e.g. the Neckartal set → nlay 31831, ncpl [1,…]), so
+            # contour_array gets a single centroid and cannot triangulate.
+            # Plot directly from the cell centroids + node heads instead.
+            from matplotlib import tri as mtri
+
+            xc, yc = grid_centroids(gwf.modelgrid)
+            h = head_layer.ravel()
+            valid_mask = np.isfinite(h) & (np.abs(h) < 1e20)
+            x, y, v = xc[valid_mask], yc[valid_mask], h[valid_mask]
+            if v.size >= 3:
+                triang = mtri.Triangulation(x, y)
+                levels = np.linspace(float(v.min()), float(v.max()), contour_intervals + 1)
+                cf = ax.tricontourf(triang, v, levels=levels, cmap="viridis", alpha=0.85)
+                ax.tricontour(triang, v, levels=levels, colors="navy", linewidths=0.8)
+                fig.colorbar(cf, ax=ax, label="Head")
+            else:
+                sc = ax.scatter(x, y, c=v, cmap="viridis", s=20)
+                fig.colorbar(sc, ax=ax, label="Head")
+            ax.set_aspect("equal")
+            ax.set_title(f"{model} — heads layer {layer}, kstpkper {target}")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+        else:
+            pmv = fplot.PlotMapView(model=gwf, layer=layer, ax=ax)
+            pmv.plot_grid(alpha=0.3, lw=0.4)
+            valid = head_layer[np.abs(head_layer) < 1e20]
+            if valid.size > 1:
+                levels = np.linspace(valid.min(), valid.max(), contour_intervals + 1)
+                pmv.contour_array(head_layer, levels=levels, colors="navy", linewidths=0.8)
+            pmv.plot_array(head_layer, alpha=0.6, cmap="viridis")
+            ax.set_title(f"{model} — heads layer {layer}, kstpkper {target}")
+            ax.set_xlabel("Column")
+            ax.set_ylabel("Row")
         out_path = save_figure(fig, output_file, ws)
 
     return {

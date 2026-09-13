@@ -443,6 +443,9 @@ def _impl_add_disu_package(
     hwva=None,
     angldegx=None,
     idomain=None,
+    vertices=None,
+    cell2d=None,
+    nvert: int | None = None,
     gridprops_file: str | None = None,
 ) -> dict:
     """Add a fully-unstructured (DISU) grid from explicit node connectivity.
@@ -450,6 +453,8 @@ def _impl_add_disu_package(
     DISU is defined by NODES/NJA plus connection data (IAC/JA, optional
     IHC/CL12/HWVA/ANGLDEGX). The per-node TOP/BOT arrays are required; AREA
     defaults to 1.0. A ``gridprops_file`` (JSON) may carry any of these keys.
+    Optional ``vertices``/``cell2d`` (with ``nvert``) provide cell x/y geometry
+    so coordinate-based operations and plan-view plots work.
     """
     if gridprops_file is not None:
         import json as _json
@@ -467,6 +472,9 @@ def _impl_add_disu_package(
         hwva = props.get("hwva", hwva)
         angldegx = props.get("angldegx", angldegx)
         idomain = props.get("idomain", idomain)
+        vertices = props.get("vertices", vertices)
+        cell2d = props.get("cell2d", cell2d)
+        nvert = props.get("nvert", nvert)
 
     nodes = int(nodes)
     nja = int(nja)
@@ -527,6 +535,13 @@ def _impl_add_disu_package(
         kwargs["angldegx"] = angldegx
     if idomain is not None:
         kwargs["idomain"] = idomain
+    if vertices is not None:
+        kwargs["nvert"] = int(nvert) if nvert is not None else len(vertices)
+        kwargs["vertices"] = vertices
+    elif nvert is not None:
+        kwargs["nvert"] = int(nvert)
+    if cell2d is not None:
+        kwargs["cell2d"] = cell2d
     mf6.ModflowGwfdisu(gwf, **kwargs)
     written = save_sim(model, gwf.simulation)
     return {
@@ -1363,6 +1378,9 @@ def register(mcp) -> None:
         hwva: list | None = None,
         angldegx: list | None = None,
         idomain: list | None = None,
+        vertices: list | None = None,
+        cell2d: list | None = None,
+        nvert: int | None = None,
         gridprops_file: str | None = None,
     ) -> dict:
         """Add a fully-unstructured (DISU) grid from explicit node connectivity.
@@ -1370,13 +1388,15 @@ def register(mcp) -> None:
         DISU is defined by ``nodes``/``nja`` plus per-edge connection data:
         ``iac`` (connections per node), ``ja`` (connected node ids, 0-based)
         and optionally ``ihc``/``cl12``/``hwva``/``angldegx``. Per-node ``top``
-        and ``bot`` are required and ``area`` defaults to 1.0. Pass
-        ``gridprops_file`` (JSON with any of these keys) for large grids.
+        and ``bot`` are required and ``area`` defaults to 1.0. Optional
+        ``vertices``/``cell2d`` add cell x/y geometry (enabling coordinate
+        observations and plan-view plots). Pass ``gridprops_file`` (JSON with
+        any of these keys) for large grids.
         """
         try:
             return _impl_add_disu_package(
                 model, nodes, nja, top, bot, area, iac, ja, ihc, cl12, hwva,
-                angldegx, idomain, gridprops_file,
+                angldegx, idomain, vertices, cell2d, nvert, gridprops_file,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

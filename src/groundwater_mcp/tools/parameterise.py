@@ -1570,6 +1570,7 @@ def _impl_import_obs_from_csv(
     x_col: str | None,
     y_col: str | None,
     layer: int,
+    cellid_col: str | None = None,
 ) -> dict:
     """Read head/flow observations from CSV and write a MODFLOW 6 OBS file."""
     from pathlib import Path
@@ -1608,7 +1609,34 @@ def _impl_import_obs_from_csv(
     sites = df[site_col].unique()
     site_to_cellid: dict[str, tuple[int, ...] | int] = {}
 
-    if x_col and y_col and x_col in df.columns and y_col in df.columns:
+    if cellid_col and cellid_col in df.columns:
+        # Explicit cell ids (e.g. a gauge→cell map). Needed when coordinates are
+        # ambiguous — DISU/DISV layers stack in x/y, so nearest-centroid cannot
+        # distinguish them.
+        disu_only = get_disu(gwf)
+        for site in sites:
+            raw = df.loc[df[site_col] == site, cellid_col].iloc[0]
+            if disu_only is not None:
+                node = int(float(raw))
+                nnodes = int(disu_only.nodes.data)
+                if not (0 <= node < nnodes):
+                    raise ValueError(
+                        f"Cell id {node} for site {site!r} is out of range on a "
+                        f"{nnodes}-node DISU grid (0-based node expected)."
+                    )
+                site_to_cellid[site] = node + 1  # 1-based DISU OBS node
+            else:
+                parts = [
+                    int(float(p))
+                    for p in re.split(r"[,\s]+", str(raw).strip("[](){} "))
+                    if p != ""
+                ]
+                if not parts:
+                    raise ValueError(
+                        f"Could not parse cell id {raw!r} for site {site!r}."
+                    )
+                site_to_cellid[site] = tuple(parts) if len(parts) > 1 else parts[0]
+    elif x_col and y_col and x_col in df.columns and y_col in df.columns:
         # Map each site to a cell by its mean (x, y) coordinate
         site_coords = df.groupby(site_col)[[x_col, y_col]].mean()
 
@@ -1617,23 +1645,35 @@ def _impl_import_obs_from_csv(
 
         # Find nearest cell centroid for each site
         from groundwater_mcp.utils.spatial import grid_centroids
-        ncells_per_layer = mg.ncpl if hasattr(mg, "ncpl") else (mg.nrow * mg.ncol)
+        disu_pkg = get_disu(gwf)
+        dis_pkg = get_dis(gwf)
         xc_all, yc_all = grid_centroids(mg)
-        xc = xc_all[:ncells_per_layer]
-        yc = yc_all[:ncells_per_layer]
+        if disu_pkg is not None:
+            # DISU node centroids span every node (mg.ncpl is a per-node array,
+            # not a count); match against the full node set.
+            xc, yc = xc_all, yc_all
+        else:
+            ncells_per_layer = (
+                int(mg.ncpl) if hasattr(mg, "ncpl") else (int(mg.nrow) * int(mg.ncol))
+            )
+            xc = xc_all[:ncells_per_layer]
+            yc = yc_all[:ncells_per_layer]
 
         for site, sx, sy in zip(site_coords.index, xcoords, ycoords):
             dist = np.hypot(xc - sx, yc - sy)
             nearest = int(np.argmin(dist))
-            dis_pkg = get_dis(gwf)
-            if dis_pkg is not None:
+            if disu_pkg is not None:
+                # 1-based DISU node number (FloPy does not add 1 for a scalar
+                # DISU OBS cellid).
+                site_to_cellid[site] = nearest + 1
+            elif dis_pkg is not None:
                 ncol = int(dis_pkg.ncol.data)
                 row_idx = nearest // ncol
                 col_idx = nearest % ncol
                 cellid: tuple[int, ...] = (layer, row_idx, col_idx)
+                site_to_cellid[site] = cellid
             else:
-                cellid = (layer, nearest)
-            site_to_cellid[site] = cellid
+                site_to_cellid[site] = (layer, nearest)
     else:
         # No coordinates — create placeholder observations keyed by site name,
         # sequentially through the cell ids. DIS cell ids are
@@ -2127,18 +2167,24 @@ def register(mcp) -> None:
         x_col: str | None = None,
         y_col: str | None = None,
         layer: int = 0,
+        cellid_col: str | None = None,
     ) -> dict:
         """Import head or flow observations from a CSV file.
 
-        Sites are mapped to model cells by (x, y) coordinate (nearest centroid) if
-        x_col and y_col are provided, otherwise by sequential order. Works on
-        structured DIS grids (cell ids are ``(layer, row, col)``) and
-        unstructured DISV grids (cell ids are ``(layer, node)``). Writes a
-        MODFLOW 6 OBS file and a summary CSV of site-to-cell mappings.
+        Sites are mapped to model cells by an explicit ``cellid_col`` cell-id
+        column if provided, otherwise by (x, y) coordinate (nearest centroid) if
+        x_col and y_col are provided, otherwise by sequential order. The
+        explicit column is required when coordinates are ambiguous (DISU/DISV
+        layers stack in x/y): on DISU it holds a 0-based node id. Coordinate
+        mode also works on grids that carry cell geometry. Works on structured
+        DIS grids (cell ids are ``(layer, row, col)``), DISV (``(layer, node)``)
+        and DISU (scalar node). Writes a MODFLOW 6 OBS file and a summary CSV of
+        site-to-cell mappings.
         """
         try:
             return _impl_import_obs_from_csv(
-                model, csv_file, obs_type, site_col, date_col, value_col, x_col, y_col, layer
+                model, csv_file, obs_type, site_col, date_col, value_col, x_col,
+                y_col, layer, cellid_col,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
