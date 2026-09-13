@@ -1644,7 +1644,10 @@ def _impl_import_obs_from_csv(
         disu_only = get_disu(gwf)
         for i, site in enumerate(sites):
             if disu_only is not None:
-                site_to_cellid[site] = i  # 0-based DISU node id
+                # MF6 OBS uses 1-based DISU node numbers and (unlike the
+                # boundary packages) FloPy does not add 1 for a scalar DISU
+                # cellid, so pass the 1-based node here.
+                site_to_cellid[site] = i + 1
             elif dis_only is not None:
                 site_to_cellid[site] = (layer, i, 0)
             else:

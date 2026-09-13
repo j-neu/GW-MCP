@@ -159,10 +159,39 @@ def test_import_obs_from_csv_disu_sequential_uses_node_ids(tmp_path):
         name, csv_path, "HEAD", "site", "date", "value", None, None, 0
     )
     assert "error" not in result, result
-    assert result["site_cellid_map"]["S1"] == 0
-    assert result["site_cellid_map"]["S2"] == 1
+    # DISU OBS node numbers are 1-based (FloPy does not add 1 for a scalar id).
+    assert result["site_cellid_map"]["S1"] == 1
+    assert result["site_cellid_map"]["S2"] == 2
     entry = read_meta(name)["observations"]["sites"][0]
-    assert entry["cellid"] == 0
+    assert entry["cellid"] == 1
+
+
+@requires_mf6
+def test_disu_obs_file_is_one_based_and_model_runs(tmp_path):
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _build_disu_model(tmp_path, "disu_obsrun")
+    _impl_import_obs_from_csv(
+        name, _write_seq_obs_csv(tmp_path, name), "HEAD", "site", "date", "value",
+        None, None, 0,
+    )
+    flush_model(name)
+    obs_text = (resolve_workspace(name) / f"{name}.obs").read_text()
+    data_lines = [
+        ln.split()
+        for ln in obs_text.splitlines()
+        if not ln.lstrip().startswith("#")
+        and len(ln.split()) >= 3
+        and ln.split()[1].upper() == "HEAD"
+    ]
+    assert data_lines
+    node_ids = [parts[2] for parts in data_lines]
+    assert node_ids == ["1", "2"]  # 1-based, MF6-valid
+
+    from groundwater_mcp.tools.runner import _impl_run_simulation
+
+    run = _impl_run_simulation(name)
+    assert run.get("success") is True, run
 
 
 def test_import_obs_from_csv_disu_coords_without_geometry_raises(tmp_path):
@@ -188,6 +217,27 @@ def test_setup_calibration_disu_all_scope(tmp_path):
     )
     assert "error" not in result, result
     assert result["n_adjustable_parameters"] == 1
+
+
+@requires_mf6
+def test_setup_calibration_disu_base_run_succeeds(tmp_path):
+    from groundwater_mcp.tools.runner import _impl_run_simulation
+
+    name = _build_disu_model(tmp_path, "disu_calrun")
+    _impl_import_obs_from_csv(
+        name, _write_seq_obs_csv(tmp_path, name), "HEAD", "site", "date", "value",
+        None, None, 0,
+    )
+    result = _impl_setup_calibration(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 1.0}},
+        obs_source="model",
+        noptmax=1,
+    )
+    assert "error" not in result, result
+    flush_model(name)
+    run = _impl_run_simulation(name)
+    assert run.get("success") is True, run
 
 
 def test_setup_calibration_disu_zones_scope(tmp_path):
