@@ -11,7 +11,7 @@ import re
 
 import numpy as np
 
-from groundwater_mcp.utils.grid import get_dis, get_disv
+from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     clear_k_base_snapshot,
@@ -48,6 +48,11 @@ _MF6_CONTINUOUS_OBS_TYPES = {
 # so a name like GMS's "POINT_#1" is read as "POINT_" and the remainder becomes a
 # comment ("Observation type not found: #").
 _OBS_NAME_INVALID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _cellid_as_json(cid):
+    """JSON-friendly cell id: a list for DIS/DISV tuples, an int for DISU nodes."""
+    return cid if isinstance(cid, int) else list(cid)
 
 
 def _safe_obs_name(site: str, used: set[str]) -> str:
@@ -1601,7 +1606,7 @@ def _impl_import_obs_from_csv(
             )
 
     sites = df[site_col].unique()
-    site_to_cellid: dict[str, tuple[int, ...]] = {}
+    site_to_cellid: dict[str, tuple[int, ...] | int] = {}
 
     if x_col and y_col and x_col in df.columns and y_col in df.columns:
         # Map each site to a cell by its mean (x, y) coordinate
@@ -1633,10 +1638,14 @@ def _impl_import_obs_from_csv(
         # No coordinates — create placeholder observations keyed by site name,
         # sequentially through the cell ids. DIS cell ids are
         # (layer, row, col); DISV cell ids are (layer, node) — a 3-tuple is
-        # invalid in an OBS6 file on a DISV grid.
+        # invalid in an OBS6 file on a DISV grid; DISU cell ids are a single
+        # 1-based node number.
         dis_only = get_dis(gwf)
+        disu_only = get_disu(gwf)
         for i, site in enumerate(sites):
-            if dis_only is not None:
+            if disu_only is not None:
+                site_to_cellid[site] = i  # 0-based DISU node id
+            elif dis_only is not None:
                 site_to_cellid[site] = (layer, i, 0)
             else:
                 site_to_cellid[site] = (layer, i)
@@ -1652,10 +1661,10 @@ def _impl_import_obs_from_csv(
     used_obs_names: set[str] = set()
     site_obs_name: dict[str, str] = {}
     for site in sites:
-        cellid = site_to_cellid[site]
+        cid = site_to_cellid[site]
         obsname = _safe_obs_name(str(site), used_obs_names)
         site_obs_name[str(site)] = obsname
-        records.append((obsname, obs_type_str, cellid))
+        records.append((obsname, obs_type_str, cid))
     obsdata[obs_filename] = records
 
     # Replace the model's existing OBS package. A shipped model can carry
@@ -1698,7 +1707,7 @@ def _impl_import_obs_from_csv(
         })
         entry = {
             "site": obsname,
-            "cellid": list(site_to_cellid[site]),
+            "cellid": _cellid_as_json(site_to_cellid[site]),
             "n_records": int(len(site_df)),
             "values": [float(v) for v in site_df[value_col].tolist()],
             "dates": [str(d) for d in site_df[date_col].tolist()]
@@ -1736,7 +1745,7 @@ def _impl_import_obs_from_csv(
         "total_records": len(df),
         "obs_file": str(obs_file),
         "summary_file": str(summary_path),
-        "site_cellid_map": {s: list(cid) for s, cid in site_to_cellid.items()},
+        "site_cellid_map": {s: _cellid_as_json(cid) for s, cid in site_to_cellid.items()},
         "obs_names": dict(site_obs_name),
         "written": written,
     }

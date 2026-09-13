@@ -418,7 +418,6 @@ def test_replay_flow_build_check_run_postprocess(flow_project, tmp_path):
 # ---------------------------------------------------------------------------
 
 _GAP_TOOLS = [
-    "add_disu_package",
     "add_maw_package",
     "add_uzf_package",
     "add_lak_package",
@@ -451,18 +450,19 @@ def test_gap_unsupported_boundary_fails_cleanly(holdout_root):
         assert "suggestion" in data, f"error envelope missing suggestion for {pkg}: {data}"
 
 
-def test_gap_disu_project_has_no_tool_path(holdout_root):
-    """The sealed DISU project cannot be built at v0.1.0 — that is the point.
+def test_disu_project_has_tool_path(holdout_root):
+    """The DISU project is now buildable/adoptable: the tool path exists.
 
-    The holdout keeps it for v0.2.0 validation; at v0.1.0 the limitation must
-    be explicit (no tool claims DISU support).
+    DISU support landed for v0.2.0 (``add_disu_package``); the sealed holdout
+    is used for the rerun-loop validation. The tool must be present and must
+    not be confused with DISV.
     """
     project_dir = _selected_dir(holdout_root, "test009_3lay-disu")
     if not project_dir.is_dir():
         pytest.skip("holdout project test009_3lay-disu not present")
     tools = {t.name for t in _run(mcp.list_tools())}
-    assert "add_disu_package" not in tools
-    assert "add_disv_package" in tools  # DISV exists; DISU must not be confused with it
+    assert "add_disu_package" in tools
+    assert "add_disv_package" in tools  # DISV remains distinct from DISU
 
 
 def test_gap_transport_projects_present_and_ungated(holdout_root):

@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-66 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+67 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -122,6 +122,9 @@ Inline `vertices`/`cell2d` payloads are rejected beyond 50,000 cells
 (`PAYLOAD_TOO_LARGE`, 7f-I4) — pass `gridprops_file` (a JSON file with
 `vertices`/`cell2d`/`top`/`botm`) or use `import_grid_from_shapefile`
 (`method='disv'`) for real Voronoi grids.
+| `add_disu_package` | `model: str`, `nodes: int`, `nja: int`, `top: list`, `bot: list`, `area: list \| None = None`, `iac: list \| None = None`, `ja: list \| None = None`, `ihc: list \| None = None`, `cl12: list \| None = None`, `hwva: list \| None = None`, `angldegx: list \| None = None`, `idomain: list \| None = None`, `gridprops_file: str \| None = None` | Grid summary |
+
+Fully unstructured (DISU) grids are defined by explicit node connectivity: `nodes`/`nja` plus `iac` (connections per node) and `ja` (connected node ids, 0-based; each node's first connection must be itself). `top`/`bot` are per-node; `area` defaults to 1.0 and `ihc`/`cl12`/`hwva` default to single-layer/unit placeholders so a connectivity-only model still runs. Pass `gridprops_file` (JSON) for large grids. Obs cell ids are scalar 0-based node numbers; adopter models keep working via `adopt_model`.
 | `add_npf_package` | `model: str`, `icelltype: int \| list`, `k: float \| list`, `k33: float \| list \| None`, `save_flows: bool = True`, `k_units: str = "m/d"` | Confirmation |
 | `add_ic_package` | `model: str`, `strt: float \| list` | Confirmation |
 | `add_sto_package` | `model: str`, `iconvert: int \| list`, `ss: float \| list`, `sy: float \| list \| None`, `steady_state: list[int] \| None`, `save_flows: bool = True` | Package summary with resolved steady/transient periods |

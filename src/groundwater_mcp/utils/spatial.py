@@ -195,10 +195,20 @@ def intersect_points_with_polygons(
 def grid_centroids(modelgrid) -> tuple[np.ndarray, np.ndarray]:
     """Return flattened (x, y) cell-centroid arrays from a FloPy modelgrid.
 
-    Works for both DIS (structured) and DISV (unstructured) grids.
+    Works for DIS (structured) and DISV/DISU grids that carry cell geometry.
+    A DISU model can be defined without any x/y (only NODES/NJA/area), in
+    which case FloPy raises while building geometry — that is reported as a
+    clear ValueError rather than a bare TypeError.
     """
-    xc = np.asarray(modelgrid.xcellcenters).ravel()
-    yc = np.asarray(modelgrid.ycellcenters).ravel()
+    try:
+        xc = np.asarray(modelgrid.xcellcenters).ravel()
+        yc = np.asarray(modelgrid.ycellcenters).ravel()
+    except Exception as exc:
+        raise ValueError(
+            "This grid has no cell-centroid x/y coordinates (a DISU grid "
+            "defined without vertices/geometry). Coordinate-based operations "
+            "are unavailable — use sequential node/cell mapping instead."
+        ) from exc
     return xc, yc
 
 

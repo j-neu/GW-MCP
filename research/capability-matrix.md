@@ -86,7 +86,7 @@ templates, `gwmcp://models/{model}/{lst,pst,files}`, expose the listing
 file, PEST control file, and workspace file listing as readable URIs instead
 of round-tripping through a tool call (C7) — these register as templates
 (`mcp.list_resource_templates()`), not static resources, since models are
-created at runtime. → 66 tools, +2 prompts, +3 resource templates. No
+created at runtime. → 67 tools, +2 prompts, +3 resource templates. No
 capability-coverage rows changed. All of 7e Tier C is now done except the
 `[human]` closed-book verification on C1/C6/C8 (needs a live agent session).
 **7e-A2 (2026-08-17): automated calibration setup.** `setup_calibration`
@@ -178,7 +178,7 @@ base run) and rejects unsupported `obs_type` values (e.g. `FLOW`) loudly.
 |---|---|---|---|---|
 | DIS (rectangular grid) | covered | `add_dis_package` | test005_advgw_tidal, ex-gwf-hani, mf6-training | `idomain` support (7e-B9) |
 | DISV (layered vertex grid) | covered | `add_disv_package` | test006_gwf3_disv, ex-gwf-u1disv, mf6Voronoi, Modflow-API-Ag-Package | obs import (coords → `(layer, node)`), `summarise_model`, `export_model_spec`, and non-zoned/zoned `setup_calibration` all work on DISV (fix 2026-09-12) |
-| DISU (fully unstructured) | **gap** | — | test009_3lay-disu, test006_gwf3_gnc, ex-gwf-radial, MF6_EnKF_DISU, GMS Quadtree | User-flagged; first v0.2.0 item |
+| DISU (fully unstructured) | covered | `add_disu_package` | test009_3lay-disu, test006_gwf3_gnc, ex-gwf-radial, MF6_EnKF_DISU, GMS Quadtree | Connectivity-based build (NODES/NJA, IAC/JA 0-based); `get_disu`/`grid_size`, `model_status`/`summarise_model`, obs scalar node ids and DISU `setup_calibration` (2026-09-13). No x/y without vertices → `plot_heads_map`/coordinate obs fail clearly |
 | TDIS / IMS (time + solver) | covered | `set_simulation` | all testmodels/examples (mfsim.nam) | nper, perlen, nstp, tsmult, ims_complexity |
 | STO (storage) | covered | `add_sto_package` | test003_gwfs_tr, test020_NevilleTonkinTransient, ex-gwf-advtidal | v0.1.0 gate (2026-08-16): iconvert/ss/sy + steady/transient periods |
 | NPF (properties) | covered | `add_npf_package` | all testmodels/examples | |
@@ -266,7 +266,7 @@ No capability-coverage rows changed except OBS (partial → covered).
 
 ## Coverage summary
 
-- covered: 15 rows · partial: 0 · gap: 11 (DISU, MAW, UZF, LAK, GNC, MVR,
+- covered: 16 rows · partial: 0 · gap: 10 (MAW, UZF, LAK, GNC, MVR,
   GWT, SWT, GWF-GWT coupling, pestpp-sen, pestpp-pareto/swp) · legacy-out-of-scope: 4
   (UCODE SVD estimation and UCODE linear/MCMC uncertainty rows removed
   2026-08-17 — UCODE is no longer part of the project's calibration scope)

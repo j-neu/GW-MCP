@@ -9,7 +9,7 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
-from groundwater_mcp.utils.grid import get_dis, get_disv
+from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
 from groundwater_mcp.utils.model_store import get_gwf, read_meta
 from groundwater_mcp.utils.workspace import resolve_workspace
 
@@ -185,6 +185,8 @@ def _model_nlay(model: str) -> int:
     disv = get_disv(gwf)
     if disv is not None:
         return int(disv.nlay.data)
+    if get_disu(gwf) is not None:
+        return 1
     return 0
 
 
@@ -906,8 +908,22 @@ def _impl_plot_heads_map(
 
     _validate_layer(model, layer)
     ws = resolve_workspace(model)
-    hds_path, warning = _find_output_file(model, ws, ".hds")
     gwf = get_gwf(model)
+
+    # A DISU grid defined without vertices has no cell x/y, so plan-view
+    # plotting is impossible — fail with a clear message, not a bare TypeError.
+    from groundwater_mcp.utils.spatial import grid_centroids
+
+    try:
+        grid_centroids(gwf.modelgrid)
+    except ValueError as exc:
+        raise ValueError(
+            "plot_heads_map requires cell x/y geometry, which this "
+            "discretisation does not carry (a DISU grid defined without "
+            "vertices). Use read_heads or compute_water_balance instead."
+        ) from exc
+
+    hds_path, warning = _find_output_file(model, ws, ".hds")
 
     hf = fu.HeadFile(str(hds_path))
     kstpkper_list = hf.get_kstpkper()

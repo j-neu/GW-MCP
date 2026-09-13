@@ -6,7 +6,7 @@ An open-source Python MCP server for AI-assisted groundwater modelling with MODF
 
 ## Overview
 
-The server exposes 66 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 67 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -62,6 +62,8 @@ Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter es
 Zoned K multiplier calibration (2026-09-11): `setup_calibration(scope="zones")` auto-derives zones from groups of equal positive per-layer `npf:k` values and turns each zone into a dimensionless multiplier parameter (`<prefix>_z<index>`). It writes `<gwf>_k_base.dat`, `<gwf>_k_zone.dat` and `<gwf>_k_mult.dat.tpl` and forces a forward wrapper that computes `k = base_k × multiplier[zone]` before each MODFLOW 6 run, so the base spatial K pattern is preserved and only zone magnitudes are calibrated. This closes the neversink `setup_calibration` uniform-only (whole-scope per-layer replacement) parameterisation gap.
 
 DISV support in the obs/calibration/reporting layer (2026-09-12): FloPy's `gwf.get_package("dis")` falls back to a partial package-type match, so on a DISV model it returns the `ModflowGwfdisv` package for `"dis"` too — every `if dis is not None` branch silently took the structured-DIS path and dereferenced the missing `nrow`/`ncol`. `utils/grid.py` (`get_dis`/`get_disv`/`get_grid`) now returns a package only when it is the requested grid type; all 22 call sites use it. `import_obs_from_csv` coordinate mode maps sites to `(layer, node)` on DISV, and `summarise_model`/`describe_model`/`export_model_spec`/non-zoned `setup_calibration` work on unstructured grids. Output discovery (`_find_output_file`/`_find_budget_file`) also resolves OC-declared paths relative to the workspace (subdirectories) and accepts the GMS `.hed`/`.ccf` extensions. This closes the GMS `mf6_pest_obs_ss` Tier-1 blocker.
+
+DISU (fully unstructured) support (2026-09-13): `add_disu_package` builds a grid from explicit node connectivity (NODES/NJA + IAC/JA, with per-node TOP/BOT/AREA and optional IHC/CL12/HWVA/ANGLDEGX; JA is 0-based and IHC/CL12/HWVA default to single-layer/unit placeholders so a connectivity-only model runs). `utils/grid.py` gains `get_disu`/`grid_size`, and the grid resizing/recognition path (`model_status`, `summarise_model`, DISU-aware `setup_calibration` and `import_obs_from_csv` scalar node ids) is DISU-aware. DISU has no cell x/y when defined without vertices, so `plot_heads_map` and coordinate-mode obs import fail with a clear message while `read_heads`/`compute_water_balance` work. This unblocks the `MF6_EnKF_DISU` Tier-1 target.
 
 ---
 

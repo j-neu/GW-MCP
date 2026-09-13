@@ -181,7 +181,7 @@ pattern (dry-run → rerun-2/3/4 with fixes between) applied at scale:
 | mf6_freyberg (usgs/pestpp TM7C26) | sen/ies/glm/opt/sweep PEST++ chain on authoritative benchmark | ✅ **PASSED 2026-09-07** (run-1 + rerun-2 green) |
 | neversink_workflow (DOI-USGS) | real watershed, pestpp-ies + pestpp-sen, obs CSVs | ⏳ run-1 partial 2026-09-07 — **calibration BLOCKED by `import_obs_from_csv` OBS6-package defect** → **defect fixed 2026-09-08** (obs-list replacement + WEL boundname export; tests + suite green) → **rerun-1 partial 2026-09-08**: import fix verified (449-target registration + reference RMSE 0.129 m), but **full K calibration still BLOCKED** by `setup_calibration`'s uniform-only whole-scope `npf:k` tokenisation (zoned-valley-fill K ⇒ non-convergent uniform layer runs) — same decision class as GMS; rerun-2 held. **Zoned/multiplier K capability landed 2026-09-11** (fix a). **Rerun-2 GREEN-with-defect 2026-09-11/12**: full chain completed (10 zone multipliers → GLM φ 542,101→245,338, RMSE ≈27 m on 337 field obs), 0 reprompts, but a `setup_calibration` re-runnability defect was hit and worked around; **fixed 2026-09-12** (commits `1bac781`/`733cd74`, fix b). **Rerun-3 GREEN set-and-forget 2026-09-12**: pristine read-only adopt + clone; 20 zone multipliers across all 4 layers; φ 725,261→327,897, RMSE 40.24→27.05 m, R² 0.914; 0 reprompts / 0 violations → **PASSED 2026-09-12** (owner tick pending) |
 | 1DSubsidenceModeling-MF6CSUB | 50 real CA subsidence sites, CSUB + obs, pestpp-ies | ⏳ not started |
-| MF6_EnKF_DISU (Neckartal DE) | real DISU model + gauge obs, EnKF data assimilation | ⏳ not started |
+| MF6_EnKF_DISU (Neckartal DE) | real DISU model + gauge obs, EnKF data assimilation | ⏳ not started — **DISU grid support landed 2026-09-13** (`add_disu_package` + DISU-aware grid/obs/calibration/postprocess; `tests/test_disu_support.py`; 578 green); adopt/run/postprocess probe green on `test009_3lay-disu`; EnKF data-assimilation chain + closed-book reruns pending |
 
 **Tier 2 — capability-gate examples. Each new tool in a later release**
 (v0.2.0: DISU, MAW/UZF/LAK, GNC/MVR, GWT, pestpp-sen, OBS; v0.3.0: CSUB, GWE,
@@ -480,7 +480,7 @@ held-out Tier-2 target (rerun loop, per the release gate above) BEFORE the
 v0.2.0 release ships** — the example is promoted to dev/test data only AFTER
 the release that ships its tool. Refs point at `research/discovery/catalog.md`
 rows and the Tier-2 gate list above.
-- [ ] DISU (fully unstructured grid) support — `add_disu_package`; refs: test009_3lay-disu, ex-gwf-radial; **gate: test009_3lay-disu + ex-gwf-radial + GMS Quadtree (rerun loop)**
+- [x] DISU (fully unstructured grid) support — `add_disu_package` *(capability landed 2026-09-13: connectivity build + `get_disu`/`grid_size`, `model_status`/`summarise_model`, obs scalar node ids, DISU `setup_calibration`, clear no-geometry errors; `tests/test_disu_support.py`; 578 green)*; refs: test009_3lay-disu, ex-gwf-radial; **gate: test009_3lay-disu + ex-gwf-radial + GMS Quadtree (rerun loop) — reruns pending**
 - [ ] MAW / UZF / LAK packages — extend boundary dispatch or new tools; refs: test020, test051_uzfp2, test045_lake1ss, ex-gwf-sagehen, mf6-training; **gate: test020 + test051_uzfp2**
 - [ ] GNC (ghost-node) + MVR (water mover); refs: test006_gwf3_gnc, test001g_MVR, ex-gwf-lak-p02; **gate: test006_gwf3_gnc + test001g_MVR**
 - [ ] GWT (transport) + GWF-GWT coupling — new model types; refs: ex-gwt-keating, ex-gwt-mt3dms-p01, test201_gwtbuy-henryCHD; **gate: ex-gwt-keating + test201_gwtbuy-henryCHD**

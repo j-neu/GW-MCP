@@ -19,7 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 from groundwater_mcp.tools.runner import _find_mf6_binary
 from groundwater_mcp.utils import jobs
-from groundwater_mcp.utils.grid import get_dis, get_disv
+from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
 from groundwater_mcp.utils.model_store import (
     flush_model,
     get_gwf,
@@ -1013,7 +1013,18 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
             "ncell": nlay * per_layer,
         }
     else:
-        raise ValueError("No grid package (DIS/DISV) found on the model.")
+        disu = get_disu(gwf)
+        if disu is None:
+            raise ValueError("No grid package (DIS/DISV/DISU) found on the model.")
+        per_layer = int(disu.nodes.data)
+        nlay = 1
+        grid = {
+            "type": "DISU",
+            "nlay": nlay,
+            "nnodes": per_layer,
+            "per_layer": per_layer,
+            "ncell": per_layer,
+        }
 
     k_base = np.asarray(npf.k.array, dtype=float).reshape(-1)
     if k_base.size != grid["ncell"]:
@@ -1185,7 +1196,24 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
 
         grid = {"type": "DISV", "nlay": nlay, "ncpl": ncpl, "ncell": ncell}
     else:
-        raise ValueError("No grid package (DIS/DISV) found on the model.")
+        disu = get_disu(gwf)
+        if disu is None:
+            raise ValueError("No grid package (DIS/DISV/DISU) found on the model.")
+        nnodes = int(disu.nodes.data)
+        nlay, ncell = 1, nnodes
+
+        def cell_to_flat(cell) -> int:
+            if isinstance(cell, (int, np.integer)):
+                node = int(cell)
+            else:
+                if len(cell) != 1:
+                    raise ValueError(f"Cell {cell} must be a node id on a DISU grid.")
+                node = int(cell[0])
+            if not (0 <= node < nnodes):
+                raise ValueError(f"Cell {cell} out of bounds on a {nnodes}-node DISU grid.")
+            return node
+
+        grid = {"type": "DISU", "nlay": nlay, "nnodes": nnodes, "ncell": ncell}
 
     params: list[dict] = []
     for name, spec in parameterisation.items():

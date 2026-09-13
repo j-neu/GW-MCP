@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 66
+_EXPECTED_TOOL_COUNT = 67
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -82,6 +82,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "set_model_crs",
         "add_dis_package",
         "add_disv_package",
+        "add_disu_package",
         "add_npf_package",
         "add_ic_package",
         "add_sto_package",

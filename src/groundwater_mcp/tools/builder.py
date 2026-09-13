@@ -8,7 +8,7 @@ from pathlib import Path
 import flopy.mf6 as mf6
 import numpy as np
 
-from groundwater_mcp.utils.grid import get_dis, get_disv
+from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_sim,
@@ -429,6 +429,116 @@ def _impl_add_disv_package(
     }
 
 
+def _impl_add_disu_package(
+    model: str,
+    nodes: int,
+    nja: int,
+    top,
+    bot,
+    area=None,
+    iac=None,
+    ja=None,
+    ihc=None,
+    cl12=None,
+    hwva=None,
+    angldegx=None,
+    idomain=None,
+    gridprops_file: str | None = None,
+) -> dict:
+    """Add a fully-unstructured (DISU) grid from explicit node connectivity.
+
+    DISU is defined by NODES/NJA plus connection data (IAC/JA, optional
+    IHC/CL12/HWVA/ANGLDEGX). The per-node TOP/BOT arrays are required; AREA
+    defaults to 1.0. A ``gridprops_file`` (JSON) may carry any of these keys.
+    """
+    if gridprops_file is not None:
+        import json as _json
+
+        props = _json.loads(Path(gridprops_file).read_text())
+        nodes = int(props.get("nodes", nodes))
+        nja = int(props.get("nja", nja))
+        top = props.get("top", top)
+        bot = props.get("bot", bot)
+        area = props.get("area", area)
+        iac = props.get("iac", iac)
+        ja = props.get("ja", ja)
+        ihc = props.get("ihc", ihc)
+        cl12 = props.get("cl12", cl12)
+        hwva = props.get("hwva", hwva)
+        angldegx = props.get("angldegx", angldegx)
+        idomain = props.get("idomain", idomain)
+
+    nodes = int(nodes)
+    nja = int(nja)
+    if iac is None or ja is None:
+        raise ValueError(
+            "DISU requires connection data: pass 'iac' and 'ja' (or a "
+            "gridprops_file containing them)."
+        )
+    if area is None:
+        area = [1.0] * nodes
+    # FloPy needs IHC+IAC to derive the modelgrid's layer structure; for a
+    # single-layer DISU every connection is horizontal (IHC=1).
+    if ihc is None:
+        ihc = [1] * nja
+    # MF6 requires symmetric CL12/HWVA; when the caller does not supply real
+    # geometry, placeholder unit values keep the model runnable.
+    if cl12 is None:
+        cl12 = [1.0] * nja
+    if hwva is None:
+        hwva = [1.0] * nja
+    if len(top) != nodes or len(bot) != nodes or len(area) != nodes:
+        raise ValueError(
+            f"len(top)={len(top)}, len(bot)={len(bot)}, len(area)={len(area)} "
+            f"must each equal nodes={nodes}."
+        )
+    if len(iac) != nodes:
+        raise ValueError(f"len(iac)={len(iac)} must equal nodes={nodes}.")
+    if len(ja) != nja:
+        raise ValueError(f"len(ja)={len(ja)} must equal nja={nja}.")
+    if ihc is not None and len(ihc) != nja:
+        raise ValueError(f"len(ihc)={len(ihc)} must equal nja={nja}.")
+    if cl12 is not None and len(cl12) != nja:
+        raise ValueError(f"len(cl12)={len(cl12)} must equal nja={nja}.")
+    if hwva is not None and len(hwva) != nja:
+        raise ValueError(f"len(hwva)={len(hwva)} must equal nja={nja}.")
+
+    gwf = get_gwf(model)
+    for existing in (get_dis(gwf), get_disv(gwf), get_disu(gwf)):
+        if existing is not None:
+            gwf.remove_package(existing)
+
+    kwargs: dict = {
+        "nodes": nodes,
+        "nja": nja,
+        "top": top,
+        "bot": bot,
+        "area": area,
+        "iac": iac,
+        "ja": ja,
+    }
+    if ihc is not None:
+        kwargs["ihc"] = ihc
+    if cl12 is not None:
+        kwargs["cl12"] = cl12
+    if hwva is not None:
+        kwargs["hwva"] = hwva
+    if angldegx is not None:
+        kwargs["angldegx"] = angldegx
+    if idomain is not None:
+        kwargs["idomain"] = idomain
+    mf6.ModflowGwfdisu(gwf, **kwargs)
+    written = save_sim(model, gwf.simulation)
+    return {
+        "model": model,
+        "grid_type": "DISU",
+        "nodes": nodes,
+        "nja": nja,
+        "ncells": nodes,
+        "written": written,
+    }
+
+
 def _impl_add_npf_package(
     model: str,
     icelltype: int | list,
@@ -804,6 +914,27 @@ def _impl_summarise_model(model: str) -> dict:
             "ncpl": int(disv_pkg.ncpl.data),
             "ncells": int(disv_pkg.nlay.data * disv_pkg.ncpl.data),
         }
+    else:
+        disu_pkg = get_disu(gwf)
+        if disu_pkg is not None:
+            nnodes = int(disu_pkg.nodes.data)
+            nja = int(disu_pkg.nja.data) if getattr(disu_pkg, "nja", None) is not None else None
+            grid_info = {
+                "type": "DISU",
+                "nlay": 1,
+                "nnodes": nnodes,
+                "ncells": nnodes,
+            }
+            if nja is not None:
+                grid_info["nja"] = nja
+            idomain = getattr(disu_pkg, "idomain", None)
+            if idomain is not None:
+                try:
+                    id_arr = np.asarray(idomain.array)
+                    if id_arr is not None and id_arr.dtype != object:
+                        grid_info["n_active"] = int((id_arr > 0).sum())
+                except Exception:
+                    pass
 
     # Stress period info from TDIS
     stress_periods: list[dict] = []
@@ -885,7 +1016,8 @@ def _compute_model_status(model: str) -> dict:
 
     dis_pkg = get_dis(gwf)
     disv_pkg = get_disv(gwf)
-    has_grid = dis_pkg is not None or disv_pkg is not None
+    disu_pkg = get_disu(gwf)
+    has_grid = dis_pkg is not None or disv_pkg is not None or disu_pkg is not None
     tdis = sim.get_package("tdis")
     ims = sim.get_package("ims")
     has_simulation = tdis is not None and ims is not None
@@ -908,8 +1040,8 @@ def _compute_model_status(model: str) -> dict:
          "set_simulation(model, nper, perlen, nstp, ims_complexity) — defines "
          "TDIS+IMS; also a documented prerequisite for import_grid_from_shapefile."),
         ("grid", has_grid, True,
-         "add_dis_package / add_disv_package / import_grid_from_shapefile — "
-         "defines the model grid."),
+         "add_dis_package / add_disv_package / add_disu_package / "
+         "import_grid_from_shapefile — defines the model grid."),
         ("npf", has_npf, True,
          "add_npf_package(model, icelltype, k) — hydraulic properties; must "
          "exist before assign_k_from_zones, which edits this package in place."),
@@ -1174,6 +1306,45 @@ def register(mcp) -> None:
                 "Use import_grid_from_shapefile (method='disv') or pass "
                 "gridprops_file naming a JSON file.",
             )
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_disu_package(
+        model: str,
+        nodes: int,
+        nja: int,
+        top: list,
+        bot: list,
+        area: list | None = None,
+        iac: list | None = None,
+        ja: list | None = None,
+        ihc: list | None = None,
+        cl12: list | None = None,
+        hwva: list | None = None,
+        angldegx: list | None = None,
+        idomain: list | None = None,
+        gridprops_file: str | None = None,
+    ) -> dict:
+        """Add a fully-unstructured (DISU) grid from explicit node connectivity.
+
+        DISU is defined by ``nodes``/``nja`` plus per-edge connection data:
+        ``iac`` (connections per node), ``ja`` (connected node ids, 0-based)
+        and optionally ``ihc``/``cl12``/``hwva``/``angldegx``. Per-node ``top``
+        and ``bot`` are required and ``area`` defaults to 1.0. Pass
+        ``gridprops_file`` (JSON with any of these keys) for large grids.
+        """
+        try:
+            return _impl_add_disu_package(
+                model, nodes, nja, top, bot, area, iac, ja, ihc, cl12, hwva,
+                angldegx, idomain, gridprops_file,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
