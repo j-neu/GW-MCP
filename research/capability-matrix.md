@@ -163,6 +163,14 @@ across all 22 call sites, coordinate obs map to `(layer, node)` on DISV, and
 `_find_output_file`/`_find_budget_file` resolve OC-declared subdirectory paths
 and the GMS `.hed`/`.ccf` extensions. DISV obs/calibration row (formerly an
 implicit gap) is now covered; `tests/test_disv_support.py`.
+**Adopt/rewrite + OBS robustness fix (2026-09-13, GMS rerun):** FloPy leaves a
+GWF OC package's `saverecord`/`printrecord` empty when the period block is an
+external `OPEN/CLOSE` file (GMS), so the first rewrite dropped it and the run
+wrote no heads/budget — `model_store.restore_oc_period_records` now re-reads
+the OC period file on adopt/load/clone. `import_obs_from_csv` also sanitises
+site names to MF6-safe tokens (`#` is a comment marker; `POINT_#1` aborted the
+base run) and rejects unsupported `obs_type` values (e.g. `FLOW`) loudly.
+`tests/test_oc_obs_robustness.py`.
 
 ## GWF — flow (discretisation + stress packages)
 

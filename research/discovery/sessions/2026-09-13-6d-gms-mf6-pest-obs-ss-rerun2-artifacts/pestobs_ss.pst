@@ -1,0 +1,36 @@
+pcf
+* control data
+             restart          estimation
+         1        10         1         0         1
+         1         1              single               point         1
+   2.000000E+01  -3.000000E+00   3.000000E-01   1.000000E-02        -7
+   1.000000E+01   1.000000E+01   1.000000E-03
+   1.000000E-01
+        20   1.000000E-02         3         3   1.000000E-02         3
+         0         0         0
+* singular value decomposition
+         1
+  10000000    1.000000E-06
+1
+* parameter groups
+gwmcp                  relative              1.0000000000E-02      0.01 switch                2.0000000000E+00      parabolic             1.0000000000E-05      5.0000000000E-01      smaller              
+* parameter data
+hk_all                log                   factor                2.4000000000E+00      2.4000000000E-01      2.4000000000E+01      gwmcp                 1.0000000000E+00      0.0000000000E+00      1          
+* observation groups
+head_obs             
+* observation data
+point_1               3.1062000000E+02      1.0000000000E+00      head_obs             
+point_10              3.1638000000E+02      1.0000000000E+00      head_obs             
+point_2               3.0480000000E+02      1.0000000000E+00      head_obs             
+point_3               3.1653000000E+02      1.0000000000E+00      head_obs             
+point_4               3.3467000000E+02      1.0000000000E+00      head_obs             
+point_5               3.0861000000E+02      1.0000000000E+00      head_obs             
+point_6               3.2705000000E+02      1.0000000000E+00      head_obs             
+point_7               3.2766000000E+02      1.0000000000E+00      head_obs             
+point_8               3.1699000000E+02      1.0000000000E+00      head_obs             
+point_9               3.2918000000E+02      1.0000000000E+00      head_obs             
+* model command line
+"D:\Claude Projects\GW-MCP\.venv\Scripts\python.exe" C:\Users\jakob\AppData\Local\Temp\gwmcp_run_pestobs_ss.py
+* model input/output
+gwf_model_k.dat.tpl gwf_model_k.dat
+gwf_model_head.obs.csv.ins gwf_model_head.obs.csv
