@@ -2138,6 +2138,86 @@ def _impl_run_pestpp_glm(
     }
 
 
+def _impl_run_pestpp_da(
+    model: str,
+    pst_file: str,
+    num_reals: int = 50,
+    num_workers: int = 1,
+    da_options: dict | None = None,
+) -> dict:
+    """Run PESTPP-DA (generalized sequential/batch data assimilation).
+
+    The caller must supply a DA-ready PST (observation/parameter/weight cycle
+    tables, or ``da_*`` options via ``da_options``). In PEST++ DA the control
+    ``noptmax`` is the ensemble size, so ``num_reals`` is written there.
+
+    Parameters
+    ----------
+    model:
+        Registered model name.
+    pst_file:
+        Path to the PST control file.
+    num_reals:
+        Number of realisations (written to ``noptmax``).
+    num_workers:
+        Number of parallel workers (see run_pestpp_glm note on parallelism).
+    da_options:
+        Extra ``++`` options (e.g. ``{"da_cycle": 1,
+        "da_obs_cycle_table": "..."}``) written into the PST.
+    """
+    exe = _find_pestpp_binary("pestpp-da")
+    ws = resolve_workspace(model)
+    pst_path = _resolve_pst_path(model, pst_file)
+    if not pst_path.exists():
+        raise FileNotFoundError(f"PST control file not found: {pst_path}")
+
+    # Flush staged model changes so the forward model reads the current input
+    # set (7f-E1.2).
+    flush_model(model)
+
+    pst = pyemu.Pst(str(pst_path))
+    pst.control_data.noptmax = int(num_reals)
+    for key, value in (da_options or {}).items():
+        pst.pestpp_options[key] = value
+    pst.write(str(pst_path))
+
+    result = subprocess.run(
+        [exe, pst_path.name],
+        cwd=str(ws),
+        capture_output=True,
+        text=True,
+    )
+
+    base_name = pst_path.stem
+    phi_csv = ws / f"{base_name}.phi.actual.csv"
+
+    final_phi_mean: float | None = None
+    final_phi_std: float | None = None
+    cycles = 0
+
+    if phi_csv.exists():
+        phi_progress, _ = _read_phi_csv(phi_csv)
+        cycles = len(phi_progress)
+        if phi_progress:
+            phi_vals = [row["phi"] for row in phi_progress]
+            final_phi_mean = float(np.mean(phi_vals))
+            final_phi_std = float(np.std(phi_vals))
+
+    converged = result.returncode == 0
+
+    return {
+        "model": model,
+        "pst_file": str(pst_path),
+        "converged": converged,
+        "final_phi_mean": final_phi_mean,
+        "final_phi_std": final_phi_std,
+        "cycles": cycles,
+        "num_reals": num_reals,
+        "stdout": result.stdout[-3000:] if result.stdout else "",
+        "stderr": result.stderr[-1000:] if result.stderr else "",
+    }
+
+
 def _impl_run_pestpp_ies(
     model: str,
     pst_file: str,
@@ -2671,6 +2751,38 @@ def register(mcp: FastMCP) -> None:
             return _impl_run_pestpp_ies(model, pst_file, num_reals, num_workers)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "not found" in msg.lower() or "binary" in msg.lower():
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
+            return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def run_pestpp_da(
+        model: str,
+        pst_file: str,
+        num_reals: int = 50,
+        num_workers: int = 1,
+        da_options: dict | None = None,
+    ) -> dict:
+        """Run PESTPP-DA (ensemble data assimilation) and return phi statistics.
+
+        Requires a DA-ready PST: pass cycle-table options (e.g.
+        ``{"da_cycle": 1, "da_obs_cycle_table": "...",
+        "da_parameter_cycle_table": "..."}``) or a PST already carrying ``da_*``
+        options. ``num_reals`` is written to ``noptmax`` (the DA ensemble size)."""
+        try:
+            return _impl_run_pestpp_da(model, pst_file, num_reals, num_workers, da_options)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err(
+                "PEST_ERROR",
+                str(exc),
+                "Ensure the PST control file exists in the workspace.",
+            )
         except RuntimeError as exc:
             msg = str(exc)
             if "not found" in msg.lower() or "binary" in msg.lower():

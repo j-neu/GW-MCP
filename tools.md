@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-67 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+68 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -495,6 +495,9 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 **Windows model command:** must be a direct executable or a space-free Python wrapper. pestpp cannot run `.bat`/`.cmd` wrappers (it hangs normalising `cmd /c`) nor executables whose path contains spaces; `setup_pest_control` warns when it detects either.
 | `run_pestpp_glm` | `model: str`, `pst_file: str`, `num_workers: int = 1` | `{ converged: bool, final_phi: float, iterations: int }` |
 | `run_pestpp_ies` | `model: str`, `pst_file: str`, `num_reals: int = 50`, `num_workers: int = 1` | `{ final_phi_mean: float, final_phi_std: float, iterations: int }` |
+| `run_pestpp_da` | `model: str`, `pst_file: str`, `num_reals: int = 50`, `num_workers: int = 1`, `da_options: dict \| None = None` | `{ converged: bool, final_phi_mean: float, final_phi_std: float, cycles: int, num_reals: int }` |
+
+`run_pestpp_da` runs the PESTPP-DA binary (`noptmax` is written from `num_reals`, the DA ensemble size) against a **caller-supplied DA-ready `.pst`** — pass cycle-table options such as `{"da_cycle": 1, "da_obs_cycle_table": "...", "da_parameter_cycle_table": "..."}` (or a `.pst` that already carries `da_*` options). Building the DA-ready PST (observation/parameter/weight cycle tables and ensemble files) is the caller's responsibility; this tool exposes the engine.
 | `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
 | `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
 | `check_parameter_sensitivity` | `model: str`, `parameters: dict[str, float]`, `template_files: list[str]`, `delta: float = 0.1` | Per-parameter sensitivity (mean relative change of the simulated observations) over n+1 forward runs (7f-H3.1) |
