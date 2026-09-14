@@ -575,6 +575,77 @@ def test_setup_da_control_rejects_unknown_obs_cycles(tmp_path):
         )
 
 
+def test_setup_da_control_rejects_par_cycles_colliding_with_adjustable_parameter(tmp_path):
+    """A par_cycles key naming an adjustable K parameter is a hard error.
+
+    Otherwise the PST marks K adjustable while the parameter cycle table
+    overrides it every cycle — a silent wrong result.
+    """
+    name = _da_model(tmp_path, name="dacol")
+    parameterisation = {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+    with pytest.raises(ValueError, match=r"par_cycles key\(s\) \['k'\] collide"):
+        _impl_setup_da_control(
+            name,
+            parameterisation,
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+            par_cycles={"k": {0: 4.0, 1: 6.0}},
+        )
+
+    # the tool envelope reports INVALID_INPUT, naming the parameter
+    payload = json.loads(
+        asyncio.run(
+            mcp.call_tool(
+                "setup_da_control",
+                {
+                    "model": name,
+                    "parameterisation": parameterisation,
+                    "cycles": [0, 1],
+                    "obs_cycles": _obs_cycles(),
+                    "par_cycles": {"k": {"0": 4.0, "1": 6.0}},
+                },
+            )
+        )[0].text
+    )
+    assert payload["error"] is True
+    assert payload["code"] == "INVALID_INPUT"
+    assert "k" in payload["message"]
+
+
+def test_setup_da_control_rejects_use_simulated_states_false(tmp_path):
+    """v5.2.16 needs final-to-initial state linkages the tool does not emit,
+    so False yields a PST rejected at run time — reject it up front."""
+    name = _da_model(tmp_path, name="danostate")
+    parameterisation = {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+    with pytest.raises(ValueError, match="use_simulated_states=False"):
+        _impl_setup_da_control(
+            name,
+            parameterisation,
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+            use_simulated_states=False,
+        )
+
+    payload = json.loads(
+        asyncio.run(
+            mcp.call_tool(
+                "setup_da_control",
+                {
+                    "model": name,
+                    "parameterisation": parameterisation,
+                    "cycles": [0, 1],
+                    "obs_cycles": _obs_cycles(),
+                    "use_simulated_states": False,
+                },
+            )
+        )[0].text
+    )
+    assert payload["error"] is True
+    assert payload["code"] == "INVALID_INPUT"
+    assert "use_simulated_states" in payload["message"]
+
+
+
 # ---------------------------------------------------------------------------
 # Binary-backed validation
 # ---------------------------------------------------------------------------

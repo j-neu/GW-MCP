@@ -2158,6 +2158,14 @@ def _impl_setup_da_control(
     if len(set(cycles)) != len(cycles):
         raise ValueError(f"cycles must be unique, got {cycles}.")
 
+    if not use_simulated_states:
+        raise ValueError(
+            "use_simulated_states=False is not supported: pestpp-da v5.2.16 "
+            "requires final-to-initial state linkages that setup_da_control "
+            "does not emit, so the resulting PST is rejected at run time. "
+            "Only use_simulated_states=True is supported."
+        )
+
     gwf = get_gwf(model)
     sim = gwf.simulation
     tdis = sim.get_package("tdis")
@@ -2273,6 +2281,15 @@ def _impl_setup_da_control(
         par_cycles[str(k)] = {
             int(c): float(v) for c, v in vals.items() if v is not None
         }
+    collisions = [n for n in par_cycles if n in k_param_names]
+    if collisions:
+        raise ValueError(
+            f"par_cycles key(s) {collisions} collide with adjustable parameter "
+            "name(s); a parameter cannot be both calibrated and driven by the "
+            "parameter cycle table, which would override the calibrated value "
+            "every cycle. Rename the forcing parameter or remove it from the "
+            "parameterisation."
+        )
     forcing_names = [n for n in par_cycles if n not in k_param_names]
     tdis_tpl = None
     if forcing_names:
@@ -2440,7 +2457,7 @@ def _impl_setup_da_control(
         "model_command": list(pst.model_command),
         "next_steps": (
             "Run the assimilation with run_pestpp_da(model, pst_file), then "
-            "summarise_calibration."
+            "summarise_da."
         ),
     }
     if wrapper is not None:
@@ -2824,8 +2841,8 @@ def _impl_run_pestpp_da(
     is preserved (mirroring the ``noptmax`` handling) so a
     ``setup_da_control(num_reals=N)`` PST is not silently resized. The PEST
     control ``noptmax`` is the number of update *iterations per assimilation
-    cycle*, not the ensemble size — ``0`` performs a single (non-iterative)
-    update per cycle, the standard ensemble-Kalman case. When ``noptmax`` is
+    cycle*, not the ensemble size — ``0`` performs no update (base values only);
+    use ``>=1`` for one ensemble-Kalman update per cycle. When ``noptmax`` is
     omitted the PST's own value is preserved. (PEST++ manual §12;
     ``pestpp/pestpp-da_benchmarks`` reference PST.)
 
@@ -3430,7 +3447,11 @@ def register(mcp: FastMCP) -> None:
         so weights live in obs_data.csv). ``par_cycles`` optionally supplies
         per-cycle values for fixed forcing parameters — a ``perlen`` entry
         templates the TDIS stress-period length and drives it from the
-        parameter cycle table.
+        parameter cycle table. A ``par_cycles`` key that names an adjustable
+        parameter is rejected with INVALID_INPUT (the cycle table would override
+        the calibrated value every cycle). ``use_simulated_states=False`` is
+        rejected with INVALID_INPUT — pestpp-da v5.2.16 requires final-to-initial
+        state linkages this tool does not emit, so only ``True`` is supported.
 
         ``prior_ensemble`` (mapping of parameter name to a list of realisations)
         or ``prior_std`` (draw ``num_reals`` realisations around each adjustable
@@ -3451,7 +3472,7 @@ def register(mcp: FastMCP) -> None:
         end-of-cycle value; a clear error is returned otherwise.
 
         Run the assimilation afterwards with run_pestpp_da, then
-        summarise_calibration."""
+        summarise_da."""
         try:
             return _impl_setup_da_control(
                 model,
@@ -3644,8 +3665,9 @@ def register(mcp: FastMCP) -> None:
         to ``da_num_reals``); when omitted the PST's own ``da_num_reals`` is
         preserved (so a ``setup_da_control(num_reals=N)`` PST keeps N). The
         optional ``noptmax`` sets the number of update iterations per
-        assimilation cycle (0 = a single standard Kalman update) and preserves
-        the PST's own value when omitted."""
+        assimilation cycle (0 performs no update — base values only; use >=1
+        for one ensemble-Kalman update per cycle) and preserves the PST's own
+        value when omitted."""
         try:
             return _impl_run_pestpp_da(
                 model, pst_file, num_reals, num_workers, da_options, noptmax
