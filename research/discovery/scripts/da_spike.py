@@ -44,6 +44,24 @@ SS, SY = 1e-4, 0.1
 STATE_CELLS = [(0, 0, 1), (0, 1, 1), (0, 2, 1)]
 OBS_NAMES = [f"h_{r}_{c}" for (_l, r, c) in STATE_CELLS]
 NOPTMAX = 1  # v5.2.16: noptmax=1 performs ONE Kalman update per cycle.
+# Per-cycle stress-period length (days), driven by the populated
+# da_parameter_cycle_table.  Distinct values make the effect observable.
+PERLEN_CYCLE = {0: 40.0, 1: 100.0}
+
+
+def tdis_template() -> str:
+    return (
+        "ptf ~\n"
+        "BEGIN options\n"
+        "  TIME_UNITS  days\n"
+        "END options\n"
+        "BEGIN dimensions\n"
+        "  NPER  1\n"
+        "END dimensions\n"
+        "BEGIN perioddata\n"
+        "  ~          perlen          ~  1  1.0\n"
+        "END perioddata\n"
+    )
 
 
 def build_model(ws: Path) -> None:
@@ -183,6 +201,7 @@ def write_da(ws: Path) -> None:
     # template files (pest_file -> model_file are declared in the tpl file csv)
     (ws / "k.dat.tpl").write_text(k_template())
     (ws / "heads_0.dat_in.tpl").write_text(heads_template())
+    (ws / "spike.tdis.tpl").write_text(tdis_template())
 
     # instruction file: MCP's canonical pif for an MF6 OBS continuous CSV
     # (line 1 = header, line 2 = the single time-step row; ~,~ skips the time
@@ -208,15 +227,20 @@ def write_da(ws: Path) -> None:
         [
             ["k", "relative", 0.01, 0.0, "switch", 2.0, "parabolic", 1e-05, 0.5, "smaller"],
             ["head_state", "relative", 0.01, 0.0, "switch", 2.0, "parabolic", 1e-05, 0.5, "smaller"],
+            ["forcing", "relative", 0.01, 0.0, "switch", 2.0, "parabolic", 1e-05, 0.5, "smaller"],
         ],
     )
 
     # parameters: one adjustable K multiplier + one state parameter per obs cell
+    # + one FIXED per-cycle forcing parameter (perlen, set by the cycle table).
     par_rows = [
         ["k_mult", "log", "factor", 1.0, 0.1, 10.0, "k", 1.0, 0.0, 1, -1.0],
     ]
     for n in OBS_NAMES:
         par_rows.append([n, "none", "factor", STRT0, 0.0, 20.0, "head_state", 1.0, 0.0, 1, -1.0])
+    par_rows.append(
+        ["perlen", "fixed", "factor", PERLEN, 1e-8, 1.1e4, "forcing", 1.0, 0.0, 1, -1.0]
+    )
     write_csv(
         ws / "spike.par_data.csv",
         [
@@ -250,6 +274,7 @@ def write_da(ws: Path) -> None:
         [
             ["k.dat.tpl", "k.dat", -1],
             ["heads_0.dat_in.tpl", "heads_0.dat_in", -1],
+            ["spike.tdis.tpl", "spike.tdis", -1],
         ],
     )
     write_csv(
@@ -260,8 +285,12 @@ def write_da(ws: Path) -> None:
 
     # cycle tables ---------------------------------------------------------
     cycles = [0, 1]
-    # parameter cycle table: none of our parameters are cycle-forcing
-    write_csv(ws / "par_cycle_tbl.csv", [""] + cycles, [])
+    # parameter cycle table: per-cycle values for the fixed forcing parameter
+    write_csv(
+        ws / "par_cycle_tbl.csv",
+        [""] + cycles,
+        [["perlen"] + [PERLEN_CYCLE[c] for c in cycles]],
+    )
     # observation values per cycle (one row per obs)
     obs_vals = {
         "h_0_1": [8.80, 8.90],
@@ -279,7 +308,7 @@ def write_da(ws: Path) -> None:
 * control data keyword
 pestmode                     estimation
 noptmax                      {NOPTMAX}
-ies_num_reals                5
+da_num_reals                 5
 ies_verbose_level            2
 da_use_simulated_states      True
 da_parameter_cycle_table     par_cycle_tbl.csv
@@ -320,6 +349,7 @@ def run_da(ws: Path) -> None:
         f"{MODEL}.global.phi.actual.csv",
         f"{MODEL}.global.0.pe.csv",
         f"{MODEL}.global.1.pe.csv",
+        f"{MODEL}.tdis",
     ):
         p = ws / name
         if p.exists():

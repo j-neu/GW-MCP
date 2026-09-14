@@ -10,9 +10,9 @@
 
 ## 1. Bottom line (the five facts a developer needs)
 
-1. **A v2 control file + external CSVs + 2 cycle tables runs end-to-end** (`pestpp-da spike.pst` → exit 0) over **2 cycles with 5 realisations**, updating one adjustable K multiplier, with **3 head observations per cycle**. No wrapper, no `.ins`-from-listing tricks.
+1. **A v2 control file + external CSVs + 2 cycle tables runs end-to-end** (`pestpp-da spike.pst` → exit 0) over **2 cycles with 5 realisations**, updating one adjustable K multiplier, with **3 head observations per cycle** and a **populated parameter cycle table** driving per-cycle duration (templated TDIS `perlen`: 40 d then 100 d). No wrapper, no `.ins`-from-listing tricks.
 2. **`noptmax 0` does NOT perform a DA update in v5.2.16.** It runs only the base parameter set per cycle (1 "realisation") and just carries state. **Use `noptmax 1`** for exactly one Kalman/ensemble update per cycle. (The plan/brief assumed `noptmax 0` = one update; that is wrong for this binary.)
-3. **There is no `da_num_reals` in v5.2.16.** The ensemble size is the shared `ies_num_reals`. `da_num_reals` is not a recognised option; the DA-only options are exactly `da_parameter_cycle_table`, `da_observation_cycle_table`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states`, `da_noptmax_schedule` (plus `da_weight_cycle_table`, see §7.2).
+3. **`da_num_reals` is a valid v5.2.16 option and overrides `ies_num_reals`.** The ensemble size may be given either way; both work, and when both are present the `da_` value wins (the `.rec` states `(note: 'da' args override 'ies' args when using pestpp-da)`). Verified: `da_num_reals 5` (alone) → exit 0, `number of active realizations: 5`; `ies_num_reals 5` + `da_num_reals 3` → exit 0, `...drawing parameter realizations: 3`, `number of active realizations: 3`, phi header `...,0,1,base`. **Emit `da_num_reals` to be DA-explicit.** (The literal string `da_num_reals` is absent from the binary because it is resolved through the `da_`→`ies_` alias layer — absence of the literal is *not* evidence that the option is unrecognised; the parser itself is strict, e.g. `da_bogus_option` → exit 1 `control data keyword lines were not accepted`.) The DA-only options listed in `.rec` are `da_parameter_cycle_table`, `da_observation_cycle_table`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states`, `da_noptmax_schedule`; `da_weight_cycle_table` is also accepted but is **ignored** in v5.2.16 (see §7.1) — weights must be non-zero in `obs_data.csv`.
 4. **State advance is automatic and easy** with `da_use_simulated_states True`: after each cycle PEST++-DA takes the **simulated** observations of the current cycle and writes them into the **state parameters**, which are the initial-head template tokens, so the next cycle's IC file is the previous cycle's end-of-cycle heads. Two equivalent wirings work:
    - **shared-name**: `obsnme == parnme` (e.g. both `h_0_1`), `state_par_link` left blank → logs `3 dynamic states identified through shared-names`;
    - **explicit link**: `obsnme != parnme` and `obs_data.state_par_link = <parnme>` → logs `3 dynamic states identified through observation data 'state_par_link'`.
@@ -30,7 +30,7 @@
 - NPF `icelltype=1`, `k` read **OPEN/CLOSE** from `k.dat`.
 - STO transient: ss=1e-4, sy=0.1.
 - IC `strt LAYERED` read **OPEN/CLOSE** from `heads_0.dat_in`.
-- TDIS: **NPER=1, perlen=50 d, NSTP=1** (one time step per cycle — see fact 5).
+- TDIS: **NPER=1, NSTP=1**, `perlen` templated and driven per DA cycle by the populated parameter cycle table (cycle 0 = 40 d, cycle 1 = 100 d) — one time step per cycle (see fact 5).
 - MF6 OBS package: 3 `head` observations at the interior column, rows 1–3 → `h_0_1`, `h_1_1`, `h_2_1`.
 - One adjustable parameter: `k_mult` (log, 0.1–10, group `k`), repeated 9× in `k.dat.tpl` so a single parameter controls the whole K array.
 
@@ -70,7 +70,7 @@ END GRIDDATA
 - At the end of cycle 0 the simulated heads (≈8.61 m) are transferred into the state parameters and written into `heads_0.dat_in`.
 - Cycle 1 runs MF6 once per realisation from that carried-forward IC (observed in `spike.global.1.pe.csv`: state columns ≈8.5 m), for another 50 d.
 - Cycle-table header `,0,1` = DA cycles 0 and 1. Observation values are supplied per cycle in `da_observation_cycle_table`, weights in `obs_data.csv`.
-- **Per-cycle duration**: not needed for this spike (fixed 50 d). If cycles need different durations, template TDIS `perlen` and drive it from `da_parameter_cycle_table` exactly as the `mf6_freyberg/template_seq_native` benchmark does (`perlen,100000,31,29,31,...`).
+- **Per-cycle duration**: the spike now varies it via a populated `da_parameter_cycle_table`: TDIS `perlen` is a **fixed** parameter (`forcing` group) whose value per cycle comes from `par_cycle_tbl.csv` (`perlen,40.0,100.0`). Cycle 0 runs 40 d, cycle 1 runs 100 d; the applied value is visible in the written `spike.tdis` per cycle (see §4.9). This mirrors the `mf6_freyberg/template_seq_native` benchmark (`perlen,100000,31,29,31,...`).
 
 ---
 
@@ -84,7 +84,7 @@ pcf version=2
 * control data keyword
 pestmode                     estimation
 noptmax                      1
-ies_num_reals                5
+da_num_reals                 5
 ies_verbose_level            2
 da_use_simulated_states      True
 da_parameter_cycle_table     par_cycle_tbl.csv
@@ -115,9 +115,11 @@ k_mult,log,factor,1.0,0.1,10.0,k,1.0,0.0,1,-1.0
 h_0_1,none,factor,7.5,0.0,20.0,head_state,1.0,0.0,1,-1.0
 h_1_1,none,factor,7.5,0.0,20.0,head_state,1.0,0.0,1,-1.0
 h_2_1,none,factor,7.5,0.0,20.0,head_state,1.0,0.0,1,-1.0
+perlen,fixed,factor,50.0,1e-08,11000.0,forcing,1.0,0.0,1,-1.0
 ```
 - `cycle = -1.0` on every row = parameter present in all cycles.
 - State parameters (`head_state` group) must be listed; `partrans none` is accepted.
+- `perlen` is the per-cycle forcing parameter (see §4.7/§4.9): **`partrans fixed`** marks it non-adjustable (mirrors the benchmark's `perlen,fixed,...`) so the Kalman update only adjusts `k_mult` + the state parameters.
 - **The `mf6_freyberg` benchmark's 11-column header has no `state_par_link` column**; the v5.2.16 binary also accepts an optional parameter-data `state_par_link` column (final-state → initial-state name). It is **not needed** with `da_use_simulated_states True`.
 - Note: PEST parameter/obs names are 12-char capped for parameter names in some tooling; `h_0_1` etc. are short.
 
@@ -126,6 +128,7 @@ h_2_1,none,factor,7.5,0.0,20.0,head_state,1.0,0.0,1,-1.0
 pargpnme,inctyp,derinc,derinclb,forcen,derincmul,dermthd,splitthresh,splitreldiff,splitaction
 k,relative,0.01,0.0,switch,2.0,parabolic,1e-05,0.5,smaller
 head_state,relative,0.01,0.0,switch,2.0,parabolic,1e-05,0.5,smaller
+forcing,relative,0.01,0.0,switch,2.0,parabolic,1e-05,0.5,smaller
 ```
 
 ### 4.4 `spike.obs_data.csv` (shared-name wiring)
@@ -153,6 +156,7 @@ h_2_1,0.0,1.0,head,-1,
 pest_file,model_file,cycle
 k.dat.tpl,k.dat,-1
 heads_0.dat_in.tpl,heads_0.dat_in,-1
+spike.tdis.tpl,spike.tdis,-1
 ```
 
 ### 4.6 `spike.insfile_data.csv` (model output)
@@ -161,10 +165,14 @@ pest_file,model_file,cycle
 spike.obs.csv.ins,spike.obs.csv,-1
 ```
 
-### 4.7 `par_cycle_tbl.csv` (empty is fine when no forcing parameters vary by cycle)
+### 4.7 `par_cycle_tbl.csv` (populated with the per-cycle `perlen` forcing)
 ```
 ,0,1
+perlen,40.0,100.0
 ```
+- Every parameter named here is **set from the table for that cycle** before its model input is written, overriding the `par_data` `parval1`. Cycle 0 runs 40 d, cycle 1 runs 100 d. Blank cells = not applied that cycle.
+- Parameters *not* listed (all adjustable parameters) keep their ensemble values; a header-only table (`,0,1`) is valid when no forcing parameters vary by cycle.
+- The benchmark's table drives `perlen,100000,31,29,31,...` the same way.
 
 ### 4.8 `obs_cycle_tbl.csv` (observed heads per cycle)
 ```
@@ -191,6 +199,21 @@ ptf ~
 ```
 After a run, PEST++ writes full double precision into the token field (e.g. `8.6208882898408649708699159`); the token must be wide enough (≥ 24 chars inner) or values are corrupted.
 
+`spike.tdis.tpl` — per-cycle stress-period length (`perlen`), mirroring the benchmark:
+```
+ptf ~
+BEGIN options
+  TIME_UNITS  days
+END options
+BEGIN dimensions
+  NPER  1
+END dimensions
+BEGIN perioddata
+  ~          perlen          ~  1  1.0
+END perioddata
+```
+After a full run this file's output `spike.tdis` holds cycle 1's value (100 d); with `da_stop_cycle 0` it holds cycle 0's value (40 d) — proof the populated cycle table takes effect in the written model input.
+
 ### 4.10 `spike.obs.csv.ins` — the MCP's canonical MF6-OBS-CSV reader
 ```
 pif ~
@@ -212,6 +235,11 @@ l1 ~,~   !h_0_1!  ~,~   !h_1_1!  ~,~   !h_2_1!
 
 # reproduce the noptmax=0 (no-update) behaviour
 ... da_spike.py --workdir <dir> --build --da --noptmax 0
+
+# prove the populated parameter cycle table takes effect (cycle 0 only):
+# add `da_stop_cycle 0` to the PST, run, then inspect the written model input
+cd <dir> && C:\Users\jakob\.local\bin\pestpp-da.exe spike.pst   # spike.tdis -> perlen 40
+# without da_stop_cycle the full run ends with spike.tdis -> perlen 100 (cycle 1)
 
 # direct
 cd <dir> && C:\Users\jakob\.local\bin\pestpp-da.exe spike.pst
@@ -236,6 +264,9 @@ Observed: `mf6` returncode 0, `pestpp-da` returncode 0, `number of active realiz
 | `cycle_curr_noise.csv`, `spike.global.obs+noise.csv`, `spike.0/1.obs+noise.csv` | noise realisations |
 | `spike.rec` | full echo of options, external files, and per-cycle summaries |
 | `heads_0.dat_in` | **state carried to the next cycle** (ends at ≈8.62 m) |
+| `spike.tdis` | templated TDIS written from the parameter ensemble: holds the **last cycle's** `perlen` (100 d); with `da_stop_cycle 0` it holds cycle 0's (40 d). This is the proof the populated cycle table is applied. |
+
+Note: the `perlen` column in `spike.global.<cycle>.pe.csv` reports the ensemble's `par_data` value (50.0), **not** the cycle-forced value — do not use `pe.csv` to verify cycle-table application; inspect the written model input (`spike.tdis`) instead.
 
 ---
 
@@ -252,15 +283,25 @@ H_0_1 ...
 ```
 The `da_weight_cycle_table` option was accepted but **not applied** in this build (it does not appear in the `pestpp-da options` list in `.rec`, and the weight table was never processed). **Fix: put a non-zero `weight` in `obs_data.csv`.** (A weight cycle table is not required for a minimal run.)
 
-### 7.2 Ensemble size is `ies_num_reals`, not `da_num_reals`
-`da_num_reals` does not exist in v5.2.16 (the binary contains no such string; the DA-only option list omits it). The ensemble size is the shared IES option:
+### 7.2 Ensemble size: `da_num_reals` (preferred) or `ies_num_reals`; `da_` wins
+`da_num_reals` **is** accepted and effective in v5.2.16, resolved through the `da_`→`ies_` alias layer, so the literal string does not appear in the binary even though the option works. Verified:
+```
+# da_num_reals 5 alone:
+...drawing parameter realizations: 5
+number of active realizations: 5              # exit 0
+# ies_num_reals 5 + da_num_reals 3:
+...drawing parameter realizations: 3
+number of active realizations: 3              # exit 0
+# phi header: iteration,total_runs,mean,standard_deviation,min,max,0,1,base
+```
+The `.rec` records the shared list and the rule:
 ```
 ...shared pestpp-ies/pestpp-da options:
 (note: 'da' args override 'ies' args when using pestpp-da)
 ...
 ies_num_reals: ...
 ```
-Use `ies_num_reals 5`. The `mf6_freyberg` benchmark pst (`da_num_reals 5`) is for a newer build.
+Emit `da_num_reals <N>` to be DA-explicit (`ies_num_reals` also works). The parser is genuinely strict — an unknown keyword such as `da_bogus_option` fails with `control data keyword lines were not accepted` (exit 1) — so the accepted-but-absent-literal case is specific to the alias layer, not lax parsing.
 
 ### 7.3 Do not tag a state both by shared name and by `state_par_link`
 Setting `state_par_link = h_0_1` while the parameter is also named `h_0_1`:
@@ -301,16 +342,17 @@ The reliable, already-tested pattern is the literal-marker pif in §4.10 (`l1 ~,
 
 Given a model + registered observations + a parameterisation, the tool must write:
 
-1. `*.pst` v2 with: `pcf version=2`, `* control data keyword`, `pestmode estimation`, **`noptmax 1`**, **`ies_num_reals <N>`**, `da_use_simulated_states True`, `da_parameter_cycle_table`, `da_observation_cycle_table`, and the five external sections (`* parameter groups/data`, `* observation data`, `* model command line`, `* model input`, `* model output`).
+1. `*.pst` v2 with: `pcf version=2`, `* control data keyword`, `pestmode estimation`, **`noptmax 1`**, **`da_num_reals <N>`**, `da_use_simulated_states True`, `da_parameter_cycle_table`, `da_observation_cycle_table`, and the five external sections (`* parameter groups/data`, `* observation data`, `* model command line`, `* model input`, `* model output`).
 2. `*.pargp_data.csv` (10-col benchmark header) — one row per parameter group.
 3. `*.par_data.csv` (11-col benchmark header, optional `state_par_link` 12th col) — adjustable parameters with `cycle -1`, plus one **state parameter per state cell** in a `head_state` group.
 4. `*.obs_data.csv` (`obsnme,obsval,weight,obgnme,cycle,state_par_link`) — non-zero weights; `cycle -1`; `state_par_link` blank (names shared) or the state parameter name.
 5. `tplfile_data.csv` / `insfile_data.csv` (`pest_file,model_file,cycle`) — IC template→`heads_0.dat_in`, K template→`k.dat`, `obs.csv.ins`→`obs.csv`, all `cycle -1`.
-6. Cycle tables: `obs_cycle_tbl.csv` (per-cycle observed values, blank = inactive) and a `par_cycle_tbl.csv` (header-only if no forcing parameters vary by cycle).
+6. Cycle tables: `obs_cycle_tbl.csv` (per-cycle observed values, blank = inactive) and a **populated** `par_cycle_tbl.csv` for every forcing parameter whose value changes by cycle — each entry is a **fixed** parameter in a `forcing` group (e.g. templated TDIS `perlen`), with one value column per cycle. Header-only `,0,1` is valid only when no forcing parameter varies by cycle.
+7. A **templated TDIS** (`spike.tdis.tpl` → `spike.tdis`) if cycle durations vary, listed in `tplfile_data.csv` with `cycle -1`.
 7. A state-augmented **IC template** whose tokens are the state parameter names, and an IC package that reads it via `OPEN/CLOSE`; plus the model must have `NPER=1, NSTP=1` per cycle (or a wrapper) so the obs-CSV reader sees the end-of-cycle value.
 
 ## 9. Scope / caveats
 
-- Positive result obtained on v5.2.16 only. Newer PEST++ releases changed `noptmax`/`da_num_reals` semantics (the `mf6_freyberg` benchmark uses them); `setup_da_control` should probe/emit the v5.2.16 form and document the version assumption.
+- Positive result obtained on v5.2.16 only. `noptmax` semantics (0 = no update here) are version-specific; `da_num_reals`/`ies_num_reals` are supported in v5.2.16. `setup_da_control` should emit the v5.2.16 form and document the version assumption.
 - The explicit final-state→initial-state parameter linkage route (`da_use_simulated_states False` + parameter-data `state_par_link`) was **not** exercised; v5.2.16 refuses it without linkages (`'da_use_simulated_states is false but no final-to-initial state par linkages are provided'`). The simulated-states route was chosen because it needs no such wiring.
 - `tests/fixtures/da_spike/` was intentionally **not** populated: all spike outputs are binary/CSV and git-ignored. The rerunnable script rebuilds everything into any work directory.
