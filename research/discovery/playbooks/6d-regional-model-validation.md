@@ -798,6 +798,182 @@ Work step by step and explain what you are doing at each step.
 
 ---
 
+## Target 8 — MF6_EnKF_DISU (Neckartal DE; sequential EnKF-style data assimilation)
+
+**What it validates:** the sequential data-assimilation chain — `setup_da_control`
+→ `run_pestpp_da` → `summarise_da` (7f-DA) — on a real DISU model with real gauge
+observations. Introduced 2026-09-13 with the DA capability (commits
+`d30a9fc`…`fb7164a`: DA-ready v2 `.pst` + cycle tables, optional weight table,
+optional prior ensemble, `summarise_da`, and the end-to-end MCP-only proof in
+`sessions/2026-09-13-da-e2e-tiny-model.md`). The tool count is unchanged at 70.
+
+**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\MF6_EnKF_DISU\`
+(github.com/JanGei/MF6_EnKF_DISU, cloned 2026-09-13; no LICENSE file — verify,
+academic/ToS). Verified facts (recon `sessions/2026-09-13-6d-enkf-disu-recon.md`):
+
+- The runnable MF6 model is
+  `NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim\`: single GWF model
+  `flow` (`mfsim.nam` + `flow.nam`), **DISU 31,831 nodes / NJA 198,261 / 31,522
+  active** with **vertices + CELL2D present**, packages DISU/NPF/IC/CHD/OC/RCH/RIV/
+  WEL/STO, external arrays in `flow_input/`, solved `flow_output/flow.hds` + `.cbc`.
+  `sim.tdis` is **NPER 6, one 1.0-day time step each, TIME_UNITS days** (6×1-day
+  transient).
+- Gauge data: `csv data\Pegel.csv` (wide table — `Date` + 14 gauge columns, water
+  level in m, **-9999 = missing**) and `csv data\Pegel_Cell_ID.csv` (`Name,Cell_ID`
+  — the 14 gauges mapped to scalar DISU node ids).
+- The repo's own EnKF is bespoke Python over the model (`main.py`,
+  `Transient_Run.py`, `generator.py`); it is NOT run in this target — the MCP
+  sequential-DA chain replaces it.
+- Recon also confirmed adopt → check (clean) → run (converged, 5.7 s) →
+  postprocess (heads 305–343 m, balance closes, spec exports) through the MCP, so
+  the grid/transient/obs substrate is ready. `plot_heads_map` on this grid was
+  fixed 2026-09-13 (tasks.md) — the run produces a head map.
+
+**Pre-registered criteria (Target 8):**
+
+- **check_environment** called first; stack verified before any build.
+- **Adopt**: `adopt_model` the shipped sim (model name ≤ 16 chars, workspace = the
+  sim directory, `allow_modify=True`); the grid/packages/boundaries match the
+  source set (`{DISU, nnodes 31831, nja 198261, n_active 31522}`).
+- **Single-step re-expression**: the model is run with **NPER=1/NSTP=1** per cycle
+  (see the scope note below); the cycle definition and its deviation from the
+  shipped 6-period TDIS are documented.
+- **DA setup**: `setup_da_control` returns a DA-ready v2 `.pst` — `noptmax ≥ 1`
+  (v5.2.16: `noptmax 0` performs no update), `da_num_reals N`,
+  `da_use_simulated_states True`, a `head_state` parameter per gauge cell, and
+  populated observation/parameter cycle tables.
+- **Run**: `run_pestpp_da` exits 0 with an N-realisation ensemble over the
+  requested cycles; per-cycle state carry-forward is observable.
+- **Summarise**: `summarise_da` returns the per-cycle **post-update** phi, the
+  final-cycle phi mean/std, posterior parameter statistics and residuals, with no
+  error.
+- **Fit**: the gauge observed values are assimilated and the prior→post-update phi
+  behaviour is reported. The gauge/head baseline may not be calibrated (phi scale
+  arbitrary) — document that rather than fabricate a fit.
+- **Reprompts ≤ 1**; every deviation from the source model recorded.
+- **Closed-book** and **MCP-only** as in the pre-registered criteria above.
+- **PASS bar**: **≥ 2 consecutive green closed-book reruns**, and the **last rerun
+  = set-and-forget** (0 permission prompts) with **0 reprompts** and **0 MCP-only
+  violations**. A target passes only when the agent uses the MCP chain as-is with no
+  workarounds.
+
+**Honest scope notes (target-expressibility):**
+
+- The shipped set is a **6×1-day transient** (NPER 6, one time step each), but
+  sequential PEST++-DA requires **one stress period with one time step per cycle**
+  (`setup_da_control` refuses anything else). The target **is** expressible, but
+  only by re-expressing the TDIS: call
+  `set_simulation(model, 1, [<cycle length in days>], [1])` (an MCP tool) and then
+  define the DA cycles explicitly — each cycle is one 1-day (or parameter-cycle-
+  table-driven) stress period, with heads carried between cycles by
+  `da_use_simulated_states`. **The DA cycles therefore do NOT map 1:1 onto the
+  model's native 6 stress periods**; this is a required deviation and must be
+  recorded in every run log.
+- The repo's bespoke EnKF (**15-member pilot-point/kriging ensemble + sequential
+  assimilation at `t_enkf=300`**) is **not reproduced**. The MCP chain runs
+  PESTPP-DA — an ensemble-Kalman/ensemble-smoother update over a standard K
+  parameterisation (`npf:k` `all`/`layer`/`cells`/`zones`), with the prior drawn
+  from the parameter bounds or from `prior_ensemble`/`prior_std`. There is no MCP
+  tool that generates an ensemble from pilot points by kriging. The pre-registered
+  bar is therefore **capability expression** (a real sequential DA run on a real
+  DISU model with real gauges), **not numerical equivalence** with the published
+  EnKF.
+- `Pegel.csv` is a **long daily record** (from 2003, mostly gaps, `-9999` sentinel)
+  while the model is only 6 days long; the agent selects the per-cycle observed
+  values (aligned to its chosen 1-day periods) and reshapes the wide gauge tables
+  into the long `site,date,value,Cell_ID` form `import_obs_from_csv` expects. This
+  prep is ordinary Python and allowed; the table then enters the model via the tool.
+- The adopted workspace is the holdout sim directory (per the task brief) and
+  `setup_da_control` rewires NPF/IC **in place**. `clone_model` to a session-folder
+  workspace first is the equivalent MCP-only route if the holdout must stay
+  pristine; either is acceptable as long as it is documented.
+
+### Prompt (paste verbatim into the Agent Manager session)
+
+```
+CLOSED-BOOK VALIDATION RUN — Phase 6d target 8 (MF6_EnKF_DISU, Neckartal DE; sequential DA).
+
+You are a groundwater modelling assistant validating an MCP toolchain on a REAL
+DISU model with real gauge observations. Do NOT read the groundwater-mcp
+repository source code, its tests, .kilo plans, or prior research session logs.
+You MAY read the target repository's own data, model files, and scripts — they
+are the model specification.
+
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\MF6_EnKF_DISU\
+(github.com/JanGei/MF6_EnKF_DISU, cloned 2026-09-13; no LICENSE file — verify).
+Layout: the runnable MF6 model is at
+NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim\ — a single GWF model
+`flow` (mfsim.nam + flow.nam): DISU 31,831 nodes / NJA 198,261 / 31,522 active,
+vertices + CELL2D present; packages DISU/NPF/IC/CHD/OC/RCH/RIV/WEL/STO; external
+arrays in flow_input\; solved outputs flow_output\flow.hds + .cbc. sim.tdis is
+NPER 6, one 1.0-day time step each, TIME_UNITS days (a 6x1-day transient).
+Gauge data: "csv data\Pegel.csv" (wide table: Date + 14 gauge columns, water
+level in m, -9999 = missing) and "csv data\Pegel_Cell_ID.csv" (Name,Cell_ID — the
+14 gauges mapped to scalar DISU node ids). The repo's own EnKF is bespoke Python
+(main.py / Transient_Run.py / generator.py) and is NOT part of this run.
+
+SUCCESS CRITERIA:
+1) check_environment first; report the stack.
+2) Adopt the shipped model into an MCP workspace with the adopt_model tool: model
+   name <= 16 chars, workspace = the sim directory above, allow_modify=true, and
+   the units/time units the model declares. Do NOT rebuild the grid, do NOT rename
+   files.
+3) check_model clean (or documented).
+4) Re-express the run as sequential DA. Sequential PEST++-DA needs exactly ONE
+   MF6 stress period with ONE time step per cycle (NPER=1, NSTP=1) — the canonical
+   OBS-CSV instruction file reads the first data row, which is the end-of-cycle
+   value only with a single time step. The shipped TDIS has NPER=6 (six 1-day
+   periods), so call set_simulation(model, 1, [<cycle length in days>], [1], ...)
+   to reduce it to one step, then define your DA cycles explicitly (each cycle is
+   one 1-day — or cycle-table-driven — stress period; heads carry between cycles).
+   Do NOT hand-edit the tdis file.
+5) Register the gauges. Build the long observation table the tool expects
+   (site,date,value,Cell_ID) from Pegel.csv + Pegel_Cell_ID.csv with ordinary
+   Python (allowed data prep: reshape the wide table, treat -9999 as missing,
+   select the dates/values for your cycles), then call import_obs_from_csv with
+   cellid_col="Cell_ID" (scalar DISU node id; the tool converts to the 1-based OBS
+   id) plus the site/date/value columns. Verify the 14 gauges map to the intended
+   nodes (e.g. a converged run + compare_to_observed).
+6) Set up the DA: call setup_da_control with a K parameterisation on npf:k
+   (scope "all" or "zones"/"cells", log-transformed), cycles=[...], obs_cycles
+   mapping every registered site to {cycle: observed value} (the gauge values from
+   step 5), par_cycles supplying the per-cycle TDIS perlen, num_reals = your
+   ensemble size, noptmax=1 (v5.2.16: noptmax 0 performs NO update), and
+   use_simulated_states=True. Report the generated .pst and the state-parameter
+   count.
+7) Run the assimilation with run_pestpp_da (the .pst from step 6; omit num_reals
+   to keep the PST's ensemble size), then summarise_da. Report the per-cycle phi,
+   the final-cycle phi mean/std, posterior parameter statistics, and residuals. A
+   cycle-0 prior -> post-update phi improvement is expected where the observations
+   inform the parameters; if the gauge/head baseline is not calibrated (arbitrary
+   phi scale), document that rather than fabricate a fit.
+8) Postprocess: produce a plot_heads_map (this vertex-carrying DISU grid is
+   supported) and, on the final cycle, compare_to_observed /
+   read_simulated_observations for the gauge fit.
+9) Write run-log.md in the session folder: tool-call sequence, reprompts,
+   decisions, deviations from the source model (especially the 6-period ->
+   single-step-cycles re-expression and the PESTPP-DA vs bespoke-EnKF method
+   change), convergence/phi evidence, and the DA results.
+
+MCP-ONLY CONSTRAINT: every action that adopts, builds, runs, post-processes, or
+calibrates/assimilates the MF6 MODEL ITSELF must go through a groundwater-mcp tool
+call — do NOT call flopy/pyemu MODFLOW or PEST classes directly, and do NOT
+hand-edit MODFLOW or PEST files with a text editor or shell command. Ordinary
+Python for data prep (reshaping Pegel.csv + Pegel_Cell_ID.csv into the observation
+CSV) is fine — the table then goes INTO the model via import_obs_from_csv, not via
+a direct flopy call or a hand-written file. Do NOT run the repo's EnKF scripts
+(generator.py / main.py / Transient_Run.py) — they are raw flopy and bypass the
+MCP. If a groundwater-mcp tool cannot do something you need, STOP and report
+exactly what capability is missing and why — do not work around the gap by
+building/running/assimilating the model with raw flopy/pyemu instead. A workaround
+invalidates this run: it is testing whether the MCP tools are sufficient on their
+own.
+
+Work step by step and explain what you are doing at each step.
+```
+
+---
+
 ## Session log template
 
 `research/discovery/sessions/YYYY-MM-DD-6d-<target>.md`:
