@@ -226,18 +226,20 @@ def _latest_ensemble_file(ws: Path, base_name: str, suffix: str) -> Path | None:
     return max(files, key=lambda t: t[0])[1]
 
 
-def _read_ies_parameter_ensemble(ws: Path, base_name: str) -> dict[str, dict]:
-    """Read the final pestpp-ies parameter ensemble ``<case>.<N>.par.csv``.
+def _parameter_ensemble_stats(par_csv: Path, drop_base: bool = False) -> dict[str, dict]:
+    """Compute per-parameter ensemble statistics from a parameter-ensemble CSV.
 
     Columns are parameter names, rows are realisations (a non-numeric leading
-    index column holds the realisation id). Returns a dict keyed by lower-case
-    parameter name with ``mean``/``std``/``min``/``max``/``n``. ``{}`` when no
-    ensemble file exists.
+    index / ``real_name`` column holds the realisation id). Returns a dict keyed
+    by lower-case parameter name with ``mean``/``std``/``min``/``max``/``n``.
+
+    ``drop_base`` removes the ``base`` row pestpp-da writes alongside the
+    realisations (it is the base parameter set, not an ensemble member).
     """
-    par_csv = _latest_ensemble_file(ws, base_name, "par")
-    if par_csv is None:
-        return {}
     df = pd.read_csv(par_csv)
+    if drop_base and len(df.columns) > 0:
+        id_col = "real_name" if "real_name" in df.columns else df.columns[0]
+        df = df[df[id_col].astype(str).str.lower() != "base"]
     ensemble: dict[str, dict] = {}
     for col in df.select_dtypes(include="number").columns:
         vals = df[col].dropna().astype(float)
@@ -251,6 +253,19 @@ def _read_ies_parameter_ensemble(ws: Path, base_name: str) -> dict[str, dict]:
             "n": int(len(vals)),
         }
     return ensemble
+
+
+def _read_ies_parameter_ensemble(ws: Path, base_name: str) -> dict[str, dict]:
+    """Read the final pestpp-ies parameter ensemble ``<case>.<N>.par.csv``.
+
+    Returns a dict keyed by lower-case parameter name with
+    ``mean``/``std``/``min``/``max``/``n``. ``{}`` when no ensemble file exists.
+    """
+    par_csv = _latest_ensemble_file(ws, base_name, "par")
+    if par_csv is None:
+        return {}
+    return _parameter_ensemble_stats(par_csv)
+
 
 
 def _read_ies_obs_ensemble(ws: Path, base_name: str, pst) -> pd.DataFrame | None:
@@ -296,12 +311,88 @@ def _detect_pestpp_engine(ws: Path, base_name: str) -> str:
     per-iteration ensemble files ``<case>.<N>.par.csv`` / ``<case>.<N>.obs.csv``
     and never a plain ``<case>.par``. A ``.par`` wins when both exist (a real
     run produces one or the other, never both).
+
+    pestpp-da leaves per-cycle outputs ``<case>.global.phi.actual.csv`` /
+    ``<case>.global.<cycle>.pe.csv``, and its per-cycle iteration files
+    (``<case>.<cycle>.par.csv``) would otherwise read as IES — so DA is checked
+    between GLM and IES.
     """
     if (ws / f"{base_name}.par").exists():
         return "glm"
+    if (
+        (ws / f"{base_name}.global.phi.actual.csv").exists()
+        or any(ws.glob(f"{base_name}.global.*.pe.csv"))
+        or any(ws.glob(f"{base_name}.global.*.oe.csv"))
+    ):
+        return "da"
     if any(ws.glob(f"{base_name}.*.par.csv")):
         return "ies"
     return "glm"
+
+
+def _read_da_cycle_phi(ws: Path, base_name: str) -> list[dict]:
+    """Parse pestpp-da's per-cycle phi file ``<case>.global.phi.actual.csv``.
+
+    Columns are ``cycle,iteration,mean,standard_deviation,min,max,<reals...>``,
+    with two rows per cycle (iteration 0 = prior, >=1 = post-update). The
+    reported per-cycle phi is the post-update (highest-iteration) ensemble mean.
+    Returns one ``{"cycle", "phi", "phi_std"}`` per cycle in cycle order; ``[]``
+    when the file is absent or malformed.
+    """
+    phi_csv = ws / f"{base_name}.global.phi.actual.csv"
+    if not phi_csv.exists():
+        return []
+    try:
+        df = pd.read_csv(phi_csv)
+    except (OSError, pd.errors.ParserError):
+        return []
+    if "cycle" not in df.columns or "mean" not in df.columns:
+        return []
+    cycles: list[dict] = []
+    for cycle, group in df.groupby("cycle", sort=True):
+        if "iteration" in group.columns:
+            group = group.sort_values("iteration")
+        row = group.iloc[-1]
+        mean = row["mean"]
+        std = (
+            row["standard_deviation"]
+            if "standard_deviation" in df.columns
+            else None
+        )
+        cycles.append(
+            {
+                "cycle": int(cycle),
+                "phi": float(mean) if pd.notna(mean) else None,
+                "phi_std": float(std) if std is not None and pd.notna(std) else None,
+            }
+        )
+    return cycles
+
+
+def _read_da_parameter_ensemble(ws: Path, base_name: str) -> dict[str, dict]:
+    """Posterior parameter statistics from the final pestpp-da cycle ensemble.
+
+    pestpp-da writes ``<case>.global.<cycle>.pe.csv`` (columns ``real_name``
+    then the parameter names, with a ``base`` row alongside the realisations).
+    The highest cycle's file is the posterior; the ``base`` row is excluded.
+    """
+    pe_csv = _latest_ensemble_file(ws, base_name, "pe")
+    if pe_csv is None:
+        return {}
+    return _parameter_ensemble_stats(pe_csv, drop_base=True)
+
+
+def _latest_da_residual_file(ws: Path, base_name: str) -> Path | None:
+    """Return the highest cycle/iteration pestpp-da ``<case>.<c>.<i>.base.rei``."""
+    pattern = re.compile(r"\.(\d+)\.(\d+)\.base\.rei$")
+    files = []
+    for p in ws.glob(f"{base_name}.*.base.rei"):
+        m = pattern.search(p.name)
+        if m is not None:
+            files.append(((int(m.group(1)), int(m.group(2))), p))
+    if not files:
+        return None
+    return max(files, key=lambda t: t[0])[1]
 
 
 def _pestpp_progress(ws: Path, base_name: str, engine: str) -> dict:
@@ -3080,6 +3171,81 @@ def _impl_summarise_calibration(
     }
 
 
+def _impl_summarise_da(
+    model: str,
+    pst_file: str,
+    max_residuals: int = 500,
+) -> dict:
+    """Summarise a pestpp-da sequential assimilation run.
+
+    Reads the artifacts pestpp-da v5.2.16 leaves behind: the per-cycle phi file
+    ``<case>.global.phi.actual.csv`` (post-update ensemble-mean phi per cycle),
+    the final-cycle parameter ensemble ``<case>.global.<cycle>.pe.csv``
+    (posterior ``mean``/``std``/``min``/``max`` per parameter, excluding the
+    ``base`` row), and the latest base residual file
+    ``<case>.<cycle>.<iter>.base.rei`` (per-cycle residuals — the observed
+    values are the cycle-table values for that cycle).
+
+    ``residuals`` is capped at ``max_residuals``; the full table is written to
+    ``<model>_da_residuals.csv`` and ``residual_statistics`` is computed over
+    all observations.
+
+    Parameters
+    ----------
+    model:
+        Registered model name.
+    pst_file:
+        Path to the DA-ready PST control file used for the run.
+    max_residuals:
+        Cap on the ``residuals`` list returned in the response.
+    """
+    ws = resolve_workspace(model)
+    pst_path = _resolve_pst_path(model, pst_file)
+    if not pst_path.exists():
+        raise FileNotFoundError(f"PST control file not found: {pst_path}")
+    base_name = pst_path.stem
+
+    cycles = _read_da_cycle_phi(ws, base_name)
+    final = cycles[-1] if cycles else None
+    parameter_ensemble = _read_da_parameter_ensemble(ws, base_name)
+
+    residual_stats: dict = {
+        "rmse": None,
+        "bias": None,
+        "r_squared": None,
+        "n_observations": 0,
+    }
+    residuals: list[dict] = []
+    rei_path = _latest_da_residual_file(ws, base_name)
+    if rei_path is not None:
+        res_df = pyemu.pst.pst_utils.read_resfile(str(rei_path))
+        residual_stats = _compute_residual_stats(res_df)
+        residuals = (
+            res_df[["name", "measured", "modelled", "residual", "weight"]]
+            .rename(columns={"name": "obs_name"})
+            .astype({"measured": float, "modelled": float, "residual": float, "weight": float})
+            .to_dict("records")
+        )
+
+    residuals_csv = ws / f"{model}_da_residuals.csv"
+    if residuals:
+        pd.DataFrame(residuals).to_csv(residuals_csv, index=False)
+
+    return {
+        "model": model,
+        "pst_file": str(pst_path),
+        "engine": "da",
+        "cycles": [{"cycle": c["cycle"], "phi": c["phi"]} for c in cycles],
+        "final_phi_mean": final["phi"] if final else None,
+        "final_phi_std": final["phi_std"] if final else None,
+        "parameter_ensemble": parameter_ensemble,
+        "residual_statistics": residual_stats,
+        "residuals": residuals[:max_residuals],
+        "residuals_csv": str(residuals_csv),
+        "n_residuals_total": len(residuals),
+    }
+
+
 def _impl_run_ies_uncertainty(
     model: str,
     pst_file: str,
@@ -3488,6 +3654,33 @@ def register(mcp: FastMCP) -> None:
                 "OUTPUT_FILE_MISSING",
                 str(exc),
                 "Run pestpp-glm or pestpp-ies first.",
+            )
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def summarise_da(
+        model: str,
+        pst_file: str,
+        max_residuals: int = 500,
+    ) -> dict:
+        """Summarise a pestpp-da sequential assimilation run.
+
+        Reports per-cycle phi (the post-update ensemble mean from
+        ``<case>.global.phi.actual.csv``), the final-cycle phi mean/std, the
+        posterior parameter statistics (``mean``/``std``/``min``/``max`` from
+        the final ``<case>.global.<cycle>.pe.csv``, excluding the ``base``
+        row), and residuals from the latest per-cycle base ``.rei`` (capped at
+        ``max_residuals``; the full table is written to CSV)."""
+        try:
+            return _impl_summarise_da(model, pst_file, max_residuals)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err(
+                "OUTPUT_FILE_MISSING",
+                str(exc),
+                "Run pestpp-da (run_pestpp_da) first.",
             )
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))

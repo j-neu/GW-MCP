@@ -27,8 +27,10 @@ from groundwater_mcp.tools.builder import (
     _impl_set_simulation,
 )
 from groundwater_mcp.tools.calibration import (
+    _detect_pestpp_engine,
     _impl_setup_da_control,
     _impl_run_pestpp_da,
+    _impl_summarise_da,
     _write_cycle_table,
 )
 from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
@@ -384,6 +386,100 @@ def test_setup_da_control_rejects_conflicting_prior_specs(tmp_path):
             prior_ensemble={"k": [3.0, 4.0]},
             prior_std=0.2,
         )
+
+
+# ---------------------------------------------------------------------------
+# summarise_da — engine detection + DA cycle / posterior outputs
+# ---------------------------------------------------------------------------
+
+
+def _write_da_outputs(ws: Path, case: str) -> None:
+    """Synthesise the artifact set ``pestpp-da`` leaves after a 2-cycle run."""
+    # final-cycle phi (the same file run_pestpp_da reads)
+    (ws / f"{case}.phi.actual.csv").write_text(
+        "iteration,total_runs,mean,standard_deviation,min,max,0,1,base\n"
+        "0,5,0.41,0.42,0.06,1.13,0.33,0.06,0.36\n"
+        "1,42,0.28,0.31,0.04,0.90,0.22,0.04,0.28\n"
+    )
+    # per-cycle phi: two rows per cycle (iteration 0 = prior, 1 = post-update)
+    (ws / f"{case}.global.phi.actual.csv").write_text(
+        "cycle,iteration,mean,standard_deviation,min,max,0,1,base\n"
+        "0,0,4e+59,5.47e+59,0.008,1e+60,1e+60,0.008,0.07\n"
+        "0,1,0.25,0.30,0.008,0.80,0.21,0.008,0.07\n"
+        "1,0,0.41,0.42,0.06,1.13,0.33,0.06,0.36\n"
+        "1,1,0.28,0.31,0.04,0.90,0.22,0.04,0.28\n"
+    )
+    # posterior parameter ensemble per cycle: 3 realisations + a base row that
+    # is not a realisation and must not enter the posterior statistics
+    for cycle, head in ((0, 7.5), (1, 8.5)):
+        (ws / f"{case}.global.{cycle}.pe.csv").write_text(
+            "real_name,k,h_0_1\n"
+            f"0,1.0,{head}\n"
+            f"1,2.0,{head}\n"
+            f"2,3.0,{head}\n"
+            f"base,9.0,{head}\n"
+        )
+    # a per-cycle iteration par.csv the real run leaves behind — without the DA
+    # check preceding the IES check this would read as an IES run
+    (ws / f"{case}.0.par.csv").write_text("real_name,k\n0,1.0\n1,2.0\n")
+    # latest base residuals (cycle 1, iteration 1)
+    (ws / f"{case}.1.1.base.rei").write_text(
+        " MODEL OUTPUTS AT END OF OPTIMISATION ITERATION NO. 1:-\n\n\n"
+        " Name        Group      Measured      Modelled      Residual      Weight\n"
+        " s1          head       10.0          9.0           1.0           1.0\n"
+        " s2          head       20.0          18.0          2.0           1.0\n"
+    )
+
+
+def _da_summary_workspace(tmp_path: Path, name: str) -> tuple[str, Path, str]:
+    """A DA-ready model plus the synthesised pestpp-da output artifacts."""
+    model = _da_model(tmp_path, name=name)
+    res = _impl_setup_da_control(
+        model,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+    ws = resolve_workspace(model)
+    case = Path(res["pst_file"]).stem
+    _write_da_outputs(ws, case)
+    return model, ws, res["pst_file"]
+
+
+def test_detect_pestpp_engine_returns_da(tmp_path):
+    _, ws, pst_file = _da_summary_workspace(tmp_path, "dadetect")
+    assert _detect_pestpp_engine(ws, Path(pst_file).stem) == "da"
+
+
+def test_summarise_da_reports_per_cycle_phi_and_posterior(tmp_path):
+    model, _ws, pst_file = _da_summary_workspace(tmp_path, "dasum")
+    summary = _impl_summarise_da(model, pst_file)
+
+    assert summary["engine"] == "da"
+    assert [c["cycle"] for c in summary["cycles"]] == [0, 1]
+    # per-cycle phi is the post-update (iteration 1) ensemble mean, never the
+    # 4e59 prior row of cycle 0
+    assert summary["cycles"][0]["phi"] == pytest.approx(0.25)
+    assert summary["cycles"][1]["phi"] == pytest.approx(0.28)
+    assert summary["final_phi_mean"] == pytest.approx(0.28)
+    assert summary["final_phi_std"] == pytest.approx(0.31)
+
+    # posterior statistics come from the final-cycle ensemble; the base row is
+    # excluded (mean would be 3.75 if it were counted)
+    k_stats = summary["parameter_ensemble"]["k"]
+    assert k_stats["mean"] == pytest.approx(2.0)
+    assert k_stats["std"] == pytest.approx(0.816496580927726)
+    assert k_stats["min"] == pytest.approx(1.0)
+    assert k_stats["max"] == pytest.approx(3.0)
+    assert k_stats["n"] == 3
+
+    # residuals come from the latest per-cycle base .rei
+    assert summary["residual_statistics"]["n_observations"] == 2
+    assert summary["residual_statistics"]["rmse"] == pytest.approx(2.5**0.5)
+    assert summary["n_residuals_total"] == 2
+    assert {r["obs_name"] for r in summary["residuals"]} == {"s1", "s2"}
 
 
 # ---------------------------------------------------------------------------

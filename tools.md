@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-69 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+70 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -501,6 +501,7 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 `run_pestpp_da` runs the PESTPP-DA binary against a **DA-ready `.pst`** — build one with `setup_da_control` (its cycle tables and `da_*` options are exactly what the binary expects). `num_reals` is the DA **ensemble size**, written to the `da_num_reals` `++` option; the PEST control `noptmax` is the number of update **iterations per assimilation cycle**, not the ensemble size — the optional `noptmax` overrides it and, when omitted, the PST's own value is preserved. Pass cycle options such as `{"da_observation_cycle_table": "obs_cycle_tbl.csv", "da_parameter_cycle_table": "par_cycle_tbl.csv"}` (or a `.pst` that already carries `da_*` options). PEST++-DA recognises `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states` and `da_noptmax_schedule`; there is **no** `da_cycle` / `da_obs_cycle_table` / `da_ensemble`, and an unrecognised `++` arg is a fatal parse error.
 
 | `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
+| `summarise_da` | `model: str`, `pst_file: str`, `max_residuals: int = 500` | Per-cycle phi table (post-update ensemble mean from `<case>.global.phi.actual.csv`), final-cycle phi mean/std, posterior parameter statistics (`mean`/`std`/`min`/`max` from the final `<case>.global.<cycle>.pe.csv`, excluding the `base` row), and residuals from the latest per-cycle base `.rei` (`residuals` capped at `max_residuals`, full table to CSV) |
 | `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
 | `check_parameter_sensitivity` | `model: str`, `parameters: dict[str, float]`, `template_files: list[str]`, `delta: float = 0.1` | Per-parameter sensitivity (mean relative change of the simulated observations) over n+1 forward runs (7f-H3.1) |
 | `calibrate` | `model: str`, `par_data: dict`, `template_files: list[str]`, `time_budget_minutes: float = 30.0`, `noptmax: int = 10`, `num_reals: int = 50` | Chosen method + rationale + the run result (7f-H4.1) |
@@ -518,7 +519,9 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 - assembles a **version-2** `.pst` whose external parameter/observation/model-IO sections carry a `cycle` column, with `da_num_reals`, `da_observation_cycle_table`, `da_parameter_cycle_table` and `da_use_simulated_states`;
 - when `prior_ensemble` (a mapping of parameter name to a list of realisations) or `prior_std` (draw `num_reals` realisations around each parameter's value with that standard deviation — log10 space for `partrans='log'`) is supplied, writes `<model>_da_prior.csv` (rows = realisations, columns = parameters) and sets `da_parameter_ensemble`; the ensemble row count becomes `da_num_reals`. With neither, `pestpp-da` draws the prior internally from the parameter bounds.
 
-`cycles` are DA cycle indices; `obs_cycles` maps a registered site name to `{cycle: observed value}` (a missing cycle is a blank/off cycle). The model must have `NPER=1`/`NSTP=1` — `setup_da_control` returns a clear `INVALID_INPUT` error otherwise. Run the assimilation with `run_pestpp_da`, then `summarise_calibration`.
+`cycles` are DA cycle indices; `obs_cycles` maps a registered site name to `{cycle: observed value}` (a missing cycle is a blank/off cycle). The model must have `NPER=1`/`NSTP=1` — `setup_da_control` returns a clear `INVALID_INPUT` error otherwise. Run the assimilation with `run_pestpp_da`, then `summarise_da`.
+
+**Reading DA outputs — `summarise_da`:** pestpp-da v5.2.16 writes a per-cycle phi file `<case>.global.phi.actual.csv` (`cycle,iteration,mean,standard_deviation,min,max,<reals...>`, two rows per cycle — iteration 0 = prior, ≥1 = post-update), a final-cycle parameter ensemble `<case>.global.<cycle>.pe.csv` (`real_name` column plus one column per parameter, with a `base` row alongside the realisations), and per-cycle base residual files `<case>.<cycle>.<iter>.base.rei`. `summarise_da` reports the **post-update** ensemble-mean phi for each cycle (never the cycle-0 prior), the final cycle's phi mean/std, posterior parameter statistics (the `base` row excluded — it is not an ensemble member), and residuals from the highest cycle/iteration `.rei` (whose observed values are that cycle's cycle-table values). `summarise_calibration` does **not** summarise DA runs; use `summarise_da`.
 
 `summarise_calibration` returns a **verdict** (7f-H4.2): `improved` (phi
 reduction versus the previous run — the prior phi is stored per model),
