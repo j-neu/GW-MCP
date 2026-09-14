@@ -2811,7 +2811,7 @@ def _impl_run_pestpp_glm(
 def _impl_run_pestpp_da(
     model: str,
     pst_file: str,
-    num_reals: int = 50,
+    num_reals: int | None = None,
     num_workers: int = 1,
     da_options: dict | None = None,
     noptmax: int | None = None,
@@ -2819,7 +2819,10 @@ def _impl_run_pestpp_da(
     """Run PESTPP-DA (generalized sequential/batch data assimilation).
 
     The caller supplies a DA-ready PST. The ensemble size is the
-    ``da_num_reals`` ``++`` option (written from ``num_reals``); the PEST
+    ``da_num_reals`` ``++`` option; when ``num_reals`` is given it is written
+    to that option, and when it is omitted the PST's existing ``da_num_reals``
+    is preserved (mirroring the ``noptmax`` handling) so a
+    ``setup_da_control(num_reals=N)`` PST is not silently resized. The PEST
     control ``noptmax`` is the number of update *iterations per assimilation
     cycle*, not the ensemble size — ``0`` performs a single (non-iterative)
     update per cycle, the standard ensemble-Kalman case. When ``noptmax`` is
@@ -2833,7 +2836,8 @@ def _impl_run_pestpp_da(
     pst_file:
         Path to the PST control file.
     num_reals:
-        Ensemble size, written to ``da_num_reals``.
+        Ensemble size, written to ``da_num_reals``. ``None`` leaves the PST's
+        existing ``da_num_reals`` unchanged.
     num_workers:
         Number of parallel workers (see run_pestpp_glm note on parallelism).
     da_options:
@@ -2861,10 +2865,16 @@ def _impl_run_pestpp_da(
     pst = pyemu.Pst(str(pst_path))
     if noptmax is not None:
         pst.control_data.noptmax = int(noptmax)
-    pst.pestpp_options["da_num_reals"] = int(num_reals)
+    if num_reals is not None:
+        pst.pestpp_options["da_num_reals"] = int(num_reals)
     for key, value in (da_options or {}).items():
         pst.pestpp_options[key] = value
     pst.write(str(pst_path))
+
+    # Report the ensemble size the run will actually use: the value just set, or
+    # the PST's own preserved da_num_reals.
+    effective_reals = pst.pestpp_options.get("da_num_reals")
+    effective_reals = int(effective_reals) if effective_reals is not None else None
 
     result = subprocess.run(
         [exe, pst_path.name],
@@ -2897,7 +2907,7 @@ def _impl_run_pestpp_da(
         "final_phi_mean": final_phi_mean,
         "final_phi_std": final_phi_std,
         "cycles": cycles,
-        "num_reals": num_reals,
+        "num_reals": effective_reals,
         "noptmax": int(pst.control_data.noptmax),
         "stdout": result.stdout[-3000:] if result.stdout else "",
         "stderr": result.stderr[-1000:] if result.stderr else "",
@@ -3619,7 +3629,7 @@ def register(mcp: FastMCP) -> None:
     def run_pestpp_da(
         model: str,
         pst_file: str,
-        num_reals: int = 50,
+        num_reals: int | None = None,
         num_workers: int = 1,
         da_options: dict | None = None,
         noptmax: int | None = None,
@@ -3631,9 +3641,11 @@ def register(mcp: FastMCP) -> None:
         "da_parameter_cycle_table": "par_cycle_tbl.csv",
         "da_weight_cycle_table": "weight_cycle_tbl.csv"}``) or a PST already
         carrying ``da_*`` options. ``num_reals`` is the ensemble size (written
-        to ``da_num_reals``); the optional ``noptmax`` sets the number of update
-        iterations per assimilation cycle (0 = a single standard Kalman update)
-        and preserves the PST's own value when omitted."""
+        to ``da_num_reals``); when omitted the PST's own ``da_num_reals`` is
+        preserved (so a ``setup_da_control(num_reals=N)`` PST keeps N). The
+        optional ``noptmax`` sets the number of update iterations per
+        assimilation cycle (0 = a single standard Kalman update) and preserves
+        the PST's own value when omitted."""
         try:
             return _impl_run_pestpp_da(
                 model, pst_file, num_reals, num_workers, da_options, noptmax

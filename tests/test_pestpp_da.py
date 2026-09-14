@@ -114,6 +114,34 @@ def test_run_pestpp_da_noptmax_is_not_ensemble_size(tmp_path, monkeypatch):
     assert str(pst.pestpp_options["da_num_reals"]) == "25"
 
 
+def test_run_pestpp_da_omitted_num_reals_preserves_pst_ensemble(tmp_path, monkeypatch):
+    """An omitted num_reals must preserve the DA-ready PST's da_num_reals.
+
+    Regression (Task 5): the default used to be 50, silently clobbering the
+    ensemble size a setup_da_control(num_reals=N) PST carried, even when no
+    prior file capped the run.
+    """
+    name, pst_file = _model_with_pst(tmp_path, "dapst4")
+    pst = pyemu.Pst(str(pst_file))
+    pst.pestpp_options["da_num_reals"] = 6
+    pst.write(str(pst_file))
+
+    from groundwater_mcp.tools import calibration as cal
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(cal.subprocess, "run", lambda *a, **k: _Result())
+
+    result = _impl_run_pestpp_da(name, str(pst_file))
+
+    pst_after = pyemu.Pst(str(pst_file))
+    assert str(pst_after.pestpp_options["da_num_reals"]) == "6"
+    assert result["num_reals"] == 6
+
+
 def test_run_pestpp_da_missing_pst_raises(tmp_path):
     name, _ = _model_with_pst(tmp_path, "dapst2")
     with pytest.raises(FileNotFoundError):
