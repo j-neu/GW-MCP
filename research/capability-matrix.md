@@ -86,7 +86,7 @@ templates, `gwmcp://models/{model}/{lst,pst,files}`, expose the listing
 file, PEST control file, and workspace file listing as readable URIs instead
 of round-tripping through a tool call (C7) — these register as templates
 (`mcp.list_resource_templates()`), not static resources, since models are
-created at runtime. → 69 tools, +2 prompts, +3 resource templates. No
+created at runtime. → 70 tools, +2 prompts, +3 resource templates. No
 capability-coverage rows changed. All of 7e Tier C is now done except the
 `[human]` closed-book verification on C1/C6/C8 (needs a live agent session).
 **7e-A2 (2026-08-17): automated calibration setup.** `setup_calibration`

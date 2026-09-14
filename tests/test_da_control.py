@@ -9,12 +9,16 @@ included when both binaries are installed.
 
 from __future__ import annotations
 
+import asyncio
 import csv
+import json
 import subprocess
 from pathlib import Path
 
 import pyemu
 import pytest
+
+from groundwater_mcp.server import mcp
 
 from groundwater_mcp.tools.builder import (
     _impl_add_boundary_package,
@@ -480,6 +484,44 @@ def test_summarise_da_reports_per_cycle_phi_and_posterior(tmp_path):
     assert summary["residual_statistics"]["rmse"] == pytest.approx(2.5**0.5)
     assert summary["n_residuals_total"] == 2
     assert {r["obs_name"] for r in summary["residuals"]} == {"s1", "s2"}
+
+
+def test_summarise_da_missing_run_outputs_fails_loudly(tmp_path):
+    """A PST with no DA run outputs must error, not return an empty success."""
+    model = _da_model(tmp_path, name="danotrun")
+    res = _impl_setup_da_control(
+        model,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+
+    # no <case>.global.phi.actual.csv and no <case>.global.<cycle>.pe.csv
+    with pytest.raises(FileNotFoundError, match="run_pestpp_da"):
+        _impl_summarise_da(model, res["pst_file"])
+
+    # the tool envelope reports the missing output, never a success dict
+    payload = json.loads(
+        asyncio.run(
+            mcp.call_tool("summarise_da", {"model": model, "pst_file": res["pst_file"]})
+        )[0].text
+    )
+    assert payload["error"] is True
+    assert payload["code"] == "OUTPUT_FILE_MISSING"
+
+
+def test_summarise_da_without_ensemble_but_with_cycle_phi(tmp_path):
+    """A partial (no-update-style) run is summarised, not called 'not run'."""
+    model, ws, pst_file = _da_summary_workspace(tmp_path, "daphi")
+    case = Path(pst_file).stem
+    for pe in ws.glob(f"{case}.global.*.pe.csv"):
+        pe.unlink()
+    summary = _impl_summarise_da(model, pst_file)
+    assert [c["cycle"] for c in summary["cycles"]] == [0, 1]
+    assert summary["final_phi_mean"] == pytest.approx(0.28)
+    assert summary["parameter_ensemble"] == {}
 
 
 # ---------------------------------------------------------------------------

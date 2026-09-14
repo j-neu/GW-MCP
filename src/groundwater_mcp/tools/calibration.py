@@ -3190,6 +3190,10 @@ def _impl_summarise_da(
     ``<model>_da_residuals.csv`` and ``residual_statistics`` is computed over
     all observations.
 
+    Raises ``FileNotFoundError`` when no DA run outputs exist at all (no
+    per-cycle phi file and no per-cycle parameter ensemble) — a missing run
+    must fail loudly rather than return an empty success envelope.
+
     Parameters
     ----------
     model:
@@ -3204,6 +3208,23 @@ def _impl_summarise_da(
     if not pst_path.exists():
         raise FileNotFoundError(f"PST control file not found: {pst_path}")
     base_name = pst_path.stem
+
+    # No run outputs at all means pestpp-da was never run (or died before
+    # writing its cycle artifacts). Fail loudly (7e-B2) rather than returning a
+    # success envelope with empty cycles/residuals that an agent can misread as
+    # "ran with zero observations". A legitimate noptmax=0 no-update run still
+    # writes the per-cycle phi and ensemble files, so it is not caught here.
+    has_cycle_phi = (ws / f"{base_name}.global.phi.actual.csv").exists()
+    has_parameter_ensemble = any(ws.glob(f"{base_name}.global.*.pe.csv"))
+    if not has_cycle_phi and not has_parameter_ensemble:
+        raise FileNotFoundError(
+            f"No pestpp-da run outputs found in {ws}: neither "
+            f"{base_name}.global.phi.actual.csv nor a per-cycle parameter "
+            f"ensemble ({base_name}.global.<cycle>.pe.csv) exists. The "
+            "assimilation has not run (or died before writing its outputs) — "
+            "check the run log (the .pst stdout/stderr), then run it with "
+            "run_pestpp_da."
+        )
 
     cycles = _read_da_cycle_phi(ws, base_name)
     final = cycles[-1] if cycles else None
