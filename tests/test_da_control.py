@@ -522,7 +522,32 @@ def test_setup_da_control_prior_ensemble_end_to_end(tmp_path):
     rec_files = list(ws.glob("*.rec"))
     assert rec_files, "pestpp-da did not write a .rec file"
     rec = rec_files[0].read_text().lower()
-    assert Path(res["prior_ensemble_file"]).name.lower() in rec
+
+    # pestpp-da echoes the whole control file into .rec, so the filename alone
+    # proves nothing. Require the explicit load line...
+    prior_name = Path(res["prior_ensemble_file"]).name.lower()
+    assert f"loading par ensemble from csv file {prior_name}" in rec
+
+    # ...and prove the ensemble it actually used carries the supplied values
+    # (an ignored option would make pestpp-da draw internally instead).
+    pst = pyemu.Pst(res["pst_file"])
+    case = Path(res["pst_file"]).stem
+    used_pe = pyemu.ParameterEnsemble.from_csv(pst, ws / f"{case}.global.prior.pe.csv")
+    supplied_pe = pyemu.ParameterEnsemble.from_csv(pst, res["prior_ensemble_file"])
+    assert list(used_pe.columns) == list(supplied_pe.columns)
+    supplied_k = [float(v) for v in supplied_pe.loc[:, "k"].values]
+    used_k = {
+        str(r): float(v)
+        for r, v in zip(used_pe.index, used_pe.loc[:, "k"].values)
+    }
+    used_reals = [r for r in used_k if r != "base"]
+    assert used_reals, "pestpp-da wrote no prior realisations"
+    for real in used_reals:
+        value = used_k[real]
+        assert any(abs(value - s) <= 1e-4 * max(1.0, abs(s)) for s in supplied_k), (
+            f"prior realisation {real!r} k={value} is not one of the supplied "
+            f"values {supplied_k}"
+        )
 
 
 @requires_mf6
