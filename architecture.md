@@ -6,7 +6,7 @@ An open-source Python MCP server for AI-assisted groundwater modelling with MODF
 
 ## Overview
 
-The server exposes 68 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 69 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -58,6 +58,8 @@ Reads binary output files (`.hds`, `.cbb`) via `flopy.utils`, computes derived q
 
 ### calibration
 Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter estimation and uncertainty analysis. Invoked as a subprocess with file-based I/O. Returns phi progress, residual statistics, and predictive uncertainty bounds.
+
+DA-ready control files (2026-09-14): `setup_da_control` emits the PEST++ **version-2** control file that `pestpp-da` v5.2.16 needs for sequential ensemble data assimilation. It reuses the `setup_calibration` NPF-`k` rewire/template path, rewires the IC `strt` array to an external array, and generates a state-augmented IC template with one state parameter per registered observation cell (sharing the observation name, so `da_use_simulated_states True` carries each cycle's simulated heads into the next cycle's IC). It writes the observation/parameter cycle tables, sets `da_num_reals`/`da_observation_cycle_table`/`da_parameter_cycle_table`/`da_use_simulated_states`, and requires `NPER=1`/`NSTP=1` so the canonical MF6-OBS-CSV instruction file reads the end-of-cycle value. `run_pestpp_da` executes it.
 
 Zoned K multiplier calibration (2026-09-11): `setup_calibration(scope="zones")` auto-derives zones from groups of equal positive per-layer `npf:k` values and turns each zone into a dimensionless multiplier parameter (`<prefix>_z<index>`). It writes `<gwf>_k_base.dat`, `<gwf>_k_zone.dat` and `<gwf>_k_mult.dat.tpl` and forces a forward wrapper that computes `k = base_k × multiplier[zone]` before each MODFLOW 6 run, so the base spatial K pattern is preserved and only zone magnitudes are calibrated. This closes the neversink `setup_calibration` uniform-only (whole-scope per-layer replacement) parameterisation gap.
 

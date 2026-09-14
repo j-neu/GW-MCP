@@ -25,7 +25,7 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (66 total, plus 2 MCP prompts and 3 MCP resource templates)
+## Tools (69 total, plus 2 MCP prompts and 3 MCP resource templates)
 
 | Module | Tools |
 |---|---|
@@ -35,10 +35,10 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 | **model builder** | `create_model`, `adopt_model`, `set_simulation`, `set_model_crs`, `add_dis_package`, `add_disv_package`, `add_disu_package`, `add_npf_package`, `add_ic_package`, `add_sto_package`, `add_boundary_package`, `add_oc_package`, `flush_model`, `summarise_model`, `model_status`, `list_model_files`, `list_models`, `delete_model` |
 | **runner** | `check_model`, `run_simulation`, `get_run_log`, `diagnose_convergence`, `validate_model`, `start_run`, `get_job_status`, `cancel_job` |
 | **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `diagnose_water_balance`, `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `read_simulated_observations`, `compare_to_observed`, `plot_heads_map`, `plot_cross_section` |
-| **calibration (PEST++)** | `setup_calibration`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `run_pestpp_da`, `summarise_calibration`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
+| **calibration (PEST++)** | `setup_calibration`, `setup_da_control`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `run_pestpp_da`, `summarise_calibration`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
 | **spec / provenance** | `apply_model_spec`, `export_model_spec`, `export_reproducible_script`, `describe_model`, `export_model_report`, `clone_model`, `compare_scenarios` |
 
-`setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. This zoned capability adds no new tools: the total above was corrected to 66 in this change (it had been stale at 63) and reflects earlier 7e-C additions, not this feature.
+`setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. `setup_da_control` builds a DA-ready PEST++ **version-2** control file (cycle tables + `da_*` options, IC state parameterisation) for sequential ensemble data assimilation with `run_pestpp_da`; the zoned and DA capabilities add no extra tools beyond `setup_da_control`, and the total above reflects the current registration.
 
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 

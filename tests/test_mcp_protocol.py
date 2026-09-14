@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 68
+_EXPECTED_TOOL_COUNT = 69
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -122,6 +122,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
     ],
     "calibration": [
         "setup_calibration",
+        "setup_da_control",
         "setup_pest_control",
         "start_calibration",
         "run_pestpp_glm",

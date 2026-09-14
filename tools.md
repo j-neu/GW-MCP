@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-68 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+69 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -408,6 +408,7 @@ Set up and run PEST++ parameter estimation via pyEMU.
 | Tool | Inputs | Returns |
 |---|---|---|
 | `setup_calibration` | `model: str`, `parameterisation: dict`, `obs_source: str = "model"`, `noptmax: int = 10` | The generated PEST interface: `.pst`, template, instruction file, external array, forward wrapper, parameter table |
+| `setup_da_control` | `model: str`, `parameterisation: dict`, `cycles: list[int]`, `obs_cycles: dict`, `obs_weights: dict \| None = None`, `par_cycles: dict \| None = None`, `num_reals: int = 50`, `noptmax: int = 1`, `use_simulated_states: bool = True`, `da_options: dict \| None = None` | The generated DA-ready v2 PEST interface: `.pst`, K template/target, IC template, cycle tables, state-parameter count, model command |
 | `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"` | Path to generated `.pst` control file |
 | `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" = "glm"`, `num_reals: int = 50` | `{ model, job_id, kind, pst_file, status: "running" }` — starts PEST++ in a background thread with live phi progress (7e-A3) |
 
@@ -497,11 +498,26 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 | `run_pestpp_ies` | `model: str`, `pst_file: str`, `num_reals: int = 50`, `num_workers: int = 1` | `{ final_phi_mean: float, final_phi_std: float, iterations: int }` |
 | `run_pestpp_da` | `model: str`, `pst_file: str`, `num_reals: int = 50`, `num_workers: int = 1`, `da_options: dict \| None = None`, `noptmax: int \| None = None` | `{ converged: bool, final_phi_mean: float, final_phi_std: float, cycles: int, num_reals: int, noptmax: int }` |
 
-`run_pestpp_da` runs the PESTPP-DA binary against a **caller-supplied DA-ready `.pst`**. `num_reals` is the DA **ensemble size**, written to the `da_num_reals` `++` option; the PEST control `noptmax` is the number of update **iterations per assimilation cycle** (`0` = a single standard Kalman update), not the ensemble size — the optional `noptmax` overrides it and, when omitted, the PST's own value is preserved. Pass cycle options such as `{"da_observation_cycle_table": "obs_cycle_tbl.csv", "da_parameter_cycle_table": "par_cycle_tbl.csv", "da_weight_cycle_table": "weight_cycle_tbl.csv"}` (or a `.pst` that already carries `da_*` options). PEST++-DA recognises `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states` and `da_noptmax_schedule`; there is **no** `da_cycle` / `da_obs_cycle_table` / `da_ensemble`, and an unrecognised `++` arg is a fatal parse error. Building the DA-ready PST (observation/parameter/weight cycle tables and ensemble files) is the caller's responsibility; this tool exposes the engine.
+`run_pestpp_da` runs the PESTPP-DA binary against a **DA-ready `.pst`** — build one with `setup_da_control` (its cycle tables and `da_*` options are exactly what the binary expects). `num_reals` is the DA **ensemble size**, written to the `da_num_reals` `++` option; the PEST control `noptmax` is the number of update **iterations per assimilation cycle**, not the ensemble size — the optional `noptmax` overrides it and, when omitted, the PST's own value is preserved. Pass cycle options such as `{"da_observation_cycle_table": "obs_cycle_tbl.csv", "da_parameter_cycle_table": "par_cycle_tbl.csv"}` (or a `.pst` that already carries `da_*` options). PEST++-DA recognises `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states` and `da_noptmax_schedule`; there is **no** `da_cycle` / `da_obs_cycle_table` / `da_ensemble`, and an unrecognised `++` arg is a fatal parse error.
+
 | `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
 | `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
 | `check_parameter_sensitivity` | `model: str`, `parameters: dict[str, float]`, `template_files: list[str]`, `delta: float = 0.1` | Per-parameter sensitivity (mean relative change of the simulated observations) over n+1 forward runs (7f-H3.1) |
 | `calibrate` | `model: str`, `par_data: dict`, `template_files: list[str]`, `time_budget_minutes: float = 30.0`, `noptmax: int = 10`, `num_reals: int = 50` | Chosen method + rationale + the run result (7f-H4.1) |
+
+**Sequential-DA semantics on the installed `pestpp-da` v5.2.16:** `noptmax` is iterations per cycle and **`0` performs no update** (base values only, one realisation) — use `noptmax >= 1` for an ensemble-Kalman update (`setup_da_control` defaults to `1`). `da_num_reals` overrides `ies_num_reals`. `da_weight_cycle_table` is accepted but **ignored** in this build, so observation weights must be non-zero in `obs_data.csv`. A DA run needs one MODFLOW 6 stress period / one time step per cycle (`NPER=1`, `NSTP=1`).
+
+### DA-ready control file — `setup_da_control`
+
+`setup_da_control` emits the whole DA interface in one call (7f-DA):
+
+- rewires NPF `k` to an external `OPEN/CLOSE` array and generates the K template (reusing the `setup_calibration` machinery);
+- rewires the IC `strt` array and generates a **state-augmented IC template** — one state parameter per registered observation cell, sharing the observation name so `da_use_simulated_states True` carries each cycle's simulated heads into the next cycle's IC;
+- generates the MF6-OBS-CSV instruction file (the canonical `l1 ~,~ !name! …` pif reads the first data row, which is the end-of-cycle value because there is one time step per cycle);
+- writes the observation cycle table (`obs_cycles`) and, when `par_cycles` supplies fixed forcing values, a populated parameter cycle table (a `perlen` entry templates the TDIS stress-period length);
+- assembles a **version-2** `.pst` whose external parameter/observation/model-IO sections carry a `cycle` column, with `da_num_reals`, `da_observation_cycle_table`, `da_parameter_cycle_table` and `da_use_simulated_states`.
+
+`cycles` are DA cycle indices; `obs_cycles` maps a registered site name to `{cycle: observed value}` (a missing cycle is a blank/off cycle). The model must have `NPER=1`/`NSTP=1` — `setup_da_control` returns a clear `INVALID_INPUT` error otherwise. Run the assimilation with `run_pestpp_da`, then `summarise_calibration`.
 
 `summarise_calibration` returns a **verdict** (7f-H4.2): `improved` (phi
 reduction versus the previous run — the prior phi is stored per model),

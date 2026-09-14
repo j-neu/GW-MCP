@@ -86,7 +86,7 @@ templates, `gwmcp://models/{model}/{lst,pst,files}`, expose the listing
 file, PEST control file, and workspace file listing as readable URIs instead
 of round-tripping through a tool call (C7) — these register as templates
 (`mcp.list_resource_templates()`), not static resources, since models are
-created at runtime. → 68 tools, +2 prompts, +3 resource templates. No
+created at runtime. → 69 tools, +2 prompts, +3 resource templates. No
 capability-coverage rows changed. All of 7e Tier C is now done except the
 `[human]` closed-book verification on C1/C6/C8 (needs a live agent session).
 **7e-A2 (2026-08-17): automated calibration setup.** `setup_calibration`
@@ -220,6 +220,7 @@ base run) and rejects unsupported `obs_type` values (e.g. `FLOW`) loudly.
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
 |---|---|---|---|---|
 | PEST++ GLM / IES | covered | `setup_calibration`, `run_pestpp_glm`, `run_pestpp_ies` | | `setup_calibration` emits the whole interface (external-array rewire, wide-token template, ins from the OBS CSV, Windows-safe forward wrapper, safe `.pst` defaults); GLM phi from `.iobj`; `summarise_calibration` auto-detects the engine and summarises IES runs too (2026-08-29) — phi from the `.phi.actual.csv` mean column, parameter estimates from the final ensemble `par.csv` (mean + spread), residuals from `.rei` or the obs ensemble |
+| PEST++ DA (sequential ensemble data assimilation) | covered | `setup_da_control`, `run_pestpp_da` | MF6_EnKF_DISU (Neckartal DE) | `setup_da_control` builds the version-2 `.pst` with cycle tables and `da_*` options: NPF `k` + IC `strt` rewired to external arrays, one state parameter per observed cell (IC template tokens sharing the observation name) carried by `da_use_simulated_states`, non-zero weights in `obs_data.csv`; requires one stress period / one time step per cycle (`NPER=1`/`NSTP=1`). Verified end-to-end on `pestpp-da` v5.2.16 (≥2 cycles, state advance); `noptmax 0` performs **no** update on that build, so the tool defaults to `1` |
 | PEST++ PPU (prediction uncertainty) | covered | `run_ies_uncertainty` | | Ensemble percentiles |
 | PEST++ SEN (sensitivities) | **gap** | — | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_run_sen.pst), neversink_workflow | |
 | PEST++ Pareto / SWP (sweep) | **gap** | — | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_sweep.pst, run_opt.pst) | |
@@ -231,7 +232,7 @@ base run) and rejects unsupported `obs_type` values (e.g. `FLOW`) loudly.
 `run_simulation`, `get_run_log`, `diagnose_convergence`, `validate_model`, `diagnose_water_balance`,
 `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `model_status`, `start_run`,
 `get_job_status`, `cancel_job`, `start_calibration`, `setup_calibration`,
-`setup_pest_control`, `summarise_calibration`, `import_grid_from_shapefile`,
+`setup_da_control`, `setup_pest_control`, `summarise_calibration`, `import_grid_from_shapefile`,
 `assign_top_from_raster`, `assign_k_from_zones`,
 `import_river_from_shapefile`, `search_docs`, `search_tutorials`,
 `get_doc_file`.

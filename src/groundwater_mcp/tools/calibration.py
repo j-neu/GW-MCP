@@ -1781,6 +1781,454 @@ def _impl_setup_calibration(
 
 
 # ---------------------------------------------------------------------------
+# DA-ready control file (7f-DA): cycle tables + da_* options
+# ---------------------------------------------------------------------------
+
+
+def _write_cycle_table(
+    path: Path, names: list[str], cycles: list[int], values: dict
+) -> None:
+    """Write a PEST++-DA cycle table (header = '' then integer cycles)."""
+    lines = ["," + ",".join(str(int(c)) for c in cycles)]
+    for name in names:
+        by_cycle = values.get(name, {})
+        row = [
+            f"{by_cycle[c]:g}" if c in by_cycle and by_cycle[c] is not None else ""
+            for c in cycles
+        ]
+        lines.append(f"{name}," + ",".join(row))
+    path.write_text("\n".join(lines) + "\n")
+
+
+_DA_STATE_TOKEN_WIDTH = 30
+
+
+def _impl_rewire_ic_strt_external(model: str, filename: str | None = None) -> dict:
+    """Rewrite the IC package so ``strt`` is read via ``OPEN/CLOSE <file>``.
+
+    Mirrors :func:`_impl_rewire_npf_k_external`: the current starting-head array
+    is written to the external file (FloPy handles the on-disk write, so the
+    model runs unchanged afterwards) and the IC package reads it. This is the
+    hook the DA state parameters need — each cycle's end-of-cycle heads are
+    carried into the next cycle's IC through this file.
+    """
+    gwf = get_gwf(model)
+    ic = gwf.get_package("ic")
+    if ic is None:
+        raise ValueError(
+            "No IC package found; run add_ic_package before rewiring strt to an "
+            "external array."
+        )
+    filename = filename or f"{gwf.name}_strt.dat"
+    arr = np.asarray(ic.strt.array, dtype=float)
+    ic.strt.set_data({"filename": filename, "data": arr})
+    save_sim(model, gwf.simulation)
+    flush_model(model)
+    return {
+        "model": model,
+        "package": "IC",
+        "keyword": "strt",
+        "external_file": filename,
+        "array": arr,
+        "written": True,
+    }
+
+
+def _da_cell_flat_index(model: str, cellid) -> int:
+    """Flat (C-order) index of a registered observation cell.
+
+    ``import_obs_from_csv`` stores 0-based cell ids: ``(layer, row, col)`` on a
+    DIS grid and ``(layer, node)`` on a DISV grid. The flat index matches the
+    layout of the external IC array the template is written against.
+    """
+    gwf = get_gwf(model)
+    dis = get_dis(gwf)
+    disv = get_disv(gwf)
+    if dis is not None and disv is None:
+        nlay, nrow, ncol = (
+            int(dis.nlay.data),
+            int(dis.nrow.data),
+            int(dis.ncol.data),
+        )
+        parts = [int(v) for v in cellid]
+        if len(parts) != 3:
+            raise ValueError(
+                f"Observation cell {cellid!r} must be (layer, row, col) on a DIS grid."
+            )
+        lay, r, c = parts
+        if not (0 <= lay < nlay and 0 <= r < nrow and 0 <= c < ncol):
+            raise ValueError(f"Observation cell {cellid!r} is out of bounds on the grid.")
+        return lay * (nrow * ncol) + r * ncol + c
+    if disv is not None:
+        nlay, ncpl = int(disv.nlay.data), int(disv.ncpl.data)
+        parts = [int(v) for v in cellid]
+        if len(parts) != 2:
+            raise ValueError(
+                f"Observation cell {cellid!r} must be (layer, node) on a DISV grid."
+            )
+        lay, node = parts
+        if not (0 <= lay < nlay and 0 <= node < ncpl):
+            raise ValueError(f"Observation cell {cellid!r} is out of bounds on the grid.")
+        return lay * ncpl + node
+    raise ValueError(
+        "setup_da_control IC state parameterisation supports DIS and DISV grids "
+        "only; this model has neither."
+    )
+
+
+def _impl_generate_ic_tpl(
+    model: str,
+    state_cells: dict[int, str],
+    ic_base: np.ndarray,
+    target_file: str,
+) -> dict:
+    """Generate the state-augmented IC template.
+
+    One value per line (the external-array layout MODFLOW 6 reads
+    sequentially); cells that host a state parameter carry a wide token named
+    for the state, every other cell keeps its current starting head. The wide
+    token matters: pestpp-da writes full-precision simulated heads into it.
+    """
+    ws = resolve_workspace(model)
+    tpl_path = ws / f"{target_file}.tpl"
+    flat = np.asarray(ic_base, dtype=float).reshape(-1)
+    lines = ["ptf ~"]
+    for idx, value in enumerate(flat):
+        name = state_cells.get(idx)
+        if name is None:
+            lines.append(f"{value:.10g}")
+        else:
+            lines.append("~" + f"{name:^{_DA_STATE_TOKEN_WIDTH}}" + "~")
+    tpl_path.write_text("\n".join(lines) + "\n")
+    return {"tpl_path": str(tpl_path), "target": str(ws / target_file)}
+
+
+def _impl_generate_tdis_tpl(model: str, perlen_name: str) -> dict:
+    """Template the TDIS stress-period length so a cycle table can drive it.
+
+    With ``NPER=1``/``NSTP=1`` there is exactly one stress-period length per DA
+    cycle; the token is named for the fixed forcing parameter.
+    """
+    gwf = get_gwf(model)
+    sim = gwf.simulation
+    tdis = sim.get_package("tdis")
+    if tdis is None:
+        raise ValueError("No TDIS package found; run set_simulation before setup_da_control.")
+    target_file = Path(str(getattr(tdis, "filename", "mfsim.tdis"))).name
+    time_units_attr = getattr(tdis, "time_units", None)
+    time_units = str(time_units_attr.array) if time_units_attr is not None else "days"
+    ws = resolve_workspace(model)
+    tpl_path = ws / f"{target_file}.tpl"
+    text = (
+        "ptf ~\n"
+        "BEGIN options\n"
+        f"  TIME_UNITS  {time_units}\n"
+        "END options\n"
+        "BEGIN dimensions\n"
+        "  NPER  1\n"
+        "END dimensions\n"
+        "BEGIN perioddata\n"
+        f"  ~{perlen_name:^{_TPL_TOKEN_WIDTH}}~  1  1.0\n"
+        "END perioddata\n"
+    )
+    tpl_path.write_text(text)
+    return {"tpl_path": str(tpl_path), "target": str(ws / target_file)}
+
+
+def _impl_setup_da_control(
+    model: str,
+    parameterisation: dict,
+    cycles: list[int],
+    obs_cycles: dict,
+    obs_weights: dict | None = None,
+    par_cycles: dict | None = None,
+    num_reals: int = 50,
+    noptmax: int = 1,
+    use_simulated_states: bool = True,
+    da_options: dict | None = None,
+) -> dict:
+    """Build a DA-ready PEST++ **version 2** control file (7f-DA).
+
+    Reuses the ``setup_calibration`` NPF-``k`` external-array rewire/template
+    machinery, additionally parametrises the IC ``strt`` array as the DA
+    *state* (one state parameter per registered observation site, sharing the
+    observation name so ``da_use_simulated_states`` can carry each cycle's
+    simulated heads into the next cycle), and writes the cycle tables and
+    ``da_*`` options ``pestpp-da`` v5.2.16 accepts.
+
+    ``cycles`` are DA cycle indices; ``obs_cycles`` maps each registered site
+    name to ``{cycle: observed value}``. Sequential DA runs one MODFLOW 6
+    stress period / one time step per cycle, so ``NPER=1``/``NSTP=1`` is
+    required (the canonical MF6-OBS-CSV instruction file reads the first data
+    row, which is the end-of-cycle value). ``par_cycles`` optionally supplies
+    per-cycle values for fixed forcing parameters (a ``perlen`` entry templates
+    the TDIS stress-period length); ``da_options`` are extra ``da_*`` keywords.
+    """
+    ws = resolve_workspace(model)
+
+    # -- validate inputs ---------------------------------------------------
+    if not cycles:
+        raise ValueError("cycles must name at least one DA cycle index.")
+    cycles = [int(c) for c in cycles]
+    if len(set(cycles)) != len(cycles):
+        raise ValueError(f"cycles must be unique, got {cycles}.")
+
+    gwf = get_gwf(model)
+    sim = gwf.simulation
+    tdis = sim.get_package("tdis")
+    if tdis is None:
+        raise ValueError(
+            "set_simulation must be called before setup_da_control so the "
+            "stress-period discretisation is known."
+        )
+    nper = int(np.asarray(tdis.nper.array).item())
+    perioddata = np.asarray(tdis.perioddata.array)
+    nstp = (
+        perioddata["nstp"].astype(int)
+        if perioddata.dtype.names
+        else perioddata.reshape(-1, 3)[:, 1].astype(int)
+    )
+    if nper != 1 or nstp.size != 1 or int(nstp[0]) != 1:
+        raise ValueError(
+            "Sequential PEST++-DA needs one MODFLOW 6 stress period with one "
+            f"time step per cycle (NPER=1, NSTP=1); this model has NPER={nper}, "
+            f"NSTP={nstp.tolist()}. Call set_simulation(model, 1, "
+            "[period_length], [1], ...)."
+        )
+
+    obs_meta = read_meta(model).get("observations")
+    if not obs_meta or not obs_meta.get("sites"):
+        raise ValueError(
+            "setup_da_control requires observation targets registered via "
+            "import_obs_from_csv. No 'observations' entry found in "
+            ".gwmcp_meta.json for this model."
+        )
+    site_entries = list(obs_meta["sites"])
+    site_names = [str(entry["site"]) for entry in site_entries]
+    if len(set(site_names)) != len(site_names):
+        raise ValueError("Registered observation site names are not unique.")
+
+    raw_obs_cycles = obs_cycles
+    obs_cycles = {}
+    for k, vals in (raw_obs_cycles or {}).items():
+        if not isinstance(vals, dict):
+            raise ValueError(
+                f"obs_cycles['{k}'] must map a cycle index to an observed value."
+            )
+        obs_cycles[str(k)] = {
+            int(c): float(v) for c, v in vals.items() if v is not None
+        }
+    missing = [s for s in site_names if s not in obs_cycles]
+    extra = [s for s in obs_cycles if s not in site_names]
+    if missing:
+        raise ValueError(
+            f"obs_cycles is missing registered site(s) {missing}; every "
+            "registered site needs a per-cycle observed-value mapping."
+        )
+    if extra:
+        raise ValueError(
+            f"obs_cycles names site(s) {extra} that are not registered "
+            f"observations ({site_names})."
+        )
+    cycle_set = set(cycles)
+    for site in site_names:
+        bad = [c for c in obs_cycles[site] if int(c) not in cycle_set]
+        if bad:
+            raise ValueError(
+                f"obs_cycles['{site}'] refers to cycle(s) {bad} not in cycles {cycles}."
+            )
+
+    # -- parameters: K rewire + template (reuses the setup_calibration path) --
+    norm = _normalise_parameterisation(model, parameterisation)
+    _restore_or_snapshot_k_base(model)
+    ext_file = _impl_rewire_npf_k_external(model)["external_file"]
+    k_tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
+    k_tpl_path = Path(k_tpl["tpl_path"])
+    k_target = Path(k_tpl["target"])
+    k_initial = {p["name"]: p["initial"] for p in norm["parameters"]}
+    _tpl_substitute(k_tpl_path, k_target, k_initial)
+
+    # -- IC state parameterisation ----------------------------------------
+    name_by_flat: dict[int, str] = {}
+    for entry, site in zip(site_entries, site_names):
+        idx = _da_cell_flat_index(model, entry["cellid"])
+        if idx in name_by_flat:
+            raise ValueError(
+                f"Observation sites {name_by_flat[idx]!r} and {site!r} map to the "
+                "same cell; DA state parameters must be one per cell."
+            )
+        name_by_flat[idx] = site
+    ic_info = _impl_rewire_ic_strt_external(model)
+    ic_base = ic_info["array"]
+    ic_target = Path(ws / ic_info["external_file"])
+    ic_tpl = _impl_generate_ic_tpl(model, name_by_flat, ic_base, ic_info["external_file"])
+    ic_tpl_path = Path(ic_tpl["tpl_path"])
+    ic_initial = {
+        name: float(np.asarray(ic_base).reshape(-1)[idx])
+        for idx, name in name_by_flat.items()
+    }
+    _tpl_substitute(ic_tpl_path, ic_target, ic_initial)
+
+    # -- OBS instruction file (first data row = end-of-cycle value) --------
+    output_csv = str(obs_meta["output_csv"])
+    ins_path = ws / f"{output_csv}.ins"
+    _impl_generate_ins_from_obs_csv(
+        str(ws / output_csv), ins_path=str(ins_path), obs_names=site_names
+    )
+
+    # -- optional per-cycle fixed forcing parameters -----------------------
+    k_param_names = [p["name"] for p in norm["parameters"]]
+    raw_par_cycles = par_cycles
+    par_cycles = {}
+    for k, vals in (raw_par_cycles or {}).items():
+        if not isinstance(vals, dict):
+            raise ValueError(
+                f"par_cycles['{k}'] must map a cycle index to a fixed value."
+            )
+        par_cycles[str(k)] = {
+            int(c): float(v) for c, v in vals.items() if v is not None
+        }
+    forcing_names = [n for n in par_cycles if n not in k_param_names]
+    tdis_tpl = None
+    if forcing_names:
+        if len(forcing_names) != 1:
+            raise ValueError(
+                "A single-time-step DA model has one per-cycle forcing slot "
+                "(the TDIS stress-period length); supply at most one "
+                f"par_cycles parameter outside the K parameterisation, got "
+                f"{forcing_names}."
+            )
+        tdis_tpl = _impl_generate_tdis_tpl(model, forcing_names[0])
+        perlen = par_cycles[forcing_names[0]]
+        initial = next(
+            (float(perlen[c]) for c in cycles if c in perlen and perlen[c] is not None),
+            1.0,
+        )
+        _tpl_substitute(
+            Path(tdis_tpl["tpl_path"]), Path(tdis_tpl["target"]), {forcing_names[0]: initial}
+        )
+
+    # -- assemble the version-2 control file ------------------------------
+    par_names = list(k_param_names) + list(site_names) + list(forcing_names)
+    if len(set(par_names)) != len(par_names):
+        raise ValueError(
+            "DA parameter names collide (K parameter names, observation/state "
+            "names and forcing names must be distinct): "
+            f"{sorted({n for n in par_names if par_names.count(n) > 1})}."
+        )
+
+    pst = pyemu.pst_utils.generic_pst(par_names, site_names)
+
+    for p in norm["parameters"]:
+        name = p["name"]
+        pst.parameter_data.loc[name, "parval1"] = float(p["initial"])
+        pst.parameter_data.loc[name, "parlbnd"] = float(p["lower_bound"])
+        pst.parameter_data.loc[name, "parubnd"] = float(p["upper_bound"])
+        pst.parameter_data.loc[name, "partrans"] = str(p["partrans"])
+        pst.parameter_data.loc[name, "pargp"] = "k"
+    for name in site_names:
+        pst.parameter_data.loc[name, "parval1"] = float(ic_initial[name])
+        pst.parameter_data.loc[name, "parlbnd"] = float(ic_initial[name]) - 1.0e6
+        pst.parameter_data.loc[name, "parubnd"] = float(ic_initial[name]) + 1.0e6
+        pst.parameter_data.loc[name, "partrans"] = "none"
+        pst.parameter_data.loc[name, "pargp"] = "head_state"
+    for name in forcing_names:
+        first = par_cycles[name]
+        pst.parameter_data.loc[name, "parval1"] = next(
+            (float(first[c]) for c in cycles if c in first and first[c] is not None),
+            1.0,
+        )
+        pst.parameter_data.loc[name, "parlbnd"] = 1.0e-8
+        pst.parameter_data.loc[name, "parubnd"] = 1.0e6
+        pst.parameter_data.loc[name, "partrans"] = "fixed"
+        pst.parameter_data.loc[name, "pargp"] = "forcing"
+    pst.parameter_data["cycle"] = -1
+
+    # Observation values come from the cycle table; weights must be non-zero in
+    # obs_data.csv (da_weight_cycle_table is ignored by pestpp-da v5.2.16).
+    weights = {str(k): float(v) for k, v in (obs_weights or {}).items()}
+    unknown_w = [k for k in weights if k not in site_names]
+    if unknown_w:
+        raise ValueError(
+            f"obs_weights names unknown observation(s) {unknown_w}; registered "
+            f"sites are {site_names}."
+        )
+    pst.observation_data["obsval"] = 0.0
+    pst.observation_data["weight"] = [weights.get(n, 1.0) for n in site_names]
+    pst.observation_data["obgnme"] = str(obs_meta.get("type", "HEAD")).lower()
+    pst.observation_data["cycle"] = -1
+    pst.observation_data["state_par_link"] = ""
+
+    # Model IO sections carry the DA cycle column (all-cycle = -1).
+    in_files = [
+        [k_tpl_path.name, k_target.name, -1],
+        [ic_tpl_path.name, ic_target.name, -1],
+    ]
+    if tdis_tpl is not None:
+        in_files.append([Path(tdis_tpl["tpl_path"]).name, Path(tdis_tpl["target"]).name, -1])
+    pst.model_input_data = pd.DataFrame(
+        in_files, columns=["pest_file", "model_file", "cycle"]
+    )
+    pst.model_input_data.index = [row[0] for row in in_files]
+    pst.model_output_data = pd.DataFrame(
+        [[ins_path.name, output_csv, -1]], columns=["pest_file", "model_file", "cycle"]
+    )
+    pst.model_output_data.index = [ins_path.name]
+
+    # Forward command: the MF6 binary (or a space-free Python wrapper).
+    wrapper = None
+    if _needs_forward_wrapper(model):
+        wrapper = _generate_forward_wrapper(model)
+        pst.model_command = list(wrapper["model_command"])
+    else:
+        try:
+            pst.model_command = [_find_mf6_binary()]
+        except RuntimeError:
+            pass  # keep pyemu's default; only needed for an actual run
+
+    obs_tbl = ws / f"{model}_da_obs_cycle_tbl.csv"
+    par_tbl = ws / f"{model}_da_par_cycle_tbl.csv"
+    _write_cycle_table(obs_tbl, site_names, cycles, obs_cycles)
+    _write_cycle_table(par_tbl, list(par_cycles.keys()), cycles, par_cycles)
+
+    pst.pestpp_options["da_num_reals"] = int(num_reals)
+    pst.pestpp_options["da_observation_cycle_table"] = obs_tbl.name
+    pst.pestpp_options["da_parameter_cycle_table"] = par_tbl.name
+    pst.pestpp_options["da_use_simulated_states"] = bool(use_simulated_states)
+    for key, value in (da_options or {}).items():
+        pst.pestpp_options[key] = value
+    pst.control_data.noptmax = int(noptmax)
+
+    pst.rectify_pgroups()
+    pst.parameter_groups["derinclb"] = 0.01
+
+    pst_path = ws / f"{model}.pst"
+    pst.write(str(pst_path), version=2)
+
+    result: dict = {
+        "model": model,
+        "pst_file": str(pst_path),
+        "template_file": str(k_tpl_path),
+        "target_file": str(k_target),
+        "ic_template_file": str(ic_tpl_path),
+        "ic_target_file": str(ic_target),
+        "cycle_tables": {"obs": str(obs_tbl), "parameter": str(par_tbl)},
+        "n_observations": len(site_names),
+        "n_adjustable_parameters": len(norm["parameters"]),
+        "n_state_parameters": len(site_names),
+        "n_cycles": len(cycles),
+        "model_command": list(pst.model_command),
+        "next_steps": (
+            "Run the assimilation with run_pestpp_da(model, pst_file), then "
+            "summarise_calibration."
+        ),
+    }
+    if wrapper is not None:
+        result["forward_wrapper"] = wrapper["wrapper_path"]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # PEST++ tool implementations
 # ---------------------------------------------------------------------------
 
@@ -2617,6 +3065,68 @@ def register(mcp: FastMCP) -> None:
         summarise_calibration."""
         try:
             return _impl_setup_calibration(model, parameterisation, obs_source, noptmax)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "MODFLOW 6" in msg or "binary" in msg.lower():
+                return _err("BINARY_NOT_FOUND", msg, "Install MODFLOW 6 with: get-modflow :")
+            return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def setup_da_control(
+        model: str,
+        parameterisation: dict,
+        cycles: list[int],
+        obs_cycles: dict,
+        obs_weights: dict | None = None,
+        par_cycles: dict | None = None,
+        num_reals: int = 50,
+        noptmax: int = 1,
+        use_simulated_states: bool = True,
+        da_options: dict | None = None,
+    ) -> dict:
+        """Build a DA-ready PEST++ v2 control file (cycle tables + da_* options).
+
+        For sequential ensemble data assimilation with pestpp-da. ``cycles`` are
+        DA cycle indices, e.g. [0, 1, 2]. ``obs_cycles`` maps each registered
+        observation site name to a per-cycle observed value, e.g.
+        {"S1": {0: 30.0, 1: 29.0}}. ``obs_weights`` optionally sets a non-zero
+        weight per site (da_weight_cycle_table is ignored by pestpp-da v5.2.16,
+        so weights live in obs_data.csv). ``par_cycles`` optionally supplies
+        per-cycle values for fixed forcing parameters — a ``perlen`` entry
+        templates the TDIS stress-period length and drives it from the
+        parameter cycle table.
+
+        The tool rewires NPF k and the IC strt array to external OPEN/CLOSE
+        files, generates the K template plus a state-augmented IC template (one
+        state parameter per observed cell, sharing the observation name so
+        da_use_simulated_states can carry each cycle's simulated heads into the
+        next cycle), writes the observation instruction file, and assembles a
+        version-2 .pst carrying a `cycle` column and the da_* options. The model
+        must run one stress period with one time step per cycle (NPER=1,
+        NSTP=1) — otherwise the OBS-CSV instruction file would not read the
+        end-of-cycle value; a clear error is returned otherwise.
+
+        Run the assimilation afterwards with run_pestpp_da, then
+        summarise_calibration."""
+        try:
+            return _impl_setup_da_control(
+                model,
+                parameterisation,
+                cycles,
+                obs_cycles,
+                obs_weights,
+                par_cycles,
+                num_reals,
+                noptmax,
+                use_simulated_states,
+                da_options,
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:
