@@ -1935,6 +1935,95 @@ def _impl_generate_tdis_tpl(model: str, perlen_name: str) -> dict:
     return {"tpl_path": str(tpl_path), "target": str(ws / target_file)}
 
 
+def _impl_write_da_prior_ensemble(
+    model: str,
+    pst: pyemu.Pst,
+    prior_ensemble: dict | None = None,
+    prior_std: float | None = None,
+    num_reals: int = 50,
+) -> dict:
+    """Write a pyemu ``ParameterEnsemble`` CSV for ``da_parameter_ensemble``.
+
+    Either ``prior_ensemble`` (a mapping of parameter name → list of
+    realisations) or ``prior_std`` (draw ``num_reals`` realisations around each
+    adjustable parameter's ``parval1`` with that standard deviation — in log10
+    space for ``partrans='log'`` parameters) may be given, not both. Parameters
+    not named in ``prior_ensemble`` are filled with their control-file value,
+    matching the ensemble it would draw internally from the bounds.
+
+    The draw is done here rather than with ``ParameterEnsemble.from_gaussian_draw``
+    because pyemu 1.4.0's ``Cov`` lowercases parameter names, which collides with
+    the uppercase state-parameter names this control file can carry.
+    """
+    if prior_ensemble is not None and prior_std is not None:
+        raise ValueError(
+            "Supply either prior_ensemble or prior_std, not both; prior_ensemble "
+            "is an explicit table, prior_std draws one from the parameter values."
+        )
+    ws = resolve_workspace(model)
+    par_names = [str(n) for n in pst.parameter_data.index]
+    by_lower = {n.lower(): n for n in par_names}
+
+    if prior_ensemble is not None:
+        if not isinstance(prior_ensemble, dict):
+            raise ValueError("prior_ensemble must map parameter name → list of realisations.")
+        series: dict[str, list[float]] = {}
+        unknown: list[str] = []
+        for raw, vals in prior_ensemble.items():
+            key = str(raw).lower()
+            if key not in by_lower:
+                unknown.append(str(raw))
+                continue
+            series[by_lower[key]] = [float(v) for v in vals]
+        if unknown:
+            raise ValueError(
+                f"prior_ensemble names unknown parameter(s) {unknown}; the "
+                f"control file parameters are {par_names}."
+            )
+        lengths = {len(v) for v in series.values()}
+        if len(lengths) != 1:
+            raise ValueError(
+                "prior_ensemble columns must all hold the same number of "
+                f"realisations, got lengths {sorted(lengths)}."
+            )
+        n_reals = lengths.pop()
+        if n_reals < 1:
+            raise ValueError("prior_ensemble must contain at least one realisation.")
+        df = pd.DataFrame(index=range(n_reals))
+        for name in par_names:
+            if name in series:
+                df[name] = series[name]
+            else:
+                df[name] = float(pst.parameter_data.loc[name, "parval1"])
+    else:
+        if prior_std is None or float(prior_std) <= 0.0:
+            raise ValueError("prior_std must be a positive number.")
+        n_reals = int(num_reals)
+        if n_reals < 1:
+            raise ValueError("num_reals must be a positive integer.")
+        rng = np.random.default_rng()
+        std = float(prior_std)
+        df = pd.DataFrame(index=range(n_reals))
+        for name in par_names:
+            row = pst.parameter_data.loc[name]
+            base = float(row["parval1"])
+            transform = str(row["partrans"]).lower()
+            if transform in ("fixed", "tied"):
+                df[name] = base
+            elif transform == "log":
+                df[name] = 10.0 ** (np.log10(base) + rng.normal(0.0, std, n_reals))
+            else:
+                df[name] = base + rng.normal(0.0, std, n_reals)
+
+    # PEST/PEST++ names are lowercased, so emit lowercase columns to line up with
+    # the control file once it is read back.
+    df.columns = [str(c).lower() for c in df.columns]
+    pe = pyemu.ParameterEnsemble(pst, df, istransformed=False)
+    out_path = ws / f"{model}_da_prior.csv"
+    pe.to_csv(str(out_path))
+    return {"file": str(out_path), "num_reals": int(pe.shape[0])}
+
+
 def _impl_setup_da_control(
     model: str,
     parameterisation: dict,
@@ -1946,6 +2035,8 @@ def _impl_setup_da_control(
     noptmax: int = 1,
     use_simulated_states: bool = True,
     da_options: dict | None = None,
+    prior_ensemble: dict | None = None,
+    prior_std: float | None = None,
 ) -> dict:
     """Build a DA-ready PEST++ **version 2** control file (7f-DA).
 
@@ -1963,6 +2054,9 @@ def _impl_setup_da_control(
     row, which is the end-of-cycle value). ``par_cycles`` optionally supplies
     per-cycle values for fixed forcing parameters (a ``perlen`` entry templates
     the TDIS stress-period length); ``da_options`` are extra ``da_*`` keywords.
+    ``prior_ensemble`` / ``prior_std`` optionally write a pyemu parameter
+    ensemble CSV and point ``da_parameter_ensemble`` at it; when neither is
+    given, pestpp-da draws the prior internally from the parameter bounds.
     """
     ws = resolve_workspace(model)
 
@@ -2204,11 +2298,27 @@ def _impl_setup_da_control(
             {n: {c: weights.get(n, 1.0) for c in cycles} for n in site_names},
         )
 
+    # Optional prior parameter ensemble: rows = realisations, columns =
+    # parameters, read by pestpp-da via da_parameter_ensemble. Its row count is
+    # the ensemble size, so it also sets da_num_reals.
+    prior_tbl = None
+    if prior_ensemble is not None or prior_std is not None:
+        prior_tbl = _impl_write_da_prior_ensemble(
+            model,
+            pst,
+            prior_ensemble=prior_ensemble,
+            prior_std=prior_std,
+            num_reals=num_reals,
+        )
+        num_reals = prior_tbl["num_reals"]
+
     pst.pestpp_options["da_num_reals"] = int(num_reals)
     pst.pestpp_options["da_observation_cycle_table"] = obs_tbl.name
     pst.pestpp_options["da_parameter_cycle_table"] = par_tbl.name
     if weight_tbl is not None:
         pst.pestpp_options["da_weight_cycle_table"] = weight_tbl.name
+    if prior_tbl is not None:
+        pst.pestpp_options["da_parameter_ensemble"] = Path(prior_tbl["file"]).name
     pst.pestpp_options["da_use_simulated_states"] = bool(use_simulated_states)
     for key, value in (da_options or {}).items():
         pst.pestpp_options[key] = value
@@ -2244,6 +2354,8 @@ def _impl_setup_da_control(
     }
     if wrapper is not None:
         result["forward_wrapper"] = wrapper["wrapper_path"]
+    if prior_tbl is not None:
+        result["prior_ensemble_file"] = prior_tbl["file"]
     return result
 
 
@@ -3108,6 +3220,8 @@ def register(mcp: FastMCP) -> None:
         noptmax: int = 1,
         use_simulated_states: bool = True,
         da_options: dict | None = None,
+        prior_ensemble: dict | None = None,
+        prior_std: float | None = None,
     ) -> dict:
         """Build a DA-ready PEST++ v2 control file (cycle tables + da_* options).
 
@@ -3120,6 +3234,14 @@ def register(mcp: FastMCP) -> None:
         per-cycle values for fixed forcing parameters — a ``perlen`` entry
         templates the TDIS stress-period length and drives it from the
         parameter cycle table.
+
+        ``prior_ensemble`` (mapping of parameter name to a list of realisations)
+        or ``prior_std`` (draw ``num_reals`` realisations around each adjustable
+        parameter's value with that standard deviation) optionally writes
+        ``<model>_da_prior.csv`` and points the ``da_parameter_ensemble`` option
+        at it; supply at most one. When neither is given, pestpp-da draws the
+        prior internally from the parameter bounds. The written ensemble's row
+        count becomes the DA ensemble size (``da_num_reals``).
 
         The tool rewires NPF k and the IC strt array to external OPEN/CLOSE
         files, generates the K template plus a state-augmented IC template (one
@@ -3145,6 +3267,8 @@ def register(mcp: FastMCP) -> None:
                 noptmax,
                 use_simulated_states,
                 da_options,
+                prior_ensemble,
+                prior_std,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

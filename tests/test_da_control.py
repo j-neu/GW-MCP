@@ -311,6 +311,82 @@ def test_setup_da_control_empty_parameter_cycle_table_by_default(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Prior parameter ensemble (da_parameter_ensemble)
+# ---------------------------------------------------------------------------
+
+
+def test_setup_da_control_draws_prior_ensemble_from_std(tmp_path):
+    name = _da_model(tmp_path, name="daprior")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+        prior_std=0.2,
+    )
+    assert "error" not in res, res
+    assert res["prior_ensemble_file"].endswith("_da_prior.csv")
+
+    pst = pyemu.Pst(res["pst_file"])
+    assert str(pst.pestpp_options["da_parameter_ensemble"]) == Path(
+        res["prior_ensemble_file"]
+    ).name
+
+    pe = pyemu.ParameterEnsemble.from_csv(pst, res["prior_ensemble_file"])
+    assert pe.shape[0] == 4
+    # one column per control-file parameter (K + states + any forcing)
+    assert set(pst.parameter_data.index).issubset(set(pe.columns))
+    assert "k" in pe.columns
+    assert len(set(pe.loc[:, "k"].values.tolist())) > 1  # actually drawn
+
+
+def test_setup_da_control_uses_explicit_prior_ensemble(tmp_path):
+    name = _da_model(tmp_path, name="daprie")
+    values = [3.0, 4.0, 6.0, 7.0]
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        prior_ensemble={"k": values},
+    )
+    assert "error" not in res, res
+    pst = pyemu.Pst(res["pst_file"])
+    assert str(pst.pestpp_options["da_num_reals"]) == "4"
+    pe = pyemu.ParameterEnsemble.from_csv(pst, res["prior_ensemble_file"])
+    assert pe.shape[0] == 4
+    assert list(pe.loc[:, "k"].values) == pytest.approx(values)
+
+
+def test_setup_da_control_no_prior_ensemble_by_default(tmp_path):
+    name = _da_model(tmp_path, name="daprinone")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+    )
+    assert "error" not in res, res
+    assert "prior_ensemble_file" not in res
+    assert "da_parameter_ensemble" not in pyemu.Pst(res["pst_file"]).pestpp_options
+
+
+def test_setup_da_control_rejects_conflicting_prior_specs(tmp_path):
+    name = _da_model(tmp_path, name="dapriconf")
+    with pytest.raises(ValueError, match="prior_ensemble"):
+        _impl_setup_da_control(
+            name,
+            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+            prior_ensemble={"k": [3.0, 4.0]},
+            prior_std=0.2,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
 
@@ -423,6 +499,30 @@ def test_setup_da_control_end_to_end(tmp_path):
     assert run["cycles"] >= 2, run
     assert run["final_phi_mean"] is not None
     assert run["final_phi_mean"] == run["final_phi_mean"]  # not NaN
+
+
+@requires_mf6
+@requires_pestpp_da
+def test_setup_da_control_prior_ensemble_end_to_end(tmp_path):
+    """pestpp-da accepts and reads the caller-supplied da_parameter_ensemble."""
+    name = _da_model(tmp_path, name="dae2eprior")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+        prior_std=0.2,
+    )
+    assert "error" not in res, res
+    run = _impl_run_pestpp_da(name, res["pst_file"], num_reals=4)
+    assert run["converged"], run
+    assert run["cycles"] >= 2, run
+    ws = resolve_workspace(name)
+    rec_files = list(ws.glob("*.rec"))
+    assert rec_files, "pestpp-da did not write a .rec file"
+    rec = rec_files[0].read_text().lower()
+    assert Path(res["prior_ensemble_file"]).name.lower() in rec
 
 
 @requires_mf6
