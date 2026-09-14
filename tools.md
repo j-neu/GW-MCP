@@ -514,7 +514,7 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 - rewires NPF `k` to an external `OPEN/CLOSE` array and generates the K template (reusing the `setup_calibration` machinery);
 - rewires the IC `strt` array and generates a **state-augmented IC template** — one state parameter per registered observation cell, sharing the observation name so `da_use_simulated_states True` carries each cycle's simulated heads into the next cycle's IC;
 - generates the MF6-OBS-CSV instruction file (the canonical `l1 ~,~ !name! …` pif reads the first data row, which is the end-of-cycle value because there is one time step per cycle);
-- writes the observation cycle table (`obs_cycles`) and, when `par_cycles` supplies fixed forcing values, a populated parameter cycle table (a `perlen` entry templates the TDIS stress-period length);
+- writes the observation cycle table (`obs_cycles`), a weight cycle table when `obs_weights` is given (v5.2.16 ignores it — the authoritative weights are the non-zero values in `obs_data.csv`), and, when `par_cycles` supplies fixed forcing values, a populated parameter cycle table (a `perlen` entry templates the TDIS stress-period length);
 - assembles a **version-2** `.pst` whose external parameter/observation/model-IO sections carry a `cycle` column, with `da_num_reals`, `da_observation_cycle_table`, `da_parameter_cycle_table` and `da_use_simulated_states`.
 
 `cycles` are DA cycle indices; `obs_cycles` maps a registered site name to `{cycle: observed value}` (a missing cycle is a blank/off cycle). The model must have `NPER=1`/`NSTP=1` — `setup_da_control` returns a clear `INVALID_INPUT` error otherwise. Run the assimilation with `run_pestpp_da`, then `summarise_calibration`.

@@ -269,6 +269,35 @@ def test_setup_da_control_accepts_string_cycle_keys(tmp_path):
     assert Path(res["cycle_tables"]["parameter"]).read_text().splitlines()[1] == "perlen,40,100"
 
 
+def test_setup_da_control_writes_weight_cycle_table_when_given(tmp_path):
+    name = _da_model(tmp_path, name="daweight")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        obs_weights={"S1": 4.0, "S2": 2.0},
+    )
+    assert "error" not in res, res
+    pst = pyemu.Pst(res["pst_file"])
+    assert str(pst.pestpp_options["da_weight_cycle_table"]).endswith(".csv")
+    lines = Path(res["cycle_tables"]["weight"]).read_text().splitlines()
+    assert lines[0] == ",0,1"
+    rows = {ln.split(",")[0]: ln.split(",")[1:] for ln in lines[1:]}
+    assert rows["S1"] == ["4", "4"]
+    assert rows["S2"] == ["2", "2"]
+    assert rows["S3"] == ["1", "1"]
+
+    res2 = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+    )
+    assert "da_weight_cycle_table" not in pyemu.Pst(res2["pst_file"]).pestpp_options
+    assert "weight" not in res2["cycle_tables"]
+
+
 def test_setup_da_control_empty_parameter_cycle_table_by_default(tmp_path):
     name = _da_model(tmp_path)
     res = _impl_setup_da_control(

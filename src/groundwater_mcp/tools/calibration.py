@@ -2191,9 +2191,24 @@ def _impl_setup_da_control(
     _write_cycle_table(obs_tbl, site_names, cycles, obs_cycles)
     _write_cycle_table(par_tbl, list(par_cycles.keys()), cycles, par_cycles)
 
+    # Optional weight cycle table. pestpp-da v5.2.16 accepts but ignores it, so
+    # the authoritative weights are the non-zero values in obs_data.csv above;
+    # it is emitted only when the caller supplies obs_weights, for other builds.
+    weight_tbl = None
+    if obs_weights:
+        weight_tbl = ws / f"{model}_da_weight_cycle_tbl.csv"
+        _write_cycle_table(
+            weight_tbl,
+            site_names,
+            cycles,
+            {n: {c: weights.get(n, 1.0) for c in cycles} for n in site_names},
+        )
+
     pst.pestpp_options["da_num_reals"] = int(num_reals)
     pst.pestpp_options["da_observation_cycle_table"] = obs_tbl.name
     pst.pestpp_options["da_parameter_cycle_table"] = par_tbl.name
+    if weight_tbl is not None:
+        pst.pestpp_options["da_weight_cycle_table"] = weight_tbl.name
     pst.pestpp_options["da_use_simulated_states"] = bool(use_simulated_states)
     for key, value in (da_options or {}).items():
         pst.pestpp_options[key] = value
@@ -2205,6 +2220,10 @@ def _impl_setup_da_control(
     pst_path = ws / f"{model}.pst"
     pst.write(str(pst_path), version=2)
 
+    cycle_tables = {"obs": str(obs_tbl), "parameter": str(par_tbl)}
+    if weight_tbl is not None:
+        cycle_tables["weight"] = str(weight_tbl)
+
     result: dict = {
         "model": model,
         "pst_file": str(pst_path),
@@ -2212,7 +2231,7 @@ def _impl_setup_da_control(
         "target_file": str(k_target),
         "ic_template_file": str(ic_tpl_path),
         "ic_target_file": str(ic_target),
-        "cycle_tables": {"obs": str(obs_tbl), "parameter": str(par_tbl)},
+        "cycle_tables": cycle_tables,
         "n_observations": len(site_names),
         "n_adjustable_parameters": len(norm["parameters"]),
         "n_state_parameters": len(site_names),
