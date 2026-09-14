@@ -14,14 +14,21 @@
 - Files changed together, patterns from `src/groundwater_mcp/tools/calibration.py` (helpers + `register(mcp)`), `src/groundwater_mcp/utils/grid.py`.
 - `ruff check src` and `mypy src` must stay clean; full `pytest -q` green (currently 591).
 - Tool count is tracked: `tests/test_mcp_protocol.py::_EXPECTED_TOOL_COUNT` and the expected-tools list, plus `README.md`, `tools.md`, `architecture.md`, `research/capability-matrix.md`.
-- **PEST++-DA option names are exact** (unknown `++` args are a fatal parse error): `da_num_reals`, `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states`, `da_noptmax_schedule`. There is **no** `da_cycle` / `da_obs_cycle_table` / `da_ensemble`.
-- `noptmax` = number of update **iterations per cycle** (0 = single Kalman update); ensemble size is `da_num_reals`.
+- **PEST++-DA option names are exact** (unknown control-data keywords are a fatal parse error): `da_num_reals`, `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states`, `da_noptmax_schedule`. There is **no** `da_cycle` / `da_ensemble`.
+- **Target binary is `pestpp-da` v5.2.16** (the installed one). Its semantics were verified by the Task 1 spike and differ from the newer `pestpp-da_benchmarks`:
+  - `noptmax` = update **iterations per cycle**; **`0` performs NO update** (base parameter set only, 1 realisation) — for an EnKF use `noptmax >= 1` (default 1).
+  - Ensemble size: **`da_num_reals` works** and overrides `ies_num_reals` (both accepted).
+  - `da_weight_cycle_table` is accepted but **ignored** — observation weights must be non-zero in `obs_data.csv`.
+  - Sequential DA runs **one MF6 stress period / one time step per cycle** (`NPER=1`, `NSTP=1`) so the obs-CSV pif's first data row is the end-of-cycle value; per-cycle duration needs a templated `perlen` driven by `da_parameter_cycle_table`.
+  - State advance is automatic with `da_use_simulated_states True`: the state parameters are the IC-template tokens, wired by shared obs/param name or by `obs_data.state_par_link` (not both).
 - Writes must be **version=2** (`pst.write(path, version=2)`); version-1 cannot express the `cycle` column.
 - Closed-book rule applies to Agent Manager validation sessions only: no source/tests reading, no raw flopy/pyemu there — every action through an MCP tool.
 
 ---
 
 ## Verified PEST++-DA facts (from `pestpp/pestpp-da_benchmarks` + local parse probe)
+
+> **Version warning.** The benchmark below is a *newer* PEST++ build than the installed `pestpp-da` v5.2.16. The Global Constraints section records the v5.2.16-verified semantics (spike, Task 1); where the two disagree, the installed binary governs.
 
 Reference: `github.com/pestpp/pestpp-da_benchmarks` → `mf6_freyberg/template_seq_native/`.
 
@@ -119,7 +126,7 @@ git commit -m "docs(da): spike a minimal sequential pestpp-da run (cycle tables 
 
 **Interfaces:**
 - Consumes: `_restore_or_snapshot_k_base`, `_impl_rewire_npf_k_external`, `_impl_generate_tpl`, `_normalise_parameterisation`, `_tpl_substitute`, `_needs_forward_wrapper`, `_generate_forward_wrapper`, `read_meta` — all existing in `calibration.py`.
-- Produces: `_impl_setup_da_control(model, parameterisation, cycles, obs_cycles, obs_weights=None, num_reals=50, noptmax=0, use_simulated_states=True, da_options=None) -> dict` returning `{model, pst_file, template_file, target_file, cycle_tables: {obs, weight?, parameter?}, n_observations, n_adjustable_parameters, n_cycles, model_command, next_steps}`.
+- Produces: `_impl_setup_da_control(model, parameterisation, cycles, obs_cycles, obs_weights=None, num_reals=50, noptmax=1, use_simulated_states=True, da_options=None) -> dict` returning `{model, pst_file, template_file, target_file, cycle_tables: {obs, weight?, parameter?}, n_observations, n_adjustable_parameters, n_cycles, model_command, next_steps}`.
 
 - [ ] **Step 1: Write the failing cycle-table-writer test**
 
@@ -184,7 +191,7 @@ def test_setup_da_control_writes_v2_cycle_tables(tmp_path):
     pst = pyemu.Pst(res["pst_file"])
     assert str(pst.pestpp_options["da_num_reals"]) == "5"
     assert str(pst.pestpp_options["da_observation_cycle_table"]).endswith(".csv")
-    assert int(pst.control_data.noptmax) == 0
+    assert int(pst.control_data.noptmax) == 1
     # version 2 + cycle column survive the write
     text = Path(res["pst_file"]).read_text()
     assert "version=2" in text.replace(" ", "")
@@ -210,7 +217,7 @@ def setup_da_control(
     obs_cycles: dict,
     obs_weights: dict | None = None,
     num_reals: int = 50,
-    noptmax: int = 0,
+    noptmax: int = 1,
     use_simulated_states: bool = True,
     da_options: dict | None = None,
 ) -> dict:
