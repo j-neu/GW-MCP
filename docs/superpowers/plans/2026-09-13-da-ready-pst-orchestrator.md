@@ -126,7 +126,7 @@ git commit -m "docs(da): spike a minimal sequential pestpp-da run (cycle tables 
 
 **Interfaces:**
 - Consumes: `_restore_or_snapshot_k_base`, `_impl_rewire_npf_k_external`, `_impl_generate_tpl`, `_normalise_parameterisation`, `_tpl_substitute`, `_needs_forward_wrapper`, `_generate_forward_wrapper`, `read_meta` — all existing in `calibration.py`.
-- Produces: `_impl_setup_da_control(model, parameterisation, cycles, obs_cycles, obs_weights=None, num_reals=50, noptmax=1, use_simulated_states=True, da_options=None) -> dict` returning `{model, pst_file, template_file, target_file, cycle_tables: {obs, weight?, parameter?}, n_observations, n_adjustable_parameters, n_cycles, model_command, next_steps}`.
+- Produces: `_impl_setup_da_control(model, parameterisation, cycles, obs_cycles, obs_weights=None, par_cycles=None, num_reals=50, noptmax=1, use_simulated_states=True, da_options=None) -> dict` returning `{model, pst_file, template_file, target_file, ic_template_file, cycle_tables: {obs, parameter?}, n_observations, n_adjustable_parameters, n_state_parameters, n_cycles, model_command, next_steps}`.
 
 - [ ] **Step 1: Write the failing cycle-table-writer test**
 
@@ -200,7 +200,13 @@ def test_setup_da_control_writes_v2_cycle_tables(tmp_path):
 
 - [ ] **Step 6: Run it** → FAIL (`_impl_setup_da_control` missing).
 
-- [ ] **Step 7: Implement `_impl_setup_da_control`** — reuse the `setup_calibration` non-zoned path for the K rewire/template/initial substitution and the forward-command decision, then build a `pyemu.Pst` with `pyemu.pst_utils.generic_pst(par_names, obs_names)`, set `model_input_data`/`model_output_data` with a `cycle=-1` column, set `observation_data["cycle"]=-1` and `observation_data["state_par_link"]=""`, set `parameter_data["cycle"]=-1`, write the obs cycle table (and weight table when `obs_weights` given), set `pestpp_options` (`da_num_reals`, `da_observation_cycle_table`, `da_use_simulated_states`, plus `da_options`), set `control_data.noptmax`, apply `derinclb=0.01`, and `pst.write(pst_path, version=2)`. Return the `dict` in **Interfaces**. Note: the DA observation interface is built from `obs_cycles` (per-site, per-cycle values) rather than `_build_model_obs_interface` (which is single-row/steady-state); generate one instruction-file token per site reading that site's column at the current cycle — spike findings decide the exact line.
+- [ ] **Step 7: Implement `_impl_setup_da_control`** — reuse the `setup_calibration` non-zoned path for the K rewire/template/initial substitution and the forward-command decision, then build a `pyemu.Pst` with `pyemu.pst_utils.generic_pst(par_names, obs_names)`, set `model_input_data`/`model_output_data` with a `cycle=-1` column, set `observation_data["cycle"]=-1` and `observation_data["state_par_link"]=""`, set `parameter_data["cycle"]=-1`, write the obs cycle table (and weight table when `obs_weights` given), set `pestpp_options` (`da_num_reals`, `da_observation_cycle_table`, `da_use_simulated_states`, plus `da_options`), set `control_data.noptmax` (default 1), apply `derinclb=0.01`, and `pst.write(pst_path, version=2)`. Return the `dict` in **Interfaces**. Note: the DA observation interface is built from `obs_cycles` (per-site, per-cycle values) rather than `_build_model_obs_interface` (which is single-row/steady-state); generate one instruction-file token per site reading that site's column at the current cycle — spike findings decide the exact line.
+
+  **Also required (from the Task 1 spike, `research/discovery/sessions/2026-09-13-da-spike-pestpp-da-sequential.md` §8 — read it as the authoritative build checklist):**
+  - Parametrize the model's **IC `strt`** as an external `OPEN/CLOSE` array and generate a **state-augmented IC template** whose tokens are the **state parameter names** (one per state cell — the observed sites), so `da_use_simulated_states True` can carry each cycle's simulated heads into the next cycle's IC. Add those state parameters to the PST (non-adjustable, group `head_state`, `cycle=-1`). Reuse the existing ``_restore_or_snapshot``/rewire helpers where possible; the K rewire alone is not enough.
+  - The model must write an **MF6 OBS CSV** for the instruction file to read (register sites via `import_obs_from_csv`); the canonical pif (`_impl_generate_ins_from_obs_csv`) reads the **first data row**, so require **`NPER=1`, `NSTP=1` per cycle** and return a clear error if the model's TDIS is not single-step (or document a forward-wrapper fallback).
+  - Emit the exact working shapes from the spike: `pargp_data.csv` (10-col), `par_data.csv` (11-col + optional `state_par_link`), `obs_data.csv` (non-zero weights), `tplfile_data.csv`/`insfile_data.csv`, `* model command line`. `da_weight_cycle_table` must NOT be relied on (ignored by v5.2.16) — weights live in `obs_data.csv`.
+  - `da_parameter_cycle_table` must be emitted populated when per-cycle fixed parameters are supplied (`par_cycles`), header-only otherwise; verify a populated table end-to-end.
 
 - [ ] **Step 8: Run the test** → PASS. Then `pytest tests/test_da_control.py -q`.
 
@@ -216,6 +222,7 @@ def setup_da_control(
     cycles: list[int],
     obs_cycles: dict,
     obs_weights: dict | None = None,
+    par_cycles: dict | None = None,
     num_reals: int = 50,
     noptmax: int = 1,
     use_simulated_states: bool = True,
