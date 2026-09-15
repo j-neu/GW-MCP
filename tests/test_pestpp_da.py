@@ -197,9 +197,15 @@ class _FakeDAProc:
         self.killed = True
 
 
-def _da_ready_pst(tmp_path, name: str = "dastart") -> tuple[str, Path]:
-    """A DA-ready PST from setup_da_control, for the background-job tests."""
-    ws = str(tmp_path / name)
+def _da_ready_pst(
+    tmp_path, name: str = "dastart", spatial_dir: str | None = None
+) -> tuple[str, Path]:
+    """A DA-ready PST from setup_da_control, for the background-job tests.
+
+    ``spatial_dir`` inserts an extra (space-containing) path component so a test
+    can exercise a workspace whose path contains a space.
+    """
+    ws = str(tmp_path / (spatial_dir or "") / name)
     _impl_create_model(name, ws, "METERS", "DAYS")
     _impl_set_simulation(name, 1, [1.0], [1], "simple")
     _impl_add_dis_package(name, 1, 3, 3, 100.0, 100.0, 50.0, [30.0])
@@ -378,3 +384,69 @@ def test_start_calibration_ies_omitted_num_reals_preserves_pst(tmp_path, monkeyp
     )
     assert status["result"]["num_reals"] == 9
     assert str(pyemu.Pst(str(pst_file)).pestpp_options["ies_num_reals"]) == "9"
+
+
+# ---------------------------------------------------------------------------
+# Task 9 — DA must complete in a workspace whose path contains a space
+# ---------------------------------------------------------------------------
+
+
+def _mf6_available() -> bool:
+    from groundwater_mcp.tools.runner import _find_mf6_binary
+
+    try:
+        _find_mf6_binary()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _pestpp_da_available() -> bool:
+    from groundwater_mcp.tools.calibration import _find_pestpp_binary
+
+    try:
+        _find_pestpp_binary("pestpp-da")
+        return True
+    except RuntimeError:
+        return False
+
+
+requires_da_stack = pytest.mark.skipif(
+    not (_mf6_available() and _pestpp_da_available()),
+    reason="MODFLOW 6 and/or pestpp-da binary not installed",
+)
+
+
+@requires_da_stack
+def test_da_completes_in_space_containing_workspace(tmp_path):
+    """Both launch paths assimilate >=2 cycles in a space-containing workspace.
+
+    The mandated holdout workspace path (``...\\MODFLOW 6\\sim``) contains a
+    space. The model command must stay space-free: pestpp runs it with the
+    workspace as cwd, so only the *binary* path can force a wrapper (Task 9).
+    """
+    from groundwater_mcp.tools.calibration import _find_mf6_binary
+
+    name, pst_file = _da_ready_pst(tmp_path, "daspace_bg", spatial_dir="space dir")
+    ws = resolve_workspace(name)
+    assert " " in str(ws), "fixture must exercise a space-containing workspace"
+
+    command = pyemu.Pst(str(pst_file)).model_command
+    assert command == [_find_mf6_binary()], command
+    assert " " not in command[0], command
+    assert "gwmcp_run_" not in command[0], command
+
+    # Background launch path (start_calibration -> job registry).
+    start = _impl_start_calibration(name, str(pst_file), method="da")
+    assert start["status"] == "running"
+    status = _wait(start["job_id"], timeout=300.0)
+    assert status["status"] == "succeeded", status
+    assert status["result"]["converged"] is True, status
+    assert status["result"]["cycles"] >= 2, status
+
+    # Synchronous launch path (run_pestpp_da), on a second unrun workspace.
+    name2, pst_file2 = _da_ready_pst(tmp_path, "daspace_sync", spatial_dir="space dir")
+    run = _impl_run_pestpp_da(name2, str(pst_file2))
+    assert run["converged"], run
+    assert run["cycles"] >= 2, run
+    assert run["final_phi_mean"] is not None

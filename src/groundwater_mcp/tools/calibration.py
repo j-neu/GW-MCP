@@ -1542,6 +1542,23 @@ def _impl_generate_ins_from_obs_csv(
     return {"ins_path": ins_path, "obs_names": obs_names}
 
 
+def _space_free_interpreter() -> str | None:
+    """Return a Python interpreter whose path contains no spaces, if any.
+
+    ``sys.executable`` is the venv interpreter and is normally preferred, but a
+    venv under a space-containing directory (e.g. ``D:\\Claude Projects\\...``)
+    cannot be named unquoted in a pestpp model command. The base interpreter
+    the venv was built from usually lives under a space-free directory; the
+    generated wrapper only uses the standard library, so it can run there.
+    Returns ``None`` when every candidate contains a space.
+    """
+    candidates = [sys.executable, getattr(sys, "_base_executable", None)]
+    for cand in candidates:
+        if cand and " " not in str(cand) and Path(str(cand)).exists():
+            return str(cand)
+    return None
+
+
 def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     """Generate a Python forward-run wrapper at a space-free path (7e-A2.4).
 
@@ -1551,8 +1568,10 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     no spaces, in the workspace when the workspace path is space-free and in a
     space-free system directory otherwise — that runs MODFLOW 6 in the model
     workspace (the OBS package writes the observations CSV as part of the
-    run). The returned ``model_command`` references the wrapper via the quoted
-    current Python executable.
+    run). The returned ``model_command`` references the wrapper via the
+    current Python executable, preferring a space-free interpreter so the
+    command itself carries no space (Task 9); the ``multiply_k`` wrapper needs
+    numpy from this venv, so it keeps ``sys.executable``.
 
     Returns ``{wrapper_path, model_command}`` where ``model_command`` is a
     one-element list suitable for ``pst.model_command``.
@@ -1634,15 +1653,32 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     # pestpp runs the model command with cwd = the model workspace; reference
     # the wrapper by relative name when it lives there, absolute otherwise.
     cmd_target = wrapper_path.name if wrapper_path.parent == ws else str(wrapper_path)
-    model_command = [f'"{sys.executable}" {cmd_target}']
+    # A wrapper command that itself contains a space is what pestpp cannot
+    # launch (Task 9), so use a space-free interpreter when one exists; the
+    # stdlib-only wrapper runs on the base interpreter just as well. The
+    # multiply_k wrapper needs this venv's numpy, so it keeps sys.executable.
+    interpreter = sys.executable if multiply_k else (_space_free_interpreter() or sys.executable)
+    # A quoted "exe path" ensures CreateProcess splits the command correctly.
+    if " " in interpreter:
+        model_command = [f'"{interpreter}" {cmd_target}']
+    else:
+        model_command = [f"{interpreter} {cmd_target}"]
     return {"wrapper_path": str(wrapper_path), "model_command": model_command}
 
 
 def _needs_forward_wrapper(model: str) -> bool:
     """True when the default model command (the MF6 binary directly) cannot
-    be launched by pestpp — the workspace or the binary path contains spaces."""
-    if " " in str(resolve_workspace(model)):
-        return True
+    be launched by pestpp — i.e. the **binary** path contains spaces.
+
+    The workspace path deliberately no longer triggers a wrapper (Task 9):
+    pestpp runs the model command with the model workspace as its working
+    directory, so a space in the workspace path never enters the command line.
+    A direct ``mf6.exe`` with a space-containing cwd is proven to run (the
+    mandated holdout workspace, and the regression test in
+    ``tests/test_pestpp_da.py``), and it saves launching an interpreter — and
+    its numpy import — for every realisation. The wrapper is now generated
+    only for the case it exists for: a space-containing *executable* path.
+    """
     try:
         return " " in _find_mf6_binary()
     except RuntimeError:

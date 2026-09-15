@@ -103,9 +103,19 @@ def _register_obs(tmp_path: Path, name: str) -> None:
     )
 
 
-def _da_model(tmp_path: Path, name: str = "damodel", nper: int = 1, with_obs: bool = True) -> str:
-    """A single-time-step transient DIS model that can host a sequential DA run."""
-    ws = str(tmp_path / name)
+def _da_model(
+    tmp_path: Path,
+    name: str = "damodel",
+    nper: int = 1,
+    with_obs: bool = True,
+    spatial_dir: str | None = None,
+) -> str:
+    """A single-time-step transient DIS model that can host a sequential DA run.
+
+    ``spatial_dir`` inserts an extra (space-containing) path component so a test
+    can exercise a workspace whose path contains a space.
+    """
+    ws = str(tmp_path / (spatial_dir or "") / name)
     _impl_create_model(name, ws, "METERS", "DAYS")
     _impl_set_simulation(name, nper, [1.0] * nper, [1] * nper, "simple")
     _impl_add_dis_package(name, 1, 3, 3, 100.0, 100.0, 50.0, [30.0])
@@ -933,6 +943,37 @@ def test_setup_da_control_end_to_end(tmp_path):
     assert run["cycles"] >= 2, run
     assert run["final_phi_mean"] is not None
     assert run["final_phi_mean"] == run["final_phi_mean"]  # not NaN
+
+
+@requires_mf6
+def test_setup_da_control_space_workspace_uses_space_free_command(tmp_path):
+    """Task 9: a space-containing workspace must not force a wrapper command.
+
+    pestpp runs the model command with the workspace as its working directory,
+    so a space in the workspace path never enters the command line. Emitting a
+    Python-wrapper command instead (``"<venv python>" ...\\gwmcp_run_<model>.py``)
+    both wasted an interpreter launch per realisation and produced a command
+    pestpp cannot be relied on to launch.
+    """
+    from groundwater_mcp.tools.calibration import _find_mf6_binary, _needs_forward_wrapper
+
+    name = _da_model(tmp_path, name="daspace", spatial_dir="space dir")
+    assert " " in str(resolve_workspace(name)), "fixture must contain a space"
+
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+    assert not _needs_forward_wrapper(name), "workspace space alone must not need a wrapper"
+
+    command = pyemu.Pst(res["pst_file"]).model_command
+    assert command == [_find_mf6_binary()], command
+    assert " " not in command[0], command
+    assert "gwmcp_run_" not in command[0], command
 
 
 @requires_mf6
