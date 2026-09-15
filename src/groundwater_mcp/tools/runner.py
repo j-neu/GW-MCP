@@ -1093,9 +1093,10 @@ def register(mcp: FastMCP) -> None:
         Returns status (running/succeeded/failed/cancelled), elapsed_s and,
         while running, live progress — stress period / time step / percent
         complete for MF6 runs (from the .lst), iteration + latest phi for
-        PEST++ jobs (from .iobj / .phi.actual.csv). Finished jobs include the
-        result dict (same shape as run_simulation / run_pestpp_glm /
-        run_pestpp_ies)."""
+        PEST++ jobs (from .iobj / .phi.actual.csv), or the per-cycle post-update
+        phi for DA runs (from <case>.global.phi.actual.csv). Finished jobs
+        include the result dict (same shape as run_simulation / run_pestpp_glm /
+        run_pestpp_ies / run_pestpp_da)."""
         try:
             return _impl_get_job_status(job_id)
         except KeyError as exc:

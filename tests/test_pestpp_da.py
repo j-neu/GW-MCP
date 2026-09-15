@@ -9,8 +9,10 @@ return schema without launching a real assimilation run.
 from __future__ import annotations
 
 import csv
+import time
 from pathlib import Path
 
+import numpy as np
 import pyemu
 import pytest
 
@@ -20,11 +22,20 @@ from groundwater_mcp.tools.builder import (
     _impl_add_ic_package,
     _impl_add_npf_package,
     _impl_add_oc_package,
+    _impl_add_sto_package,
     _impl_create_model,
     _impl_set_simulation,
 )
-from groundwater_mcp.tools.calibration import _impl_run_pestpp_da, _impl_setup_calibration
+from groundwater_mcp.tools.calibration import (
+    _impl_run_pestpp_da,
+    _impl_setup_calibration,
+    _impl_setup_da_control,
+    _impl_start_calibration,
+    _pestpp_progress,
+)
 from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
+from groundwater_mcp.utils import jobs
+from groundwater_mcp.utils.workspace import resolve_workspace
 
 
 def _model_with_pst(tmp_path, name: str = "dapst"):
@@ -146,3 +157,152 @@ def test_run_pestpp_da_missing_pst_raises(tmp_path):
     name, _ = _model_with_pst(tmp_path, "dapst2")
     with pytest.raises(FileNotFoundError):
         _impl_run_pestpp_da(name, "does_not_exist.pst", num_reals=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — DA background job (start_calibration method="da")
+# ---------------------------------------------------------------------------
+
+_DA_PHI_CSV = (
+    "cycle,iteration,mean,standard_deviation,min,max,0,1,base\n"
+    "0,0,339.18,20.0,300.0,380.0,300.0,380.0,0\n"
+    "0,1,300.17,13.04,288.0,315.0,288.0,315.0,0\n"
+    "1,0,110.01,5.0,100.0,120.0,100.0,120.0,0\n"
+    "1,1,64.11,2.0,60.0,68.0,60.0,68.0,0\n"
+)
+
+
+class _FakeDAProc:
+    """A ``subprocess.Popen`` stand-in for the DA background job.
+
+    ``stdout`` blocks for ``delay`` seconds so the worker thread is still
+    running while a test polls ``get_job_status`` (live-progress coverage).
+    """
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.killed = False
+        self.returncode = 0
+
+    @property
+    def stdout(self):
+        if self.delay:
+            time.sleep(self.delay)
+        return iter(("da ok\n",))
+
+    def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _da_ready_pst(tmp_path, name: str = "dastart") -> tuple[str, Path]:
+    """A DA-ready PST from setup_da_control, for the background-job tests."""
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "METERS", "DAYS")
+    _impl_set_simulation(name, 1, [1.0], [1], "simple")
+    _impl_add_dis_package(name, 1, 3, 3, 100.0, 100.0, 50.0, [30.0])
+    _impl_add_npf_package(name, icelltype=0, k=5.0, k33=None, save_flows=True)
+    _impl_add_ic_package(name, strt=25.0)
+    _impl_add_sto_package(name, iconvert=0, ss=1e-4, sy=None, steady_state=[], save_flows=True)
+    _impl_add_boundary_package(
+        name, "CHD", {"0": [[[0, 0, 0], 40.0], [[0, 2, 2], 10.0]]}, None
+    )
+    _impl_add_oc_package(name, None, None, None, None)
+
+    obs_csv = tmp_path / f"{name}_obs.csv"
+    with open(obs_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "cell"])
+        writer.writerow(["S1", "2020-01-01", 30.0, "0 0 1"])
+        writer.writerow(["S2", "2020-01-01", 29.0, "0 1 1"])
+        writer.writerow(["S3", "2020-01-01", 28.0, "0 2 1"])
+    _impl_import_obs_from_csv(
+        name, str(obs_csv), "HEAD", "site", "date", "value", None, None, 0,
+        cellid_col="cell",
+    )
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles={
+            "S1": {0: 32.0, 1: 33.0},
+            "S2": {0: 30.0, 1: 31.0},
+            "S3": {0: 28.0, 1: 29.0},
+        },
+        num_reals=4,
+        noptmax=1,
+    )
+    assert "error" not in res, res
+    return name, Path(res["pst_file"])
+
+
+def test_pestpp_progress_da_from_global_phi_csv(tmp_path):
+    """The "da" engine reports the per-cycle post-update phi."""
+    (tmp_path / "case.global.phi.actual.csv").write_text(_DA_PHI_CSV)
+    progress = _pestpp_progress(tmp_path, "case", "da")
+    assert progress["engine"] == "da"
+    assert progress["n_cycles"] == 2
+    assert progress["cycle"] == 1
+    assert abs(progress["latest_phi"] - 64.11) < 1e-6
+
+
+def test_start_calibration_da_background_job(tmp_path, monkeypatch):
+    """start_calibration(method="da") runs pestpp-da in the background."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name, pst_file = _da_ready_pst(tmp_path, "dastart")
+    ws = resolve_workspace(name)
+    (ws / f"{pst_file.stem}.global.phi.actual.csv").write_text(_DA_PHI_CSV)
+
+    fake = _FakeDAProc(delay=1.0)
+    monkeypatch.setattr(cal, "_find_pestpp_binary", lambda exe: f"/fake/{exe}")
+    monkeypatch.setattr(cal, "_run_process", lambda args, cwd: fake)
+
+    result = _impl_start_calibration(name, str(pst_file), method="da", num_reals=4)
+    assert result["status"] == "running"
+    assert result["kind"] == "da"
+    job_id = result["job_id"]
+
+    # num_reals maps to da_num_reals (the DA ensemble size)
+    assert str(pyemu.Pst(str(pst_file)).pestpp_options["da_num_reals"]) == "4"
+
+    # while the fake still runs, the job reports live per-cycle progress
+    deadline = time.monotonic() + 5.0
+    saw_progress = False
+    while time.monotonic() < deadline:
+        status = jobs.get_status(job_id)
+        if "progress" in status:
+            assert status["progress"]["engine"] == "da"
+            assert status["progress"]["n_cycles"] == 2
+            saw_progress = True
+            break
+        if status["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert saw_progress, "DA job never reported live progress while running"
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        status = jobs.get_status(job_id)
+        if status["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert status["status"] == "succeeded", status
+
+    body = status["result"]
+    assert body["converged"] is True
+    assert body["cycles"] == 2
+    assert body["num_reals"] == 4
+    assert body["noptmax"] == 1
+    assert abs(body["final_phi_mean"] - float(np.mean([300.17, 64.11]))) < 1e-6
+    assert abs(body["final_phi_std"] - float(np.std([300.17, 64.11]))) < 1e-6
+
+
+def test_start_calibration_rejects_unknown_method_before_workspace():
+    """An unknown method is still rejected up front (before any workspace IO)."""
+    import groundwater_mcp.tools.calibration as cal
+
+    with pytest.raises(ValueError, match="method"):
+        cal._impl_start_calibration("no_such_model", "x.pst", method="sweep")

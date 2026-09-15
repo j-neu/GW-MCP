@@ -1008,3 +1008,206 @@ def test_setup_da_control_populated_parameter_cycle_table_end_to_end(tmp_path):
         ln for ln in tdis_text.splitlines() if "perioddata" not in ln and "1.0" in ln
     )
     assert float(perlen_line.split()[0]) == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — physical state-parameter bounds, clipped prior draws, single flush
+# ---------------------------------------------------------------------------
+
+
+def _register_obs_rows(tmp_path: Path, name: str, rows: list) -> None:
+    """Register observations from explicit ``(site, date, value, DIS cell)`` rows."""
+    csv_path = tmp_path / f"{name}_obs_multi.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "cell"])
+        for site, date, value, cell in rows:
+            writer.writerow([site, date, value, " ".join(str(c) for c in cell)])
+    _impl_import_obs_from_csv(
+        name,
+        str(csv_path),
+        "HEAD",
+        "site",
+        "date",
+        "value",
+        None,
+        None,
+        0,
+        cellid_col="cell",
+    )
+
+
+def _state_params(res: dict):
+    pst = pyemu.Pst(res["pst_file"])
+    return pst, pst.parameter_data[pst.parameter_data["pargp"] == "head_state"]
+
+
+def test_setup_da_control_state_bounds_from_obs_spread(tmp_path):
+    """State bounds are head-scale (strt +/- observed spread), never +/-1e6."""
+    name = _da_model(tmp_path, name="daspread", with_obs=False)
+    _register_obs_rows(
+        tmp_path,
+        name,
+        [
+            ("S1", "2020-01-01", 25.0, (0, 0, 1)),
+            ("S1", "2020-01-02", 35.0, (0, 0, 1)),  # spread 10 m
+            ("S2", "2020-01-01", 25.0, (0, 1, 1)),
+            ("S2", "2020-01-02", 26.0, (0, 1, 1)),  # spread 1 m -> floored at 5
+            ("S3", "2020-01-01", 25.0, (0, 2, 1)),  # <2 values -> default 10
+        ],
+    )
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+    )
+    assert "error" not in res, res
+    _, state = _state_params(res)
+
+    # shipped strt is 25 m; the bound is the site's observed spread
+    assert state.loc["s1", "parlbnd"] == pytest.approx(25.0 - 10.0)
+    assert state.loc["s1", "parubnd"] == pytest.approx(25.0 + 10.0)
+    assert state.loc["s2", "parlbnd"] == pytest.approx(25.0 - 5.0)
+    assert state.loc["s2", "parubnd"] == pytest.approx(25.0 + 5.0)
+    assert state.loc["s3", "parlbnd"] == pytest.approx(25.0 - 10.0)
+    assert state.loc["s3", "parubnd"] == pytest.approx(25.0 + 10.0)
+
+    # finite and head-scale, not the +/-1e6 relative-change default
+    assert np.isfinite(state["parlbnd"]).all() and np.isfinite(state["parubnd"]).all()
+    assert (state["parubnd"] - state["parlbnd"]).max() <= 100.0
+
+
+def test_setup_da_control_state_head_bound_override(tmp_path):
+    """state_head_bound overrides the spread-derived bound for every site."""
+    name = _da_model(tmp_path, name="daover")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+        state_head_bound=3.0,
+    )
+    assert "error" not in res, res
+    _, state = _state_params(res)
+    assert state.loc["s1", "parlbnd"] == pytest.approx(25.0 - 3.0)
+    assert state.loc["s1", "parubnd"] == pytest.approx(25.0 + 3.0)
+    widths = (state["parubnd"] - state["parlbnd"]).to_numpy(dtype=float)
+    assert np.allclose(widths, 6.0)
+
+
+def test_setup_da_control_rejects_non_positive_state_head_bound(tmp_path):
+    name = _da_model(tmp_path, name="dabadbound")
+    flush_model(name)
+    k_before = np.asarray(get_gwf(name).get_package("npf").k.array, dtype=float).copy()
+    with pytest.raises(ValueError, match="state_head_bound"):
+        _impl_setup_da_control(
+            name,
+            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+            state_head_bound=-1.0,
+        )
+    _assert_model_not_rewired(name, k_before)
+
+
+def test_setup_da_control_disu_state_bounds_head_scale(tmp_path):
+    """DISU state bounds are physical too (strt=0 m, one value per site)."""
+    name = _disu_da_model(tmp_path, "disubound")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_disu_obs_cycles(),
+        num_reals=4,
+    )
+    assert "error" not in res, res
+    _, state = _state_params(res)
+    assert state.loc["s1", "parlbnd"] == pytest.approx(-10.0)
+    assert state.loc["s1", "parubnd"] == pytest.approx(10.0)
+    assert state.loc["s2", "parlbnd"] == pytest.approx(-10.0)
+    assert state.loc["s2", "parubnd"] == pytest.approx(10.0)
+    assert (state["parubnd"] - state["parlbnd"]).max() <= 100.0
+
+
+def test_prior_std_draws_are_clipped_to_bounds(tmp_path):
+    """A large prior_std cannot emit out-of-bounds draws (log K or linear head)."""
+    name = _da_model(tmp_path, name="daclip")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=200,
+        prior_std=5.0,
+    )
+    assert "error" not in res, res
+    pst = pyemu.Pst(res["pst_file"])
+    pe = pyemu.ParameterEnsemble.from_csv(pst, res["prior_ensemble_file"])
+
+    # K is log-transformed with bounds initial*0.1 .. initial*10
+    k_vals = np.asarray(pe.loc[:, "k"].values, dtype=float)
+    assert k_vals.min() >= 0.5 - 1e-6
+    assert k_vals.max() <= 50.0 + 1e-6
+    assert k_vals.min() < k_vals.max()  # still drawn
+
+    # heads are linear with the physical state bounds (strt 25 +/- 10)
+    head_vals = np.asarray(pe.loc[:, "s1"].values, dtype=float)
+    assert head_vals.min() >= 15.0 - 1e-6
+    assert head_vals.max() <= 35.0 + 1e-6
+
+
+def test_explicit_prior_ensemble_values_clipped_to_bounds(tmp_path):
+    """Explicit out-of-bounds prior values are clipped (in-bounds kept as-is)."""
+    name = _da_model(tmp_path, name="daclipx")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        prior_ensemble={"k": [0.001, 3.0, 6.0, 1.0e6]},
+    )
+    assert "error" not in res, res
+    pst = pyemu.Pst(res["pst_file"])
+    pe = pyemu.ParameterEnsemble.from_csv(pst, res["prior_ensemble_file"])
+    vals = [float(v) for v in pe.loc[:, "k"].values]
+    assert min(vals) == pytest.approx(0.5)  # clipped up to the lower bound
+    assert max(vals) == pytest.approx(50.0)  # clipped down to the upper bound
+    assert any(abs(v - 3.0) < 1e-9 for v in vals)  # in-bounds survives
+    assert any(abs(v - 6.0) < 1e-9 for v in vals)
+
+
+def test_setup_da_control_flushes_model_once(tmp_path, monkeypatch):
+    """The K and IC rewires share a single full-model flush (was two)."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name = _da_model(tmp_path, name="daflush")
+    calls: list[str] = []
+    real_flush = cal.flush_model
+
+    def _spy(model: str) -> bool:
+        calls.append(model)
+        return real_flush(model)
+
+    monkeypatch.setattr(cal, "flush_model", _spy)
+
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+    )
+    assert "error" not in res, res
+    assert calls == [name]
+
+    # the deferred write still lands both external arrays and the OPEN/CLOSE wiring
+    ws = resolve_workspace(name)
+    gwf = get_gwf(name)
+    assert (ws / f"{gwf.name}_k.dat").exists()
+    assert (ws / f"{gwf.name}_strt.dat").exists()
+    assert "OPEN/CLOSE" in (ws / f"{gwf.name}.npf").read_text()
+    assert "OPEN/CLOSE" in (ws / f"{gwf.name}.ic").read_text()
+    assert Path(res["pst_file"]).exists()

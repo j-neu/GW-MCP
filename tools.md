@@ -287,10 +287,13 @@ transitions: `running` → `succeeded` | `failed` | `cancelled`.
   same shape as `run_simulation` (success, convergence, elapsed_s,
   listing_summary, observation_fit).
 - `start_calibration(model, pst_file, method, num_reals)` (calibration module)
-  starts pestpp-glm (`method="glm"`, default) or pestpp-ies (`method="ies"`)
-  the same way. While running, progress reports `engine`, `iteration` and
-  `latest_phi` parsed from `<case>.iobj` (GLM) or `<case>.phi.actual.csv`
-  (IES). The finished result matches `run_pestpp_glm` / `run_pestpp_ies`.
+  starts pestpp-glm (`method="glm"`, default), pestpp-ies (`method="ies"`) or
+  pestpp-da (`method="da"`) the same way. While running, progress reports
+  `engine`, `iteration` and `latest_phi` parsed from `<case>.iobj` (GLM) or
+  `<case>.phi.actual.csv` (IES), or the per-cycle post-update `cycle` /
+  `latest_phi` / `n_cycles` from `<case>.global.phi.actual.csv` (DA). The
+  finished result matches `run_pestpp_glm` / `run_pestpp_ies` / `run_pestpp_da`
+  (for DA, `num_reals` maps to `da_num_reals`).
 - `cancel_job(job_id)` terminates the underlying process **and its entire
   process tree** (`taskkill /T /F` on Windows, `killpg` on POSIX) — the
   PEST++ forward chain spawns `mf6.exe` grandchildren that would otherwise
@@ -408,9 +411,9 @@ Set up and run PEST++ parameter estimation via pyEMU.
 | Tool | Inputs | Returns |
 |---|---|---|
 | `setup_calibration` | `model: str`, `parameterisation: dict`, `obs_source: str = "model"`, `noptmax: int = 10` | The generated PEST interface: `.pst`, template, instruction file, external array, forward wrapper, parameter table |
-| `setup_da_control` | `model: str`, `parameterisation: dict`, `cycles: list[int]`, `obs_cycles: dict`, `obs_weights: dict \| None = None`, `par_cycles: dict \| None = None`, `num_reals: int = 50`, `noptmax: int = 1`, `use_simulated_states: bool = True`, `da_options: dict \| None = None`, `prior_ensemble: dict \| None = None`, `prior_std: float \| None = None` | The generated DA-ready v2 PEST interface: `.pst`, K template/target, IC template, cycle tables, state-parameter count, model command, prior ensemble file when requested |
+| `setup_da_control` | `model: str`, `parameterisation: dict`, `cycles: list[int]`, `obs_cycles: dict`, `obs_weights: dict \| None = None`, `par_cycles: dict \| None = None`, `num_reals: int = 50`, `noptmax: int = 1`, `use_simulated_states: bool = True`, `da_options: dict \| None = None`, `prior_ensemble: dict \| None = None`, `prior_std: float \| None = None`, `state_head_bound: float \| None = None` | The generated DA-ready v2 PEST interface: `.pst`, K template/target, IC template, cycle tables, state-parameter count, model command, prior ensemble file when requested |
 | `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"` | Path to generated `.pst` control file |
-| `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" = "glm"`, `num_reals: int = 50` | `{ model, job_id, kind, pst_file, status: "running" }` — starts PEST++ in a background thread with live phi progress (7e-A3) |
+| `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" \| "da" = "glm"`, `num_reals: int = 50` | `{ model, job_id, kind, pst_file, status: "running" }` — starts PEST++ in a background thread with live phi progress (7e-A3). For `method="da"`, progress is the per-cycle post-update phi from `<case>.global.phi.actual.csv` and `num_reals` maps to `da_num_reals` |
 
 ### Automated calibration setup — `setup_calibration` (7e-A2)
 
@@ -519,7 +522,9 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 - generates the MF6-OBS-CSV instruction file (the canonical `l1 ~,~ !name! …` pif reads the first data row, which is the end-of-cycle value because there is one time step per cycle);
 - writes the observation cycle table (`obs_cycles`), a weight cycle table when `obs_weights` is given (v5.2.16 ignores it — the authoritative weights are the non-zero values in `obs_data.csv`), and, when `par_cycles` supplies fixed forcing values, a populated parameter cycle table (a `perlen` entry templates the TDIS stress-period length). A `par_cycles` key that names an adjustable parameter is a hard `INVALID_INPUT` error (the cycle table would override the calibrated value every cycle);
 - assembles a **version-2** `.pst` whose external parameter/observation/model-IO sections carry a `cycle` column, with `da_num_reals`, `da_observation_cycle_table`, `da_parameter_cycle_table` and `da_use_simulated_states`;
-- when `prior_ensemble` (a mapping of parameter name to a list of realisations) or `prior_std` (draw `num_reals` realisations around each parameter's value with that standard deviation — log10 space for `partrans='log'`) is supplied, writes `<model>_da_prior.csv` (rows = realisations, columns = parameters) and sets `da_parameter_ensemble`; the ensemble row count becomes `da_num_reals`. With neither, `pestpp-da` draws the prior internally from the parameter bounds.
+- when `prior_ensemble` (a mapping of parameter name to a list of realisations) or `prior_std` (draw `num_reals` realisations around each parameter's value with that standard deviation — log10 space for `partrans='log'`) is supplied, writes `<model>_da_prior.csv` (rows = realisations, columns = parameters) and sets `da_parameter_ensemble`; the ensemble row count becomes `da_num_reals`. Every drawn **or supplied** realisation is clipped into its parameter's `parlbnd`/`parubnd` interval (in the parameter's own value/transform space), so a large `prior_std` cannot emit out-of-bounds values and an explicit out-of-bounds `prior_ensemble` entry is clamped rather than silently passed to pestpp-da. With neither, `pestpp-da` draws the prior internally from the parameter bounds.
+
+**Physical state bounds (7f-DA.3):** the `head_state` parameters (the state augmentation) get `parlbnd = strt - bound` / `parubnd = strt + bound`, where `bound` is the site's registered observed-value spread (`max - min` over its records, floored at 5 m; **10 m** when the site has fewer than two registered values) — never the `relative` change limit (about +/-1e6 m) that made the default bounds-derived prior physically meaningless (cycle-0 phi ~1e9 in the 6d rerun-2). `state_head_bound` (a positive float) overrides the derived bound for every state parameter. `setup_da_control` also performs a **single** full-model flush after staging both the NPF-K and IC-`strt` rewires (previously each helper flushed the whole model), which halves setup time on a large DISU grid with byte-identical on-disk inputs.
 
 `cycles` are DA cycle indices; `obs_cycles` maps a registered site name to `{cycle: observed value}` (a missing cycle is a blank/off cycle). The state-augmented IC parameterisation supports **DIS, DISV and DISU** grids: on DIS/DISV a site's stored cell id is `(layer, row, col)` / `(layer, node)`, on DISU it is a scalar **1-based node** number (`import_obs_from_csv` stores `node + 1`; the flat IC index is `node - 1` on a `nnodes`-node grid). A site outside the grid is an `INVALID_INPUT` error, raised **before** any model write (NPF `k` / IC `strt` are rewired only once all grid, state-cell and cycle inputs validate). The model must have `NPER=1`/`NSTP=1` — `setup_da_control` returns a clear `INVALID_INPUT` error otherwise. `use_simulated_states=True` is the only supported value: pestpp-da v5.2.16 requires final-to-initial state linkages the tool does not emit, so `use_simulated_states=False` is rejected with `INVALID_INPUT`. Run the assimilation with `run_pestpp_da`, then `summarise_da`.
 
