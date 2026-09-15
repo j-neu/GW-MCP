@@ -306,3 +306,75 @@ def test_start_calibration_rejects_unknown_method_before_workspace():
 
     with pytest.raises(ValueError, match="method"):
         cal._impl_start_calibration("no_such_model", "x.pst", method="sweep")
+
+
+def _wait(job_id: str, timeout: float = 10.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = jobs.get_status(job_id)
+        if status["status"] != "running":
+            return status
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} still running after {timeout}s")
+
+
+def test_start_calibration_da_omitted_num_reals_preserves_pst(tmp_path, monkeypatch):
+    """An omitted num_reals must not resize a setup_da_control PST (was 50)."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name, pst_file = _da_ready_pst(tmp_path, "dapreserve")
+    ws = resolve_workspace(name)
+    (ws / f"{pst_file.stem}.global.phi.actual.csv").write_text(_DA_PHI_CSV)
+    # setup_da_control(num_reals=4) wrote da_num_reals 4
+    assert str(pyemu.Pst(str(pst_file)).pestpp_options["da_num_reals"]) == "4"
+
+    monkeypatch.setattr(cal, "_find_pestpp_binary", lambda exe: f"/fake/{exe}")
+    monkeypatch.setattr(cal, "_run_process", lambda args, cwd: _FakeDAProc())
+
+    result = _impl_start_calibration(name, str(pst_file), method="da")
+    status = _wait(result["job_id"])
+    assert status["status"] == "succeeded", status
+    assert status["result"]["num_reals"] == 4  # preserved, not defaulted to 50
+    assert str(pyemu.Pst(str(pst_file)).pestpp_options["da_num_reals"]) == "4"
+
+
+def test_start_calibration_da_provided_num_reals_writes_pst(tmp_path, monkeypatch):
+    """An explicit num_reals still writes da_num_reals."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name, pst_file = _da_ready_pst(tmp_path, "dawrite")
+    ws = resolve_workspace(name)
+    (ws / f"{pst_file.stem}.global.phi.actual.csv").write_text(_DA_PHI_CSV)
+
+    monkeypatch.setattr(cal, "_find_pestpp_binary", lambda exe: f"/fake/{exe}")
+    monkeypatch.setattr(cal, "_run_process", lambda args, cwd: _FakeDAProc())
+
+    result = _impl_start_calibration(name, str(pst_file), method="da", num_reals=7)
+    status = _wait(result["job_id"])
+    assert status["status"] == "succeeded", status
+    assert status["result"]["num_reals"] == 7
+    assert str(pyemu.Pst(str(pst_file)).pestpp_options["da_num_reals"]) == "7"
+
+
+def test_start_calibration_ies_omitted_num_reals_preserves_pst(tmp_path, monkeypatch):
+    """The IES path gets the same preserve-when-omitted semantics as DA."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name, pst_file = _model_with_pst(tmp_path, "iespreserve")
+    pst = pyemu.Pst(str(pst_file))
+    pst.pestpp_options["ies_num_reals"] = 6
+    pst.write(str(pst_file))
+
+    monkeypatch.setattr(cal, "_find_pestpp_binary", lambda exe: f"/fake/{exe}")
+    monkeypatch.setattr(cal, "_run_process", lambda args, cwd: _FakeDAProc())
+
+    status = _wait(_impl_start_calibration(name, str(pst_file), method="ies")["job_id"])
+    assert status["status"] == "succeeded", status
+    assert status["result"]["num_reals"] == 6
+    assert str(pyemu.Pst(str(pst_file)).pestpp_options["ies_num_reals"]) == "6"
+
+    status = _wait(
+        _impl_start_calibration(name, str(pst_file), method="ies", num_reals=9)["job_id"]
+    )
+    assert status["result"]["num_reals"] == 9
+    assert str(pyemu.Pst(str(pst_file)).pestpp_options["ies_num_reals"]) == "9"

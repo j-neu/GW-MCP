@@ -453,7 +453,7 @@ def _impl_start_calibration(
     model: str,
     pst_file: str,
     method: str = "glm",
-    num_reals: int = 50,
+    num_reals: int | None = None,
 ) -> dict:
     """Start a PEST++ calibration in the background and return a job id (7e-A3).
 
@@ -463,9 +463,14 @@ def _impl_start_calibration(
     iteration + phi from ``<case>.iobj`` / ``<case>.phi.actual.csv`` (GLM/IES)
     or the per-cycle post-update phi from ``<case>.global.phi.actual.csv`` (DA)
     — and stop with ``cancel_job``. The finished job's ``result`` matches
-    ``run_pestpp_glm`` / ``run_pestpp_ies`` / ``run_pestpp_da``; for ``"da"``
-    ``num_reals`` is written to the ``da_num_reals`` option (the DA ensemble
-    size, not ``noptmax``, which stays the per-cycle update count).
+    ``run_pestpp_glm`` / ``run_pestpp_ies`` / ``run_pestpp_da``.
+
+    ``num_reals`` sets the ensemble size for IES (``ies_num_reals``) and DA
+    (``da_num_reals``). When omitted (``None``) the PST's own option is
+    **preserved**, so a ``setup_da_control(num_reals=N)`` PST (whose
+    ``da_num_reals`` is the prior CSV's row count) is not silently resized —
+    the same preserve-when-unset semantics as ``run_pestpp_da`` /
+    ``run_pestpp_ies``. ``noptmax`` remains the DA per-cycle update count.
     """
     if method not in ("glm", "ies", "da"):
         raise ValueError(f"method must be 'glm', 'ies' or 'da', got '{method}'.")
@@ -481,14 +486,17 @@ def _impl_start_calibration(
         {"glm": "pestpp-glm", "ies": "pestpp-ies", "da": "pestpp-da"}[method]
     )
     noptmax: int | None = None
+    effective_reals: int | None = None
     if method in ("ies", "da"):
         pst = pyemu.Pst(str(pst_path))
-        if method == "ies":
-            pst.pestpp_options["ies_num_reals"] = num_reals
-        else:
-            pst.pestpp_options["da_num_reals"] = int(num_reals)
+        option = "ies_num_reals" if method == "ies" else "da_num_reals"
+        if num_reals is not None:
+            pst.pestpp_options[option] = int(num_reals)
+            pst.write(str(pst_path))
+        if method == "da":
             noptmax = int(pst.control_data.noptmax)
-        pst.write(str(pst_path))
+        existing = pst.pestpp_options.get(option)
+        effective_reals = int(existing) if existing is not None else None
 
     proc = _run_process([exe, pst_path.name], str(ws))
     lines: deque[str] = deque(maxlen=5000)
@@ -517,7 +525,7 @@ def _impl_start_calibration(
                 "final_phi_mean": float(np.mean(phi_vals)) if phi_vals else None,
                 "final_phi_std": float(np.std(phi_vals)) if phi_vals else None,
                 "cycles": len(cycles),
-                "num_reals": int(num_reals),
+                "num_reals": effective_reals,
                 "noptmax": noptmax,
                 "stdout": "".join(lines)[-3000:],
                 "stderr": "",
@@ -540,7 +548,7 @@ def _impl_start_calibration(
             "final_phi_mean": final_phi_mean,
             "final_phi_std": final_phi_std,
             "iterations": iterations,
-            "num_reals": num_reals,
+            "num_reals": effective_reals,
             "stdout": "".join(lines)[-3000:],
         }
 
@@ -2167,10 +2175,16 @@ def _da_prior_bounds(row) -> tuple[float, float]:
     return lb, ub
 
 
-def _clip_da_prior_values(values, row) -> np.ndarray:
-    """Clip prior realisations into the parameter's own bounds (7f-DA.3)."""
+def _clip_da_prior_values(values, row) -> tuple[np.ndarray, int]:
+    """Clip prior realisations into the parameter's own bounds (7f-DA.3).
+
+    Returns ``(clipped_values, n_clipped)`` where ``n_clipped`` counts the
+    out-of-bounds realisations (so a silent clamp is reportable).
+    """
     lb, ub = _da_prior_bounds(row)
-    return np.clip(np.asarray(values, dtype=float), lb, ub)
+    arr = np.asarray(values, dtype=float)
+    n_clipped = int(np.count_nonzero((arr < lb) | (arr > ub)))
+    return np.clip(arr, lb, ub), n_clipped
 
 
 def _impl_write_da_prior_ensemble(
@@ -2192,10 +2206,11 @@ def _impl_write_da_prior_ensemble(
     Every drawn **or supplied** realisation is clipped into the parameter's own
     ``parlbnd``/``parubnd`` interval (7f-DA.3), so a large ``prior_std`` cannot
     emit physically meaningless values and an explicit ``prior_ensemble`` entry
-    outside the bounds is clamped rather than silently passed to pestpp-da.
-    Clipping happens in each parameter's value space (``partrans`` transform
-    space), so a log-transformed parameter's draw is clipped to the image of
-    its log-space bound interval.
+    outside the bounds is clamped rather than silently passed to pestpp-da. The
+    number of clamped realisations is reported as ``n_clipped``. Clipping happens
+    in each parameter's value space (``partrans`` transform space), so a
+    log-transformed parameter's draw is clipped to the image of its log-space
+    bound interval.
 
     The draw is done here rather than with ``ParameterEnsemble.from_gaussian_draw``
     because pyemu 1.4.0's ``Cov`` lowercases parameter names, which collides with
@@ -2206,6 +2221,7 @@ def _impl_write_da_prior_ensemble(
     _validate_da_prior_spec(par_names, prior_ensemble, prior_std, num_reals)
     by_lower = {n.lower(): n for n in par_names}
 
+    n_clipped_total = 0
     if prior_ensemble is not None:
         series: dict[str, list[float]] = {}
         for raw, vals in prior_ensemble.items():
@@ -2215,7 +2231,9 @@ def _impl_write_da_prior_ensemble(
         for name in par_names:
             row = pst.parameter_data.loc[name]
             if name in series:
-                df[name] = _clip_da_prior_values(series[name], row)
+                clipped, n_clipped = _clip_da_prior_values(series[name], row)
+                df[name] = clipped
+                n_clipped_total += n_clipped
             else:
                 df[name] = float(row["parval1"])
     else:
@@ -2231,13 +2249,17 @@ def _impl_write_da_prior_ensemble(
             if transform in ("fixed", "tied"):
                 df[name] = base
             elif transform == "log":
-                df[name] = _clip_da_prior_values(
+                clipped, n_clipped = _clip_da_prior_values(
                     10.0 ** (np.log10(base) + rng.normal(0.0, std, n_reals)), row
                 )
+                df[name] = clipped
+                n_clipped_total += n_clipped
             else:
-                df[name] = _clip_da_prior_values(
+                clipped, n_clipped = _clip_da_prior_values(
                     base + rng.normal(0.0, std, n_reals), row
                 )
+                df[name] = clipped
+                n_clipped_total += n_clipped
 
     # PEST/PEST++ names are lowercased, so emit lowercase columns to line up with
     # the control file once it is read back.
@@ -2245,7 +2267,11 @@ def _impl_write_da_prior_ensemble(
     pe = pyemu.ParameterEnsemble(pst, df, istransformed=False)
     out_path = ws / f"{model}_da_prior.csv"
     pe.to_csv(str(out_path))
-    return {"file": str(out_path), "num_reals": int(pe.shape[0])}
+    return {
+        "file": str(out_path),
+        "num_reals": int(pe.shape[0]),
+        "n_clipped": int(n_clipped_total),
+    }
 
 
 def _impl_setup_da_control(
@@ -2285,10 +2311,13 @@ def _impl_setup_da_control(
 
     State parameters get a **physical** head-scale bound (7f-DA.3), not the
     ``relative`` change limit: ``parlbnd = strt - bound``, ``parubnd =
-    strt + bound`` where ``bound`` is the site's registered observed-value
-    spread (``max - min`` over its records, floored at 5 m; 10 m when the site
-    has fewer than two values). ``state_head_bound`` overrides the derived
-    bound for every site with a caller-supplied positive value.
+    strt + bound`` where ``bound = max(observed spread, abs(strt - mean(observed
+    values)), 5 m)`` — wide enough to cover both the observed range and the head
+    shift the evidence demands — and 10 m when the site has fewer than two
+    registered values. ``state_head_bound`` overrides the derived bound for every
+    site with a caller-supplied positive value; the per-site bound used is
+    reported as ``state_bounds``, and ``prior_ensemble_n_clipped`` reports how
+    many prior realisations were clamped.
     """
     ws = resolve_workspace(model)
 
@@ -2444,9 +2473,10 @@ def _impl_setup_da_control(
     # bad/conflicting prior before the K/IC rewire.
     _validate_da_prior_spec(par_names, prior_ensemble, prior_std, num_reals)
 
-    # Physical state bounds (7f-DA.3): strt +/- the site's observed-value spread
-    # (floored), so pestpp-da's bounds-derived default prior is head-scale.
-    # Validated here — still before the K/IC rewire.
+    # Physical state bounds (7f-DA.3): strt +/- a head-scale bound, so
+    # pestpp-da's bounds-derived default prior is physical. The bound itself is
+    # derived once `ic_initial` (the shipped strt) is known. Validated here —
+    # still before the K/IC rewire.
     if state_head_bound is not None:
         bound_val = float(state_head_bound)
         if not np.isfinite(bound_val) or bound_val <= 0.0:
@@ -2454,15 +2484,6 @@ def _impl_setup_da_control(
                 "state_head_bound must be a positive finite number, got "
                 f"{state_head_bound}."
             )
-    state_bounds: dict[str, float] = {}
-    for site in site_names:
-        if state_head_bound is not None:
-            state_bounds[site] = float(state_head_bound)
-            continue
-        vals = site_values.get(site, [])
-        state_bounds[site] = (
-            10.0 if len(vals) < 2 else max(max(vals) - min(vals), 5.0)
-        )
 
     # -- parameters: K rewire + template (reuses the setup_calibration path) --
     # Both rewires are staged in memory and persisted by ONE flush (7f-DA.3):
@@ -2490,6 +2511,23 @@ def _impl_setup_da_control(
         for idx, name in name_by_flat.items()
     }
     _tpl_substitute(ic_tpl_path, ic_target, ic_initial)
+
+    # Per-site physical state bound: wide enough to cover both the observed
+    # spread and the shift from `strt` to the observed mean (rerun-2 needed
+    # 1-8 m moves, so the 5 m floor alone can pin a state), never below 5 m;
+    # 10 m when the site has fewer than two registered values.
+    state_bounds: dict[str, float] = {}
+    for site in site_names:
+        if state_head_bound is not None:
+            state_bounds[site] = float(state_head_bound)
+            continue
+        vals = site_values.get(site, [])
+        if len(vals) < 2:
+            state_bounds[site] = 10.0
+            continue
+        spread = max(vals) - min(vals)
+        offset = abs(float(ic_initial[site]) - float(np.mean(vals)))
+        state_bounds[site] = max(spread, offset, 5.0)
 
     # -- OBS instruction file (first data row = end-of-cycle value) --------
     output_csv = str(obs_meta["output_csv"])
@@ -2641,6 +2679,7 @@ def _impl_setup_da_control(
         "n_adjustable_parameters": len(norm["parameters"]),
         "n_state_parameters": len(site_names),
         "n_cycles": len(cycles),
+        "state_bounds": state_bounds,
         "model_command": list(pst.model_command),
         "next_steps": (
             "Run the assimilation with run_pestpp_da(model, pst_file), then "
@@ -2651,6 +2690,7 @@ def _impl_setup_da_control(
         result["forward_wrapper"] = wrapper["wrapper_path"]
     if prior_tbl is not None:
         result["prior_ensemble_file"] = prior_tbl["file"]
+        result["prior_ensemble_n_clipped"] = prior_tbl["n_clipped"]
     return result
 
 
@@ -3646,17 +3686,20 @@ def register(mcp: FastMCP) -> None:
         parameter's value with that standard deviation) optionally writes
         ``<model>_da_prior.csv`` and points the ``da_parameter_ensemble`` option
         at it; supply at most one. Every drawn or supplied realisation is
-        clipped into its parameter's ``parlbnd``/``parubnd`` interval. When
+        clipped into its parameter's ``parlbnd``/``parubnd`` interval, and the
+        number clamped is reported as ``prior_ensemble_n_clipped``. When
         neither is given, pestpp-da draws the prior internally from the
         parameter bounds. The written ensemble's row count becomes the DA
         ensemble size (``da_num_reals``).
 
         State parameters get physical head-scale bounds, ``strt +/- bound``,
-        where ``bound`` is the site's registered observed-value
-        spread (floored at 5 m; 10 m for a site with fewer than two values) —
+        where ``bound = max(observed spread, abs(strt - mean(observed values)),
+        5 m)`` (10 m for a site with fewer than two values) — wide enough to
+        cover both the observed range and the head shift the evidence demands,
         not the ``relative`` change limit that made the default prior
         unphysical. ``state_head_bound`` overrides the derived bound for every
-        state parameter with a positive caller-supplied value.
+        state parameter with a positive caller-supplied value; the per-site
+        bound used is returned in ``state_bounds``.
 
         The tool rewires NPF k and the IC strt array to external OPEN/CLOSE
         files, generates the K template plus a state-augmented IC template (one
@@ -3773,7 +3816,7 @@ def register(mcp: FastMCP) -> None:
         model: str,
         pst_file: str,
         method: str = "glm",
-        num_reals: int = 50,
+        num_reals: int | None = None,
     ) -> dict:
         """Start PEST++ calibration (GLM, IES or DA) in the background and
         return a job id immediately (7e-A3).
@@ -3781,8 +3824,11 @@ def register(mcp: FastMCP) -> None:
         method is "glm" (pestpp-glm, default), "ies" (pestpp-ies) or "da"
         (pestpp-da). For IES, num_reals sets the ensemble size
         (``ies_num_reals``); for DA it maps to ``da_num_reals`` (the DA
-        ensemble size — ``noptmax`` remains the per-cycle update count). The
-        calibration runs in a worker thread instead of blocking until the
+        ensemble size — ``noptmax`` remains the per-cycle update count). When
+        num_reals is omitted the PST's own ``ies_num_reals`` / ``da_num_reals``
+        is preserved, so a ``setup_da_control(num_reals=N)`` PST (its
+        ``da_num_reals`` is the prior CSV's row count) is not silently resized.
+        The calibration runs in a worker thread instead of blocking until the
         client timeout. Poll progress and the final result with
         get_job_status(job_id) — while running it reports live iteration + phi
         parsed from <case>.iobj (GLM), <case>.phi.actual.csv (IES) or the

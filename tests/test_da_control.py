@@ -1078,6 +1078,50 @@ def test_setup_da_control_state_bounds_from_obs_spread(tmp_path):
     assert np.isfinite(state["parlbnd"]).all() and np.isfinite(state["parubnd"]).all()
     assert (state["parubnd"] - state["parlbnd"]).max() <= 100.0
 
+    # the per-site bound actually used is reported back
+    assert res["state_bounds"]["S1"] == pytest.approx(10.0)
+    assert res["state_bounds"]["S2"] == pytest.approx(5.0)
+    assert res["state_bounds"]["S3"] == pytest.approx(10.0)
+
+
+def test_setup_da_control_state_bound_reaches_observed_mean(tmp_path):
+    """A bound must cover the shift from strt to the observed mean, not just
+    the spread floor — rerun-2 needed 1-8 m state moves."""
+    name = _da_model(tmp_path, name="daoffset", with_obs=False)
+    _register_obs_rows(
+        tmp_path,
+        name,
+        [
+            ("S1", "2020-01-01", 10.0, (0, 0, 1)),
+            ("S1", "2020-01-02", 12.0, (0, 0, 1)),  # mean 11, spread 2, strt 25
+            ("S2", "2020-01-01", 25.0, (0, 1, 1)),
+            ("S2", "2020-01-02", 26.0, (0, 1, 1)),  # mean 25.5, spread 1
+            ("S3", "2020-01-01", 25.0, (0, 2, 1)),
+            ("S3", "2020-01-02", 25.0, (0, 2, 1)),  # mean == strt, spread 0
+        ],
+    )
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=4,
+    )
+    assert "error" not in res, res
+    _, state = _state_params(res)
+
+    # S1: the bound reaches the observed level (offset 14 dominates spread 2 and
+    # the 5 m floor), so the state can move from 25 down to the 11 m evidence.
+    assert res["state_bounds"]["S1"] == pytest.approx(14.0)
+    assert state.loc["s1", "parlbnd"] == pytest.approx(25.0 - 14.0)
+    assert state.loc["s1", "parubnd"] == pytest.approx(25.0 + 14.0)
+    assert state.loc["s1", "parlbnd"] <= 11.0  # reaches the observed mean
+
+    # S2: offset 0.5 and spread 1 both below the floor -> 5 m
+    assert res["state_bounds"]["S2"] == pytest.approx(5.0)
+    # S3: offset 0, spread 0 -> floor
+    assert res["state_bounds"]["S3"] == pytest.approx(5.0)
+
 
 def test_setup_da_control_state_head_bound_override(tmp_path):
     """state_head_bound overrides the spread-derived bound for every site."""
@@ -1096,6 +1140,7 @@ def test_setup_da_control_state_head_bound_override(tmp_path):
     assert state.loc["s1", "parubnd"] == pytest.approx(25.0 + 3.0)
     widths = (state["parubnd"] - state["parlbnd"]).to_numpy(dtype=float)
     assert np.allclose(widths, 6.0)
+    assert all(res["state_bounds"][s] == pytest.approx(3.0) for s in ("S1", "S2", "S3"))
 
 
 def test_setup_da_control_rejects_non_positive_state_head_bound(tmp_path):
@@ -1158,6 +1203,9 @@ def test_prior_std_draws_are_clipped_to_bounds(tmp_path):
     assert head_vals.min() >= 15.0 - 1e-6
     assert head_vals.max() <= 35.0 + 1e-6
 
+    # the clamps are reported, not silent
+    assert res["prior_ensemble_n_clipped"] > 0
+
 
 def test_explicit_prior_ensemble_values_clipped_to_bounds(tmp_path):
     """Explicit out-of-bounds prior values are clipped (in-bounds kept as-is)."""
@@ -1177,6 +1225,8 @@ def test_explicit_prior_ensemble_values_clipped_to_bounds(tmp_path):
     assert max(vals) == pytest.approx(50.0)  # clipped down to the upper bound
     assert any(abs(v - 3.0) < 1e-9 for v in vals)  # in-bounds survives
     assert any(abs(v - 6.0) < 1e-9 for v in vals)
+    # exactly the two out-of-bounds realisations were clamped, and it is reported
+    assert res["prior_ensemble_n_clipped"] == 2
 
 
 def test_setup_da_control_flushes_model_once(tmp_path, monkeypatch):
