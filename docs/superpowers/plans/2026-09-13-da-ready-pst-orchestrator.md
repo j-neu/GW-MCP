@@ -356,6 +356,40 @@ git commit -m "feat(calibration): setup_da_control builds a DA-ready v2 PST with
 
 ---
 
+## Task 8: DA background run, physical state priors, clip prior draws (fixes surfaced by rerun-2)
+
+**Why:** the first green EnKF rerun (run log `.kilo/worktrees/6d-enkf-disu-rerun2/run-log.md` §10) surfaced three gaps that risk the set-and-forget rerun-3: (1) `setup_da_control`/`run_pestpp_da` exceed the MCP client timeout with no job/progress API; (2) DA state parameters are written with ±1e6 `relative` bounds (`calibration.py:2397-2398`), so pestpp-da's default bounds-derived prior is unphysical and cycle 0 is wasted; (3) `prior_std` draws are not clipped to `parlbnd`/`parubnd`.
+
+**Files:**
+- Modify: `src/groundwater_mcp/tools/calibration.py`
+- Test: `tests/test_da_control.py`, `tests/test_pestpp_da.py`
+- Modify: `tools.md`
+
+**Interfaces:**
+- `start_calibration(method="da")` (and `_impl_start_calibration`) runs `pestpp-da` in the background via the existing `jobs.submit` machinery, returning a `job_id`; `get_job_status` reports DA progress from `<case>.global.phi.actual.csv` (add a `"da"` branch to `_pestpp_progress`, and a DA result shape matching `run_pestpp_da`); `cancel_job` works. `num_reals` maps to `da_num_reals`.
+- `_impl_setup_da_control` gains a physical state-bound rule: state parameters get `parlbnd = strt - bound`, `parubnd = strt + bound` (not ±1e6), where `bound` is derived per site from the registered observed values' spread (max−min over its cycles, floored, e.g. `max(spread, 5.0)`, default 10.0 when a site has <2 values) and overridable via a new `state_head_bound: float | None = None` argument.
+- `_impl_write_da_prior_ensemble` clips every drawn/supplied realisation into `[parlbnd, parubnd]` (in the parameter's own `partrans` space), so `prior_std` cannot emit out-of-bounds values.
+
+- [ ] **Step 1: Failing test — DA background job.** With a fake `jobs.submit`/process or a synthetic `<case>.global.phi.actual.csv`, assert `_impl_start_calibration(method="da")` returns a job id and `_pestpp_progress(..., "da")` parses the per-cycle phi; assert an invalid method is still rejected.
+
+- [ ] **Step 2: Run → fail.** Implement the method dispatch + DA progress + DA result shape; run → pass.
+
+- [ ] **Step 3: Failing test — physical state bounds.** Build a DISU (and DIS) model with registered obs having a known per-site value spread; assert `setup_da_control` writes state params with `parlbnd`/`parubnd` = `strt ± bound` (finite, head-scale, not ±1e6) and that `state_head_bound` overrides it; assert the default is physical.
+
+- [ ] **Step 4: Run → fail.** Implement the bound rule; run → pass.
+
+- [ ] **Step 5: Failing test — clipped prior draws.** With a log-transformed K and `prior_std`, assert no drawn value falls outside `[parlbnd, parubnd]` (and the same for an out-of-bounds explicit `prior_ensemble` value, which must be clipped or rejected with a clear message — pick one and document it).
+
+- [ ] **Step 6: Run → fail.** Implement clipping; run → pass.
+
+- [ ] **Step 7: `setup_da_control` runtime.** Profile the DISU setup path; eliminate redundant full-model flushes (the NPF and IC rewire helpers each `save_sim`+`flush_model`) so setup performs a single flush. Verify the written files are unchanged. Record the before/after timing in the report.
+
+- [ ] **Step 8: Docs** — `tools.md` rows for `start_calibration` (DA method), `setup_da_control` (`state_head_bound`), and any changed description. Update the rerun-2 backlog items in `tasks.md` to "fixed".
+
+- [ ] **Step 9: Verify** — `pytest -q`, `ruff check src`, `mypy src` green. Commit.
+
+---
+
 ## Self-Review
 
 - **Spec coverage:** engine exposure (done, `388839d`) → Task 2; cycle tables → Task 2; prior ensemble → Task 3; run → existing `run_pestpp_da`; summarise → Task 4; end-to-end proof → Task 5; Tier-1 gate → Task 6. The high-risk state-linkage unknown is Task 1 (spike) and feeds Tasks 2–3.
