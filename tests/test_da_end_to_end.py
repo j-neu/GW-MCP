@@ -31,6 +31,11 @@ from groundwater_mcp.tools.calibration import _find_pestpp_binary
 from groundwater_mcp.tools.runner import _find_mf6_binary
 
 _MODEL = "da_e2e"
+_MODEL_DISU = "da_e2e_disu"
+
+# IAC/JA for a 5-node 1-D DISU chain (each node's first connection is itself).
+_DISU_IAC = [2, 3, 3, 3, 2]
+_DISU_JA = [0, 1, 1, 0, 2, 2, 1, 3, 3, 2, 4, 4, 3]
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +152,103 @@ def _build_model(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_disu_model(tmp_path: Path) -> None:
+    """Build a 5-node 1-D DISU transient model plus 2 registered node gauges.
+
+    DISU is the grid of the blocked Tier-1 target (MF6_EnKF_DISU): scalar
+    1-based node ids rather than (layer, row, col) or (layer, node).
+    """
+    ws = str(tmp_path / _MODEL_DISU)
+    _call(
+        "create_model",
+        {"name": _MODEL_DISU, "workspace": ws, "units": "METERS", "time_units": "DAYS"},
+    )
+    _call(
+        "set_simulation",
+        {
+            "model": _MODEL_DISU,
+            "nper": 1,
+            "perlen": [50.0],
+            "nstp": [1],
+            "ims_complexity": "simple",
+        },
+    )
+    _call(
+        "add_disu_package",
+        {
+            "model": _MODEL_DISU,
+            "nodes": 5,
+            "nja": len(_DISU_JA),
+            "top": [0.0] * 5,
+            "bot": [-10.0] * 5,
+            "area": [100.0] * 5,
+            "iac": _DISU_IAC,
+            "ja": _DISU_JA,
+        },
+    )
+    _call(
+        "add_npf_package",
+        {
+            "model": _MODEL_DISU,
+            "icelltype": 0,
+            "k": [5.0, 10.0, 20.0, 40.0, 80.0],
+            "k33": None,
+            "save_flows": True,
+        },
+    )
+    _call("add_ic_package", {"model": _MODEL_DISU, "strt": 0.0})
+    _call(
+        "add_sto_package",
+        {
+            "model": _MODEL_DISU,
+            "iconvert": 0,
+            "ss": 1e-4,
+            "sy": None,
+            "steady_state": [],
+            "save_flows": True,
+        },
+    )
+    # CHD gradient: high head at node 0, low head at node 4.
+    _call(
+        "add_boundary_package",
+        {
+            "model": _MODEL_DISU,
+            "package": "CHD",
+            "stress_period_data": {"0": [[0, 1.0], [4, 0.0]]},
+            "kwargs": None,
+        },
+    )
+    _call(
+        "add_oc_package",
+        {
+            "model": _MODEL_DISU,
+            "head_filerecord": None,
+            "budget_filerecord": None,
+            "saverecord": None,
+            "printrecord": None,
+        },
+    )
+
+    obs_csv = tmp_path / "gauges_disu.csv"
+    with obs_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "cellid"])
+        writer.writerow(["D1", "2020-01-01", 0.6, 0])
+        writer.writerow(["D2", "2020-01-01", 0.4, 2])
+    _call(
+        "import_obs_from_csv",
+        {
+            "model": _MODEL_DISU,
+            "csv_file": str(obs_csv),
+            "obs_type": "HEAD",
+            "site_col": "site",
+            "date_col": "date",
+            "value_col": "value",
+            "cellid_col": "cellid",
+        },
+    )
+
+
 @requires_da_stack
 def test_mcp_only_sequential_da_run(tmp_path):
     """The full chain runs over >=2 cycles with finite phi, MCP-tool only."""
@@ -196,6 +298,44 @@ def test_mcp_only_sequential_da_run(tmp_path):
     assert member_cols[-1] == "base", header
 
     summary = _call("summarise_da", {"model": _MODEL, "pst_file": pst_file})
+    assert summary["engine"] == "da"
+    assert [c["cycle"] for c in summary["cycles"]] == [0, 1]
+    assert summary["final_phi_mean"] is not None
+    assert math.isfinite(summary["final_phi_mean"])
+
+
+@requires_da_stack
+def test_mcp_only_sequential_da_run_disu(tmp_path):
+    """The full DA chain runs over >=2 cycles on a DISU grid (Task 7)."""
+    _build_disu_model(tmp_path)
+
+    setup = _call(
+        "setup_da_control",
+        {
+            "model": _MODEL_DISU,
+            "parameterisation": {"k": {"target": "npf:k", "scope": "all", "initial": 10.0}},
+            "cycles": [0, 1],
+            "obs_cycles": {"D1": {0: 0.6, 1: 0.7}, "D2": {0: 0.4, 1: 0.5}},
+            "num_reals": 5,
+        },
+    )
+    assert setup["n_cycles"] == 2
+    assert setup["n_observations"] == 2
+    assert setup["n_state_parameters"] == 2
+    pst_file = setup["pst_file"]
+    assert Path(pst_file).exists()
+
+    import pyemu
+
+    assert str(pyemu.Pst(pst_file).pestpp_options["da_num_reals"]) == "5"
+
+    run = _call("run_pestpp_da", {"model": _MODEL_DISU, "pst_file": pst_file})
+    assert run["converged"], run
+    assert run["cycles"] >= 2, run
+    assert run["num_reals"] == 5, run
+    assert math.isfinite(run["final_phi_mean"])
+
+    summary = _call("summarise_da", {"model": _MODEL_DISU, "pst_file": pst_file})
     assert summary["engine"] == "da"
     assert [c["cycle"] for c in summary["cycles"]] == [0, 1]
     assert summary["final_phi_mean"] is not None

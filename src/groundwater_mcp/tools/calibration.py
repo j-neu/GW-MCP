@@ -1928,9 +1928,10 @@ def _impl_rewire_ic_strt_external(model: str, filename: str | None = None) -> di
 def _da_cell_flat_index(model: str, cellid) -> int:
     """Flat (C-order) index of a registered observation cell.
 
-    ``import_obs_from_csv`` stores 0-based cell ids: ``(layer, row, col)`` on a
-    DIS grid and ``(layer, node)`` on a DISV grid. The flat index matches the
-    layout of the external IC array the template is written against.
+    ``import_obs_from_csv`` stores DIS/DISV cell ids as ``(layer, row, col)`` /
+    ``(layer, node)`` and DISU node ids as a scalar 1-based ``node``. The flat
+    index matches the layout of the external IC array the template is written
+    against.
     """
     gwf = get_gwf(model)
     dis = get_dis(gwf)
@@ -1961,9 +1962,28 @@ def _da_cell_flat_index(model: str, cellid) -> int:
         if not (0 <= lay < nlay and 0 <= node < ncpl):
             raise ValueError(f"Observation cell {cellid!r} is out of bounds on the grid.")
         return lay * ncpl + node
+    disu = get_disu(gwf)
+    if disu is not None:
+        # DISU cell ids are scalar 1-based node numbers (import_obs_from_csv
+        # stores ``node + 1``); the flat index is the 0-based node.
+        nnodes = int(disu.nodes.data)
+        if isinstance(cellid, (int, np.integer)):
+            node = int(cellid)
+        else:
+            parts = [int(v) for v in cellid]
+            if len(parts) != 1:
+                raise ValueError(
+                    f"Observation cell {cellid!r} must be a 1-based node id on a "
+                    "DISU grid."
+                )
+            node = parts[0]
+        flat = node - 1
+        if not (0 <= flat < nnodes):
+            raise ValueError(f"Observation cell {cellid!r} is out of bounds on the grid.")
+        return flat
     raise ValueError(
-        "setup_da_control IC state parameterisation supports DIS and DISV grids "
-        "only; this model has neither."
+        "setup_da_control IC state parameterisation supports DIS, DISV and DISU "
+        "grids only; this model has none of them."
     )
 
 
@@ -2231,17 +2251,13 @@ def _impl_setup_da_control(
                 f"obs_cycles['{site}'] refers to cycle(s) {bad} not in cycles {cycles}."
             )
 
-    # -- parameters: K rewire + template (reuses the setup_calibration path) --
+    # -- validate everything that needs no model write ---------------------
+    # Grid support, state-cell mapping and the forcing/name checks all run
+    # before ``_restore_or_snapshot_k_base`` and the K/IC rewires, so a rejected
+    # setup leaves NPF ``k`` and IC ``strt`` untouched (the 6d run log's
+    # secondary finding: a failed DISU setup left uniform K=1).
     norm = _normalise_parameterisation(model, parameterisation)
-    _restore_or_snapshot_k_base(model)
-    ext_file = _impl_rewire_npf_k_external(model)["external_file"]
-    k_tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
-    k_tpl_path = Path(k_tpl["tpl_path"])
-    k_target = Path(k_tpl["target"])
-    k_initial = {p["name"]: p["initial"] for p in norm["parameters"]}
-    _tpl_substitute(k_tpl_path, k_target, k_initial)
 
-    # -- IC state parameterisation ----------------------------------------
     name_by_flat: dict[int, str] = {}
     for entry, site in zip(site_entries, site_names):
         idx = _da_cell_flat_index(model, entry["cellid"])
@@ -2251,25 +2267,7 @@ def _impl_setup_da_control(
                 "same cell; DA state parameters must be one per cell."
             )
         name_by_flat[idx] = site
-    ic_info = _impl_rewire_ic_strt_external(model)
-    ic_base = ic_info["array"]
-    ic_target = Path(ws / ic_info["external_file"])
-    ic_tpl = _impl_generate_ic_tpl(model, name_by_flat, ic_base, ic_info["external_file"])
-    ic_tpl_path = Path(ic_tpl["tpl_path"])
-    ic_initial = {
-        name: float(np.asarray(ic_base).reshape(-1)[idx])
-        for idx, name in name_by_flat.items()
-    }
-    _tpl_substitute(ic_tpl_path, ic_target, ic_initial)
 
-    # -- OBS instruction file (first data row = end-of-cycle value) --------
-    output_csv = str(obs_meta["output_csv"])
-    ins_path = ws / f"{output_csv}.ins"
-    _impl_generate_ins_from_obs_csv(
-        str(ws / output_csv), ins_path=str(ins_path), obs_names=site_names
-    )
-
-    # -- optional per-cycle fixed forcing parameters -----------------------
     k_param_names = [p["name"] for p in norm["parameters"]]
     raw_par_cycles = par_cycles
     par_cycles = {}
@@ -2291,15 +2289,52 @@ def _impl_setup_da_control(
             "parameterisation."
         )
     forcing_names = [n for n in par_cycles if n not in k_param_names]
+    if len(forcing_names) > 1:
+        raise ValueError(
+            "A single-time-step DA model has one per-cycle forcing slot "
+            "(the TDIS stress-period length); supply at most one "
+            f"par_cycles parameter outside the K parameterisation, got "
+            f"{forcing_names}."
+        )
+    par_names = list(k_param_names) + list(site_names) + list(forcing_names)
+    if len(set(par_names)) != len(par_names):
+        raise ValueError(
+            "DA parameter names collide (K parameter names, observation/state "
+            "names and forcing names must be distinct): "
+            f"{sorted({n for n in par_names if par_names.count(n) > 1})}."
+        )
+
+    # -- parameters: K rewire + template (reuses the setup_calibration path) --
+    _restore_or_snapshot_k_base(model)
+    ext_file = _impl_rewire_npf_k_external(model)["external_file"]
+    k_tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
+    k_tpl_path = Path(k_tpl["tpl_path"])
+    k_target = Path(k_tpl["target"])
+    k_initial = {p["name"]: p["initial"] for p in norm["parameters"]}
+    _tpl_substitute(k_tpl_path, k_target, k_initial)
+
+    # -- IC state parameterisation ----------------------------------------
+    ic_info = _impl_rewire_ic_strt_external(model)
+    ic_base = ic_info["array"]
+    ic_target = Path(ws / ic_info["external_file"])
+    ic_tpl = _impl_generate_ic_tpl(model, name_by_flat, ic_base, ic_info["external_file"])
+    ic_tpl_path = Path(ic_tpl["tpl_path"])
+    ic_initial = {
+        name: float(np.asarray(ic_base).reshape(-1)[idx])
+        for idx, name in name_by_flat.items()
+    }
+    _tpl_substitute(ic_tpl_path, ic_target, ic_initial)
+
+    # -- OBS instruction file (first data row = end-of-cycle value) --------
+    output_csv = str(obs_meta["output_csv"])
+    ins_path = ws / f"{output_csv}.ins"
+    _impl_generate_ins_from_obs_csv(
+        str(ws / output_csv), ins_path=str(ins_path), obs_names=site_names
+    )
+
+    # -- optional per-cycle fixed forcing parameters -----------------------
     tdis_tpl = None
     if forcing_names:
-        if len(forcing_names) != 1:
-            raise ValueError(
-                "A single-time-step DA model has one per-cycle forcing slot "
-                "(the TDIS stress-period length); supply at most one "
-                f"par_cycles parameter outside the K parameterisation, got "
-                f"{forcing_names}."
-            )
         tdis_tpl = _impl_generate_tdis_tpl(model, forcing_names[0])
         perlen = par_cycles[forcing_names[0]]
         initial = next(
@@ -2311,14 +2346,6 @@ def _impl_setup_da_control(
         )
 
     # -- assemble the version-2 control file ------------------------------
-    par_names = list(k_param_names) + list(site_names) + list(forcing_names)
-    if len(set(par_names)) != len(par_names):
-        raise ValueError(
-            "DA parameter names collide (K parameter names, observation/state "
-            "names and forcing names must be distinct): "
-            f"{sorted({n for n in par_names if par_names.count(n) > 1})}."
-        )
-
     pst = pyemu.pst_utils.generic_pst(par_names, site_names)
 
     for p in norm["parameters"]:

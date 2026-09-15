@@ -15,6 +15,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pyemu
 import pytest
 
@@ -23,6 +24,7 @@ from groundwater_mcp.server import mcp
 from groundwater_mcp.tools.builder import (
     _impl_add_boundary_package,
     _impl_add_dis_package,
+    _impl_add_disu_package,
     _impl_add_ic_package,
     _impl_add_npf_package,
     _impl_add_oc_package,
@@ -31,6 +33,7 @@ from groundwater_mcp.tools.builder import (
     _impl_set_simulation,
 )
 from groundwater_mcp.tools.calibration import (
+    _da_cell_flat_index,
     _detect_pestpp_engine,
     _impl_setup_da_control,
     _impl_run_pestpp_da,
@@ -38,6 +41,12 @@ from groundwater_mcp.tools.calibration import (
     _write_cycle_table,
 )
 from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
+from groundwater_mcp.utils.model_store import (
+    flush_model,
+    get_gwf,
+    read_meta,
+    write_meta,
+)
 from groundwater_mcp.utils.workspace import resolve_workspace
 
 # ---------------------------------------------------------------------------
@@ -118,6 +127,90 @@ def _obs_cycles() -> dict:
         "S2": {0: 30.0, 1: 31.0},
         "S3": {0: 28.0, 1: 29.0},
     }
+
+
+# ---------------------------------------------------------------------------
+# DISU helpers
+# ---------------------------------------------------------------------------
+
+# 0-based nodes handed to import_obs_from_csv; it stores them 1-based.
+_DISU_OBS_NODES = {"S1": 0, "S2": 2}
+
+
+def _line_disu_connectivity(nnodes: int) -> tuple[list[int], list[int]]:
+    """IAC/JA for an ``nnodes``-long 1-D chain (first connection is the node itself)."""
+    iac = [2] + [3] * (nnodes - 2) + [2]
+    ja: list[int] = []
+    for node in range(nnodes):
+        ja.append(node)
+        if node > 0:
+            ja.append(node - 1)
+        if node < nnodes - 1:
+            ja.append(node + 1)
+    return iac, ja
+
+
+def _register_disu_obs(tmp_path: Path, name: str) -> None:
+    csv_path = tmp_path / f"{name}_obs.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["site", "date", "value", "cellid"])
+        for i, (site, node) in enumerate(_DISU_OBS_NODES.items()):
+            writer.writerow([site, "2020-01-01", 0.6 - 0.2 * i, node])
+    _impl_import_obs_from_csv(
+        name,
+        str(csv_path),
+        "HEAD",
+        "site",
+        "date",
+        "value",
+        None,
+        None,
+        0,
+        cellid_col="cellid",
+    )
+
+
+def _disu_da_model(
+    tmp_path: Path, name: str = "disudamodel", nnodes: int = 5, with_obs: bool = True
+) -> str:
+    """A 5-node 1-D DISU model with a CHD gradient and one DA time step.
+
+    ``k`` is deliberately heterogeneous so the transactional test can tell a
+    rewired (uniform) field from the original one.
+    """
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "METERS", "DAYS")
+    _impl_set_simulation(name, 1, [1.0], [1], "simple")
+    iac, ja = _line_disu_connectivity(nnodes)
+    _impl_add_disu_package(
+        name,
+        nnodes,
+        len(ja),
+        [0.0] * nnodes,
+        [-10.0] * nnodes,
+        area=[100.0] * nnodes,
+        iac=iac,
+        ja=ja,
+    )
+    _impl_add_npf_package(
+        name,
+        icelltype=0,
+        k=[5.0, 10.0, 20.0, 40.0, 80.0][:nnodes],
+        k33=None,
+        save_flows=True,
+    )
+    _impl_add_ic_package(name, strt=0.0)
+    _impl_add_boundary_package(name, "CHD", {"0": [[0, 1.0], [nnodes - 1, 0.0]]}, None)
+    _impl_add_oc_package(name, None, None, None, None)
+    if with_obs:
+        _register_disu_obs(tmp_path, name)
+    flush_model(name)
+    return name
+
+
+def _disu_obs_cycles() -> dict:
+    return {"S1": {0: 0.6, 1: 0.7}, "S2": {0: 0.4, 1: 0.5}}
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +736,97 @@ def test_setup_da_control_rejects_use_simulated_states_false(tmp_path):
     assert payload["error"] is True
     assert payload["code"] == "INVALID_INPUT"
     assert "use_simulated_states" in payload["message"]
+
+
+# ---------------------------------------------------------------------------
+# DISU grids (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def test_da_cell_flat_index_maps_disu_node_and_rejects_out_of_bounds(tmp_path):
+    """A stored DISU cell id is a 1-based node; the flat index is node - 1."""
+    name = _disu_da_model(tmp_path, "disuidx", with_obs=False)
+    assert _da_cell_flat_index(name, 5) == 4  # bare int (the stored form)
+    assert _da_cell_flat_index(name, [5]) == 4  # 1-element list
+    assert _da_cell_flat_index(name, (5,)) == 4  # 1-element tuple
+    assert _da_cell_flat_index(name, 1) == 0  # first node
+    with pytest.raises(ValueError, match="out of bounds"):
+        _da_cell_flat_index(name, 6)  # 1-based 6 -> flat 5 on a 5-node grid
+    with pytest.raises(ValueError, match="out of bounds"):
+        _da_cell_flat_index(name, 0)  # 1-based nodes start at 1
+    with pytest.raises(ValueError, match="1-based node"):
+        _da_cell_flat_index(name, [1, 2])
+
+
+def test_setup_da_control_disu_writes_v2_state_parameters(tmp_path):
+    """setup_da_control produces a v2 DA PST on a DISU grid (the 6d blocker)."""
+    name = _disu_da_model(tmp_path, "disuda")
+    res = _impl_setup_da_control(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_disu_obs_cycles(),
+        num_reals=4,
+        noptmax=1,
+    )
+    assert "error" not in res, res
+    pst = pyemu.Pst(res["pst_file"])
+    assert str(pst.pestpp_options["da_num_reals"]) == "4"
+    assert str(pst.pestpp_options["da_observation_cycle_table"]).endswith(".csv")
+    assert str(pst.pestpp_options["da_use_simulated_states"]).lower() == "true"
+    text = Path(res["pst_file"]).read_text()
+    assert "version=2" in text.replace(" ", "")
+    assert "cycle" in pst.observation_data.columns
+
+    # one head_state parameter per registered site, sharing the observation name
+    state = pst.parameter_data[pst.parameter_data["pargp"] == "head_state"]
+    assert set(state.index) == {"s1", "s2"}
+    assert (state["partrans"] == "none").all()
+    assert res["n_state_parameters"] == 2
+    assert res["n_observations"] == 2
+    assert res["n_cycles"] == 2
+
+    # the state-augmented IC template targets the external strt array
+    assert Path(res["ic_template_file"]).exists()
+    ic_tpl_text = Path(res["ic_template_file"]).read_text()
+    assert ic_tpl_text.count("~") >= 2  # state tokens present
+    in_files = set(pst.model_input_data["pest_file"])
+    assert any(f.endswith(".tpl") for f in in_files)
+
+
+def test_setup_da_control_disu_out_of_bounds_site_is_transactional(tmp_path):
+    """A rejected DISU site must not leave the model rewired.
+
+    import_obs_from_csv validates node ids, so an out-of-bounds site is written
+    into the model metadata directly — exactly the stale/edited meta a real
+    workspace can carry. The failed call must not have rewired NPF k (the 6d
+    run log's secondary finding: a failed setup left uniform K=1).
+    """
+    name = _disu_da_model(tmp_path, "disutxn")
+    ws = resolve_workspace(name)
+    meta = read_meta(name)
+    meta["observations"]["sites"][1]["cellid"] = 99
+    write_meta(name, meta)
+
+    k_before = np.asarray(get_gwf(name).get_package("npf").k.array, dtype=float).copy()
+    with pytest.raises(ValueError, match="out of bounds"):
+        _impl_setup_da_control(
+            name,
+            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+            cycles=[0, 1],
+            obs_cycles=_disu_obs_cycles(),
+        )
+
+    # no external K/IC rewire and no template substitution happened
+    gwf = get_gwf(name)
+    gname = gwf.name
+    assert not (ws / f"{gname}_k.dat").exists()
+    assert not (ws / f"{gname}_k.dat.tpl").exists()
+    assert not (ws / f"{gname}_strt.dat").exists()
+    assert not (ws / f"{gname}_strt.dat.tpl").exists()
+    assert f"{gname}_k.dat" not in (ws / f"{gname}.npf").read_text().lower()
+    k_after = np.asarray(gwf.get_package("npf").k.array, dtype=float)
+    assert k_after == pytest.approx(k_before)
 
 
 
