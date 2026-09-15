@@ -322,6 +322,40 @@ git commit -m "feat(calibration): setup_da_control builds a DA-ready v2 PST with
 
 ---
 
+## Task 7: DISU support for the DA IC state parameterisation (unblocks the Tier-1 target)
+
+**Why:** the first closed-book rerun on `MF6_EnKF_DISU` (a **DISU** model) was blocked: `setup_da_control` forces `use_simulated_states=True`, whose IC state parameterisation accepts **DIS/DISV only**; `use_simulated_states=False` is rejected, so no DA-ready PST can be produced for DISU. The run log also found the failure is **non-transactional**: `setup_da_control` rewires NPF/IC *before* the grid check, so the failed call left the model with uniform K=1. Run log: `.kilo/worktrees/6d-enkf-disu-rerun1/run-log.md`.
+
+**Files:**
+- Modify: `src/groundwater_mcp/tools/calibration.py` (`_da_cell_flat_index` DISU branch; reorder `_impl_setup_da_control` so all grid/state validation precedes any model write)
+- Test: `tests/test_da_control.py`
+- Modify: `tools.md` (grid-support note: DIS/DISV/DISU)
+- Create: `research/discovery/sessions/2026-09-14-6d-enkf-disu-rerun1.md` (session log citing the run log)
+
+**Interfaces:**
+- `_da_cell_flat_index(model, cellid) -> int` supports **DIS/DISV/DISU**. DISU: `import_obs_from_csv` stores the cell id as an **int, 1-based node** (`site_to_cellid[site] = node + 1`; `_cellid_as_json` keeps ints as ints), so the flat index is `int(cellid) - 1`, validated `0 <= flat < disu.nnodes`. Accept either a bare int or a 1-element list/tuple.
+- `_impl_setup_da_control` performs the grid-support + state-cell mapping + out-of-bounds validation **before** `_restore_or_snapshot_k_base`/`_impl_rewire_npf_k_external`/`_impl_rewire_ic_strt_external`, so a rejected call leaves the model untouched.
+
+**Interfaces note:** `_impl_rewire_npf_k_external` (`calibration.py:1107`) and `_impl_rewire_ic_strt_external` (`calibration.py:1897`) already handle DISU (grid-agnostic flat array + FloPy write) — do not rewrite them.
+
+- [ ] **Step 1: Failing test — DISU flat index.** Build a small DISU model with `add_disu_package`; assert `_da_cell_flat_index` maps a stored 1-based node (e.g. `5` → flat `4`) and raises on an out-of-bounds node.
+
+- [ ] **Step 2: Run → fail** (current message: "supports DIS and DISV grids only").
+
+- [ ] **Step 3: Failing test — DISU `setup_da_control`.** Register 2 sites on the DISU model (`import_obs_from_csv` with `cellid_col`), call `_impl_setup_da_control(..., cycles=[0,1], obs_cycles={...}, noptmax=1)`; assert no error, a v2 PST exists, `da_num_reals`/`da_observation_cycle_table` set, and one `head_state` state parameter per site.
+
+- [ ] **Step 4: Failing test — transactional.** With an out-of-bounds DISU site, assert `_impl_setup_da_control` raises AND the model's NPF `k` is unchanged (no `*_k.dat` external rewire applied).
+
+- [ ] **Step 5: Implement** the DISU branch + reorder validation before mutation. Run the three tests → pass.
+
+- [ ] **Step 6: Extend the e2e.** Add a DISU variant to `tests/test_da_end_to_end.py` (small DISU grid, real `pestpp-da` run, gated on the binary) proving the chain works end-to-end on DISU.
+
+- [ ] **Step 7: Docs + session log.** Update `tools.md` grid note; write `research/discovery/sessions/2026-09-14-6d-enkf-disu-rerun1.md` (citing the run log and this fix).
+
+- [ ] **Step 8: Verify** — `pytest -q`, `ruff check src`, `mypy src` green. Commit.
+
+---
+
 ## Self-Review
 
 - **Spec coverage:** engine exposure (done, `388839d`) → Task 2; cycle tables → Task 2; prior ensemble → Task 3; run → existing `run_pestpp_da`; summarise → Task 4; end-to-end proof → Task 5; Tier-1 gate → Task 6. The high-risk state-linkage unknown is Task 1 (spike) and feeds Tasks 2–3.
