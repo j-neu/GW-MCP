@@ -390,6 +390,29 @@ git commit -m "feat(calibration): setup_da_control builds a DA-ready v2 PST with
 
 ---
 
+## Task 9: DA must run in a space-containing workspace; setup under the client timeout
+
+**Why:** rerun-3 (run log `.kilo/worktrees/6d-enkf-disu-rerun3/run-log.md` §7/§7b) found that `start_calibration(method="da")` **stalls** when the workspace path contains spaces (the mandated holdout path): `pestpp-da` spins at 100 % CPU in "making runs", the Python-wrapper model processes sit idle, and no `mf6` child is launched. The identical config in a **space-free** copy completes the full 6-cycle assimilation in 7.8 min with a direct `mf6.exe` command. Separately, `setup_da_control` on the 31.5k-node model still exceeds the ~90 s MCP client timeout, losing the tool result.
+
+**Files:**
+- Modify: `src/groundwater_mcp/tools/calibration.py` (model-command/wrapper generation; the DA background launch; setup hot path)
+- Test: `tests/test_da_control.py`, `tests/test_pestpp_da.py`
+- Modify: `tools.md`
+
+**Interfaces:** unchanged tool signatures; `start_calibration(method="da")` and `run_pestpp_da` must both complete a DA run in a workspace whose path contains a space.
+
+- [ ] **Step 1: Reproduce cheaply.** Create a small DISU or DIS model in a temp dir whose path **contains a space** (e.g. `...\Temp\kilo\space dir\`) and run both `_impl_start_calibration(method="da")` and `_impl_run_pestpp_da` on it with a real `pestpp-da`. Confirm the stall (background path) vs success (sync path) and capture the `.pst` model command line in each case. If the small model does not reproduce, escalate rather than guess.
+
+- [ ] **Step 2: Root-cause.** Determine why the background path stalls where the sync path succeeds: the wrapper script, `CREATE_NEW_PROCESS_GROUP`, stdout draining in the job worker, or the model-command parsing of the `python.exe` path that contains a space (`D:\Claude Projects\GW-MCP\.venv\...`). Record the mechanism with evidence.
+
+- [ ] **Step 3: Fix + test.** Make the DA (and, if the same path is affected, GLM/IES) background run launch the forward model reliably from a space-containing workspace — e.g. make the model command space-free (direct `mf6.exe` with `cwd=ws`, so the space is in the working directory, not the command line) and/or drain the child's stdout correctly and drop `CREATE_NEW_PROCESS_GROUP` if it is implicated. Add a regression test that fails on the current code and passes after the fix (a space-containing temp workspace, real binaries, no network).
+
+- [ ] **Step 4: `setup_da_control` runtime.** Profile the 31.5k-node DISU setup path (K template 605 kB / 31 522 tokens, IC template, `_tpl_substitute`, pyemu write) and optimise it under the ~90 s client timeout (or, if it cannot be made reliably fast, make it non-blocking like the run). Report before/after timings; verify the written files are byte-identical.
+
+- [ ] **Step 5: Docs + verify** — `tools.md` (workspace/space behaviour, any timing note); `pytest -q`, `ruff check src`, `mypy src` green. Commit.
+
+---
+
 ## Self-Review
 
 - **Spec coverage:** engine exposure (done, `388839d`) → Task 2; cycle tables → Task 2; prior ensemble → Task 3; run → existing `run_pestpp_da`; summarise → Task 4; end-to-end proof → Task 5; Tier-1 gate → Task 6. The high-risk state-linkage unknown is Task 1 (spike) and feeds Tasks 2–3.
