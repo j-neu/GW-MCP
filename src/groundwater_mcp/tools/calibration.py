@@ -2046,6 +2046,56 @@ def _impl_generate_tdis_tpl(model: str, perlen_name: str) -> dict:
     return {"tpl_path": str(tpl_path), "target": str(ws / target_file)}
 
 
+def _validate_da_prior_spec(
+    par_names: list[str],
+    prior_ensemble: dict | None,
+    prior_std: float | None,
+    num_reals: int,
+) -> None:
+    """Validate the ``da_parameter_ensemble`` spec without touching the model.
+
+    Split out of :func:`_impl_write_da_prior_ensemble` so ``setup_da_control``
+    can reject a bad prior *before* it rewires NPF ``k`` / IC ``strt`` (a bad
+    prior must not leave the workspace reading uniform ``k``). With neither
+    ``prior_ensemble`` nor ``prior_std`` supplied there is nothing to validate.
+    """
+    if prior_ensemble is None and prior_std is None:
+        return
+    if prior_ensemble is not None and prior_std is not None:
+        raise ValueError(
+            "Supply either prior_ensemble or prior_std, not both; prior_ensemble "
+            "is an explicit table, prior_std draws one from the parameter values."
+        )
+    if prior_ensemble is not None:
+        if not isinstance(prior_ensemble, dict):
+            raise ValueError("prior_ensemble must map parameter name → list of realisations.")
+        known = {str(n).lower() for n in par_names}
+        unknown: list[str] = []
+        lengths: set[int] = set()
+        for raw, vals in prior_ensemble.items():
+            if str(raw).lower() not in known:
+                unknown.append(str(raw))
+                continue
+            lengths.add(len(vals))
+        if unknown:
+            raise ValueError(
+                f"prior_ensemble names unknown parameter(s) {unknown}; the "
+                f"control file parameters are {par_names}."
+            )
+        if len(lengths) != 1:
+            raise ValueError(
+                "prior_ensemble columns must all hold the same number of "
+                f"realisations, got lengths {sorted(lengths)}."
+            )
+        if next(iter(lengths)) < 1:
+            raise ValueError("prior_ensemble must contain at least one realisation.")
+    else:
+        if prior_std is None or float(prior_std) <= 0.0:
+            raise ValueError("prior_std must be a positive number.")
+        if int(num_reals) < 1:
+            raise ValueError("num_reals must be a positive integer.")
+
+
 def _impl_write_da_prior_ensemble(
     model: str,
     pst: pyemu.Pst,
@@ -2066,40 +2116,16 @@ def _impl_write_da_prior_ensemble(
     because pyemu 1.4.0's ``Cov`` lowercases parameter names, which collides with
     the uppercase state-parameter names this control file can carry.
     """
-    if prior_ensemble is not None and prior_std is not None:
-        raise ValueError(
-            "Supply either prior_ensemble or prior_std, not both; prior_ensemble "
-            "is an explicit table, prior_std draws one from the parameter values."
-        )
     ws = resolve_workspace(model)
     par_names = [str(n) for n in pst.parameter_data.index]
+    _validate_da_prior_spec(par_names, prior_ensemble, prior_std, num_reals)
     by_lower = {n.lower(): n for n in par_names}
 
     if prior_ensemble is not None:
-        if not isinstance(prior_ensemble, dict):
-            raise ValueError("prior_ensemble must map parameter name → list of realisations.")
         series: dict[str, list[float]] = {}
-        unknown: list[str] = []
         for raw, vals in prior_ensemble.items():
-            key = str(raw).lower()
-            if key not in by_lower:
-                unknown.append(str(raw))
-                continue
-            series[by_lower[key]] = [float(v) for v in vals]
-        if unknown:
-            raise ValueError(
-                f"prior_ensemble names unknown parameter(s) {unknown}; the "
-                f"control file parameters are {par_names}."
-            )
-        lengths = {len(v) for v in series.values()}
-        if len(lengths) != 1:
-            raise ValueError(
-                "prior_ensemble columns must all hold the same number of "
-                f"realisations, got lengths {sorted(lengths)}."
-            )
-        n_reals = lengths.pop()
-        if n_reals < 1:
-            raise ValueError("prior_ensemble must contain at least one realisation.")
+            series[by_lower[str(raw).lower()]] = [float(v) for v in vals]
+        n_reals = len(next(iter(series.values())))
         df = pd.DataFrame(index=range(n_reals))
         for name in par_names:
             if name in series:
@@ -2107,11 +2133,8 @@ def _impl_write_da_prior_ensemble(
             else:
                 df[name] = float(pst.parameter_data.loc[name, "parval1"])
     else:
-        if prior_std is None or float(prior_std) <= 0.0:
-            raise ValueError("prior_std must be a positive number.")
+        assert prior_std is not None  # validated by _validate_da_prior_spec
         n_reals = int(num_reals)
-        if n_reals < 1:
-            raise ValueError("num_reals must be a positive integer.")
         rng = np.random.default_rng()
         std = float(prior_std)
         df = pd.DataFrame(index=range(n_reals))
@@ -2304,6 +2327,20 @@ def _impl_setup_da_control(
             f"{sorted({n for n in par_names if par_names.count(n) > 1})}."
         )
 
+    # Observation weights must name registered sites; validated here (not at the
+    # assembly below) so a bad weight is rejected before any model write.
+    weights = {str(k): float(v) for k, v in (obs_weights or {}).items()}
+    unknown_w = [k for k in weights if k not in site_names]
+    if unknown_w:
+        raise ValueError(
+            f"obs_weights names unknown observation(s) {unknown_w}; registered "
+            f"sites are {site_names}."
+        )
+
+    # The prior-ensemble spec (da_parameter_ensemble) is likewise pure: reject a
+    # bad/conflicting prior before the K/IC rewire.
+    _validate_da_prior_spec(par_names, prior_ensemble, prior_std, num_reals)
+
     # -- parameters: K rewire + template (reuses the setup_calibration path) --
     _restore_or_snapshot_k_base(model)
     ext_file = _impl_rewire_npf_k_external(model)["external_file"]
@@ -2375,13 +2412,6 @@ def _impl_setup_da_control(
 
     # Observation values come from the cycle table; weights must be non-zero in
     # obs_data.csv (da_weight_cycle_table is ignored by pestpp-da v5.2.16).
-    weights = {str(k): float(v) for k, v in (obs_weights or {}).items()}
-    unknown_w = [k for k in weights if k not in site_names]
-    if unknown_w:
-        raise ValueError(
-            f"obs_weights names unknown observation(s) {unknown_w}; registered "
-            f"sites are {site_names}."
-        )
     pst.observation_data["obsval"] = 0.0
     pst.observation_data["weight"] = [weights.get(n, 1.0) for n in site_names]
     pst.observation_data["obgnme"] = str(obs_meta.get("type", "HEAD")).lower()

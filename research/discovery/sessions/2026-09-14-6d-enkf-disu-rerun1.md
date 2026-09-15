@@ -74,4 +74,7 @@ grid-agnostic — only the index mapping and the ordering were wrong.
 The capability gap that blocked `MF6_EnKF_DISU` steps 6–7 is **closed**. A closed-book
 rerun of the Neckartal model (re-adopting from the pristine staged copy, since the failed
 run-1 setup left its workspace with uniform K) can now exercise
-`setup_da_control → run_pestpp_da → summarise_da` on the real DISU grid.
+`setup_da_control → run_pestpp_da → summarise_da` on the real DISU grid. DISU has no
+layer dimension — `disu.nodes.data` is the global node count and the 1-based *global*
+node is what `import_obs_from_csv` stores regardless of any `layer` argument — so the
+mapping is not limited to single-layer grids and the rerun is not deferred on that basis.

@@ -427,8 +427,9 @@ cap) to a spec dict:
 - `target`: the model array to parameterise — currently `"npf:k"` only.
 - `scope`: `"all"` (whole array), `"layer"` (with `"layer": N`), `"cells"`
   (with `"cells": [[layer, row, col], ...]` on DIS — `[[layer, node], ...]`
-  on DISV or `[[node], ...]` / a scalar node on DISU), or `"zones"` (with
-  `"layer": N`). Scopes must partition the array
+  on DISV or `[[node], ...]` / a scalar node on DISU; these `cells` node ids are
+  **0-based**, unlike observation cell ids which are 1-based on DISU), or
+  `"zones"` (with `"layer": N`). Scopes must partition the array
   exactly for all/layer/cells; `zones` is the multiplier mode below.
 - `initial` (required, > 0) sets the base value; `lower_factor` /
   `upper_factor` (defaults `0.1`/`10.0`) set the bounds as

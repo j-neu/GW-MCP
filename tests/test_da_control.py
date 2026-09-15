@@ -213,6 +213,19 @@ def _disu_obs_cycles() -> dict:
     return {"S1": {0: 0.6, 1: 0.7}, "S2": {0: 0.4, 1: 0.5}}
 
 
+def _assert_model_not_rewired(name: str, k_before) -> None:
+    """A rejected setup must not have rewired NPF k or IC strt."""
+    ws = resolve_workspace(name)
+    gwf = get_gwf(name)
+    gname = gwf.name
+    assert not (ws / f"{gname}_k.dat").exists()
+    assert not (ws / f"{gname}_k.dat.tpl").exists()
+    assert not (ws / f"{gname}_strt.dat").exists()
+    assert not (ws / f"{gname}_strt.dat.tpl").exists()
+    assert f"{gname}_k.dat" not in (ws / f"{gname}.npf").read_text().lower()
+    assert np.asarray(gwf.get_package("npf").k.array, dtype=float) == pytest.approx(k_before)
+
+
 # ---------------------------------------------------------------------------
 # Cycle-table writer
 # ---------------------------------------------------------------------------
@@ -803,7 +816,6 @@ def test_setup_da_control_disu_out_of_bounds_site_is_transactional(tmp_path):
     run log's secondary finding: a failed setup left uniform K=1).
     """
     name = _disu_da_model(tmp_path, "disutxn")
-    ws = resolve_workspace(name)
     meta = read_meta(name)
     meta["observations"]["sites"][1]["cellid"] = 99
     write_meta(name, meta)
@@ -817,16 +829,45 @@ def test_setup_da_control_disu_out_of_bounds_site_is_transactional(tmp_path):
             obs_cycles=_disu_obs_cycles(),
         )
 
-    # no external K/IC rewire and no template substitution happened
-    gwf = get_gwf(name)
-    gname = gwf.name
-    assert not (ws / f"{gname}_k.dat").exists()
-    assert not (ws / f"{gname}_k.dat.tpl").exists()
-    assert not (ws / f"{gname}_strt.dat").exists()
-    assert not (ws / f"{gname}_strt.dat.tpl").exists()
-    assert f"{gname}_k.dat" not in (ws / f"{gname}.npf").read_text().lower()
-    k_after = np.asarray(gwf.get_package("npf").k.array, dtype=float)
-    assert k_after == pytest.approx(k_before)
+    _assert_model_not_rewired(name, k_before)
+
+
+def test_setup_da_control_rejects_conflicting_prior_before_rewiring(tmp_path):
+    """A conflicting prior spec must be rejected before the K rewire.
+
+    ``prior_ensemble`` + ``prior_std`` is rejected inside the prior writer, but
+    the check is now run up front so the failed call cannot leave NPF reading
+    uniform ``k`` from ``<gwf>_k.dat``.
+    """
+    name = _da_model(tmp_path, name="datxnprior")
+    flush_model(name)
+    k_before = np.asarray(get_gwf(name).get_package("npf").k.array, dtype=float).copy()
+    with pytest.raises(ValueError, match="prior_ensemble"):
+        _impl_setup_da_control(
+            name,
+            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+            prior_ensemble={"k": [3.0, 4.0]},
+            prior_std=0.2,
+        )
+    _assert_model_not_rewired(name, k_before)
+
+
+def test_setup_da_control_rejects_unknown_weight_before_rewiring(tmp_path):
+    """An unknown obs_weights site must be rejected before the K rewire."""
+    name = _da_model(tmp_path, name="datxnweight")
+    flush_model(name)
+    k_before = np.asarray(get_gwf(name).get_package("npf").k.array, dtype=float).copy()
+    with pytest.raises(ValueError, match="obs_weights"):
+        _impl_setup_da_control(
+            name,
+            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+            obs_weights={"S9": 4.0},
+        )
+    _assert_model_not_rewired(name, k_before)
 
 
 
