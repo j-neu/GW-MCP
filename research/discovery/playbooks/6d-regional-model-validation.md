@@ -949,12 +949,14 @@ SUCCESS CRITERIA:
    ensemble size, noptmax=1 (v5.2.16: noptmax 0 performs NO update), and
    use_simulated_states=True. Report the generated .pst and the state-parameter
    count.
-7) Run the assimilation with run_pestpp_da (the .pst from step 6; omit num_reals
-   to keep the PST's ensemble size), then summarise_da. Report the per-cycle phi,
-   the final-cycle phi mean/std, posterior parameter statistics, and residuals. A
-   cycle-0 prior -> post-update phi improvement is expected where the observations
-   inform the parameters; if the gauge/head baseline is not calibrated (arbitrary
-   phi scale), document that rather than fabricate a fit.
+7) Run the assimilation with `start_calibration(model, pst_file, method="da")` —
+   a background DA job that returns a job id immediately (poll progress with
+   `get_job_status`, stop with `cancel_job`); the DA run is long and a synchronous
+   call would exceed the client timeout. Then `summarise_da`. Report the per-cycle
+   phi, the final-cycle phi mean/std, posterior parameter statistics, and
+   residuals. A cycle-0 prior -> post-update phi improvement is expected where the
+   observations inform the parameters; if the gauge/head baseline is not
+   calibrated (arbitrary phi scale), document that rather than fabricate a fit.
 8) Postprocess: produce a plot_heads_map (this vertex-carrying DISU grid is
    supported) and, on the final cycle, compare_to_observed /
    read_simulated_observations for the gauge fit.
