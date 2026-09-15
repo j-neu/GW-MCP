@@ -367,8 +367,8 @@ git commit -m "feat(calibration): setup_da_control builds a DA-ready v2 PST with
 
 **Interfaces:**
 - `start_calibration(method="da")` (and `_impl_start_calibration`) runs `pestpp-da` in the background via the existing `jobs.submit` machinery, returning a `job_id`; `get_job_status` reports DA progress from `<case>.global.phi.actual.csv` (add a `"da"` branch to `_pestpp_progress`, and a DA result shape matching `run_pestpp_da`); `cancel_job` works. `num_reals` maps to `da_num_reals`.
-- `_impl_setup_da_control` gains a physical state-bound rule: state parameters get `parlbnd = strt - bound`, `parubnd = strt + bound` (not ±1e6), where `bound` is derived per site from the registered observed values' spread (max−min over its cycles, floored, e.g. `max(spread, 5.0)`, default 10.0 when a site has <2 values) and overridable via a new `state_head_bound: float | None = None` argument.
-- `_impl_write_da_prior_ensemble` clips every drawn/supplied realisation into `[parlbnd, parubnd]` (in the parameter's own `partrans` space), so `prior_std` cannot emit out-of-bounds values.
+- `_impl_setup_da_control` gains a physical state-bound rule: state parameters get `parlbnd = strt - bound`, `parubnd = strt + bound` (not ±1e6), where `bound = max(per_site_observed_spread, |strt - mean(observed)|, 5.0)` — the `|strt - mean(observed)|` term guarantees the bound reaches the observed level (rerun-2 evidence shows the state needed 1–8 m shifts), and `bound` is overridable via a new `state_head_bound: float | None = None` argument. The result reports the per-site `state_bound` used.
+- `_impl_write_da_prior_ensemble` clips every drawn/supplied realisation into `[parlbnd, parubnd]` (in the parameter's own `partrans` space), and reports `n_clipped` so a clamped submission is visible in the tool result.
 
 - [ ] **Step 1: Failing test — DA background job.** With a fake `jobs.submit`/process or a synthetic `<case>.global.phi.actual.csv`, assert `_impl_start_calibration(method="da")` returns a job id and `_pestpp_progress(..., "da")` parses the per-cycle phi; assert an invalid method is still rejected.
 
