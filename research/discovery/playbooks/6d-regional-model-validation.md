@@ -883,10 +883,18 @@ academic/ToS). Verified facts (recon `sessions/2026-09-13-6d-enkf-disu-recon.md`
   values (aligned to its chosen 1-day periods) and reshapes the wide gauge tables
   into the long `site,date,value,Cell_ID` form `import_obs_from_csv` expects. This
   prep is ordinary Python and allowed; the table then enters the model via the tool.
-- The adopted workspace is the holdout sim directory (per the task brief) and
-  `setup_da_control` rewires NPF/IC **in place**. `clone_model` to a session-folder
-  workspace first is the equivalent MCP-only route if the holdout must stay
-  pristine; either is acceptable as long as it is documented.
+- The adopted workspace is the holdout sim directory and `setup_da_control`/
+  `set_simulation` rewires NPF/IC and regenerates `mfsim.nam` **in place**, so a
+  run dirties the holdout. **Run hygiene (required):** restore the sim directory
+  from the pristine snapshot `D:\Claude Projects\GW-MCP-holdout\_pristine\MF6_EnKF_DISU_sim\`
+  before every rerun, so each run starts from the shipped model. `clone_model` to
+  a session-folder workspace first is the equivalent MCP-only alternative if the
+  holdout must stay pristine; either is acceptable as long as it is documented.
+- **DISU support (fixed 2026-09-14, commits `8fb4742`/`f5d7a4f`):** the first closed-book
+  rerun was blocked because `setup_da_control`'s IC state parameterisation accepted
+  DIS/DISV only; it now supports **DISU** and validates all inputs before any model
+  write (a rejected call no longer leaves the model on uniform K). See
+  `sessions/2026-09-14-6d-enkf-disu-rerun1.md` for the original failure.
 
 ### Prompt (paste verbatim into the Agent Manager session)
 
