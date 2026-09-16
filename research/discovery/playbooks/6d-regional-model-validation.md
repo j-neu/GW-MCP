@@ -807,7 +807,7 @@ observations. Introduced 2026-09-13 with the DA capability (commits
 optional prior ensemble, `summarise_da`, and the end-to-end MCP-only proof in
 `sessions/2026-09-13-da-e2e-tiny-model.md`). The tool count is unchanged at 70.
 
-**Data:** `D:\Claude Projects\GW-MCP-holdout\selected\MF6_EnKF_DISU\`
+**Data:** `E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\`
 (github.com/JanGei/MF6_EnKF_DISU, cloned 2026-09-13; no LICENSE file — verify,
 academic/ToS). Verified facts (recon `sessions/2026-09-13-6d-enkf-disu-recon.md`):
 
@@ -886,10 +886,16 @@ academic/ToS). Verified facts (recon `sessions/2026-09-13-6d-enkf-disu-recon.md`
 - The adopted workspace is the holdout sim directory and `setup_da_control`/
   `set_simulation` rewires NPF/IC and regenerates `mfsim.nam` **in place**, so a
   run dirties the holdout. **Run hygiene (required):** restore the sim directory
-  from the pristine snapshot `D:\Claude Projects\GW-MCP-holdout\_pristine\MF6_EnKF_DISU_sim\`
+  from the pristine snapshot `E:\GW-MCP-holdout\_pristine\MF6_EnKF_DISU_sim\`
   before every rerun, so each run starts from the shipped model. `clone_model` to
   a session-folder workspace first is the equivalent MCP-only alternative if the
   holdout must stay pristine; either is acceptable as long as it is documented.
+- **Storage relocation (2026-09-15):** the original holdout volume `D:` reports
+  exFAT `OperationalStatus: Full Repair Needed`, which caused slow/ stalling model
+  I/O (rerun-3 stalled in `pestpp-da` with "MF6 itself 1.2 s" but ~90–130 s wall per
+  realisation). The holdout is therefore **mirrored to healthy NTFS `E:`**
+  (`E:\GW-MCP-holdout\`) and Target 8 runs against the E: copy; `D:` is retained as
+  the un-repaired original. Repair `D:` and remove this note once it is healthy.
 - **DISU support (fixed 2026-09-14, commits `8fb4742`/`f5d7a4f`):** the first closed-book
   rerun was blocked because `setup_da_control`'s IC state parameterisation accepted
   DIS/DISV only; it now supports **DISU** and validates all inputs before any model
@@ -907,7 +913,7 @@ repository source code, its tests, .kilo plans, or prior research session logs.
 You MAY read the target repository's own data, model files, and scripts — they
 are the model specification.
 
-DATA: D:\Claude Projects\GW-MCP-holdout\selected\MF6_EnKF_DISU\
+DATA: E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\
 (github.com/JanGei/MF6_EnKF_DISU, cloned 2026-09-13; no LICENSE file — verify).
 Layout: the runnable MF6 model is at
 NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim\ — a single GWF model
