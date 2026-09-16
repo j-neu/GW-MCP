@@ -413,6 +413,29 @@ git commit -m "feat(calibration): setup_da_control builds a DA-ready v2 PST with
 
 ---
 
+## Task 10: multiplier K scope for DA + run-isolated summarise_da
+
+**Why:** the EnKF reruns (run logs `.kilo/worktrees/6d-enkf-disu-rerun4/session6d-t8/run-log.md`, `…/6d-enkf-disu-rerun5/run-log.md`) show that `scope="all"` on `npf:k` **replaces** the 10,413-value heterogeneous K field with one uniform value — it collapsed to ≈0.1 m/d and aborted rerun-5's first attempt on MF6 convergence, and it is why K rails at a bound. `scope="zones"` is infeasible here (10,413 zones), and the 31,522-token template is why `setup_da_control` exceeds the client timeout. A single **multiplier** on the base field preserves the pattern *and* shrinks the template to one token. Separately, `summarise_da` is not run-isolated: after a second DA run in the same directory it returned the first run's posterior and residuals.
+
+**Files:**
+- Modify: `src/groundwater_mcp/tools/calibration.py`
+- Test: `tests/test_da_control.py`, `tests/test_calibration.py`
+- Modify: `tools.md`
+
+**Interfaces:**
+- New K scope `"multiplier"`: one dimensionless factor applied to the **existing** K array (`k = base_k × factor`), base pattern preserved. Reuse the existing multiplier machinery: `_apply_k_multipliers` (`calibration.py:1070`), `_maybe_apply_zone_multipliers` (`:1102`) and `_generate_forward_wrapper(multiply_k=True)` (`:1562`) with a **single all-cells zone** (zone id 1), so the external multiplier file holds one value and the K template one token. Default factor 1.0; bounds from `lower_factor`/`upper_factor`; `partrans` default `"log"`.
+- `_impl_setup_da_control` accepts `scope="multiplier"` (it currently rejects non-`all`/`layer`/`cells` for DA) and routes through the multiplier/wrapper path instead of a per-cell token template.
+- `_impl_summarise_da` derives its run base from the current PST/run so a second DA run in the same directory reports **that run's** posterior and residuals.
+
+- [ ] **Step 1: Failing test — multiplier preserves the base field.** On a small DIS model with a heterogeneous K array, `setup_da_control(parameterisation={"k_mult": {"target":"npf:k","scope":"multiplier","initial":1.0,"lower_factor":0.2,"upper_factor":5.0}}, ...)` produces a v2 PST with **one** adjustable K parameter and a K template holding one token; at the default factor the written K equals the base field (pattern preserved), and a factor of 2 doubles it.
+- [ ] **Step 2: Run → fail.** Implement the scope (normaliser + DA routing via the single-zone multiplier/wrapper). Run → pass.
+- [ ] **Step 3: Failing test — `summarise_da` run isolation.** Two successive DA runs in one workspace with different cycle counts: after the second, `summarise_da` reports the **second** run's cycle count/posterior, not the first's.
+- [ ] **Step 4: Run → fail.** Implement the run-scoped base resolution. Run → pass.
+- [ ] **Step 5: Setup runtime.** Confirm `setup_da_control` with `scope="multiplier"` is comfortably under the ~90 s client timeout on a large (≥30k-cell) model (1-token template), recording before/after.
+- [ ] **Step 6: Docs + verify.** `tools.md` (the new scope); `pytest -q`, `ruff check src`, `mypy src` green; tool count unchanged (70). Commit.
+
+---
+
 ## Self-Review
 
 - **Spec coverage:** engine exposure (done, `388839d`) → Task 2; cycle tables → Task 2; prior ensemble → Task 3; run → existing `run_pestpp_da`; summarise → Task 4; end-to-end proof → Task 5; Tier-1 gate → Task 6. The high-risk state-linkage unknown is Task 1 (spike) and feeds Tasks 2–3.
