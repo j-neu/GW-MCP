@@ -842,8 +842,10 @@ academic/ToS). Verified facts (recon `sessions/2026-09-13-6d-enkf-disu-recon.md`
   (v5.2.16: `noptmax 0` performs no update), `da_num_reals N`,
   `da_use_simulated_states True`, a `head_state` parameter per gauge cell, and
   populated observation/parameter cycle tables.
-- **Run**: `run_pestpp_da` exits 0 with an N-realisation ensemble over the
-  requested cycles; per-cycle state carry-forward is observable.
+- **Run**: the DA engine runs to completion with an N-realisation ensemble over
+  the requested cycles and per-cycle state carry-forward observable — either
+  `run_pestpp_da` (synchronous) or the equivalent background
+  `start_calibration(model, pst_file, method="da")` + `get_job_status`.
 - **Summarise**: `summarise_da` returns the per-cycle **post-update** phi, the
   final-cycle phi mean/std, posterior parameter statistics and residuals, with no
   error.
@@ -948,10 +950,13 @@ SUCCESS CRITERIA:
    cellid_col="Cell_ID" (scalar DISU node id; the tool converts to the 1-based OBS
    id) plus the site/date/value columns. Verify the 14 gauges map to the intended
    nodes (e.g. a converged run + compare_to_observed).
-6) Set up the DA: call setup_da_control with a K parameterisation on npf:k
-   (scope "all" or "zones"/"cells", log-transformed), cycles=[...], obs_cycles
-   mapping every registered site to {cycle: observed value} (the gauge values from
-   step 5), par_cycles supplying the per-cycle TDIS perlen, num_reals = your
+6) Set up the DA: call setup_da_control with a K parameterisation on npf:k —
+   prefer scope "multiplier" (a single dimensionless factor applied to the
+   existing K field, so the heterogeneous pattern is preserved; `scope="all"`
+   replaces the whole field with one uniform value, which is solver-hostile on
+   this 10,413-value K field), log-transformed. Pass cycles=[...], obs_cycles
+   mapping every registered site to {cycle: observed value} (the gauge values
+   from step 5), par_cycles supplying the per-cycle TDIS perlen, num_reals = your
    ensemble size, noptmax=1 (v5.2.16: noptmax 0 performs NO update), and
    use_simulated_states=True. Report the generated .pst and the state-parameter
    count.
