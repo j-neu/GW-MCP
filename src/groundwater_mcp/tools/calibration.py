@@ -369,27 +369,50 @@ def _read_da_cycle_phi(ws: Path, base_name: str) -> list[dict]:
     return cycles
 
 
-def _read_da_parameter_ensemble(ws: Path, base_name: str) -> dict[str, dict]:
-    """Posterior parameter statistics from the final pestpp-da cycle ensemble.
+def _read_da_parameter_ensemble(
+    ws: Path, base_name: str, cycle: int | None = None
+) -> dict[str, dict]:
+    """Posterior parameter statistics from a pestpp-da cycle ensemble.
 
     pestpp-da writes ``<case>.global.<cycle>.pe.csv`` (columns ``real_name``
     then the parameter names, with a ``base`` row alongside the realisations).
-    The highest cycle's file is the posterior; the ``base`` row is excluded.
+    The ``base`` row is excluded.
+
+    When ``cycle`` is given the exact final-cycle file of the **current** run is
+    read. This is the run-isolation fix: a second DA run with fewer cycles in a
+    reused workspace leaves the first run's higher-cycle ``.pe.csv`` on disk, so
+    "highest cycle number" returned the previous run's posterior (6d rerun-4
+    finding F2). With ``cycle=None`` the highest cycle file is used.
     """
-    pe_csv = _latest_ensemble_file(ws, base_name, "pe")
+    if cycle is None:
+        pe_csv = _latest_ensemble_file(ws, base_name, "pe")
+    else:
+        candidate = ws / f"{base_name}.global.{int(cycle)}.pe.csv"
+        pe_csv = candidate if candidate.exists() else None
     if pe_csv is None:
         return {}
     return _parameter_ensemble_stats(pe_csv, drop_base=True)
 
 
-def _latest_da_residual_file(ws: Path, base_name: str) -> Path | None:
-    """Return the highest cycle/iteration pestpp-da ``<case>.<c>.<i>.base.rei``."""
+def _latest_da_residual_file(
+    ws: Path, base_name: str, cycle: int | None = None
+) -> Path | None:
+    """Return the highest iteration pestpp-da ``<case>.<c>.<i>.base.rei``.
+
+    ``cycle`` restricts the search to the current run's final cycle (see
+    ``_read_da_parameter_ensemble``); without it the highest cycle/iteration
+    across every run in the workspace is returned.
+    """
     pattern = re.compile(r"\.(\d+)\.(\d+)\.base\.rei$")
     files = []
     for p in ws.glob(f"{base_name}.*.base.rei"):
         m = pattern.search(p.name)
-        if m is not None:
-            files.append(((int(m.group(1)), int(m.group(2))), p))
+        if m is None:
+            continue
+        c, it = int(m.group(1)), int(m.group(2))
+        if cycle is not None and c != int(cycle):
+            continue
+        files.append(((c, it), p))
     if not files:
         return None
     return max(files, key=lambda t: t[0])[1]
@@ -1110,6 +1133,160 @@ def _maybe_apply_zone_multipliers(model: str, target: Path) -> None:
         _apply_k_multipliers(base, zone, target, ws / f"{gwf.name}_k.dat")
 
 
+def _grid_info(gwf) -> dict:
+    """Grid descriptor (``type``, ``nlay``, ``per_layer``, ``ncell``, ...).
+
+    Shared by the parameterisation normalisers so DIS / DISV / DISU grids are
+    classified one way. Mirrors the historical zoned branch: a DIS package
+    wins unless a DISV package is also present (``get_package("dis")``
+    prefix-matches DISV).
+    """
+    dis = get_dis(gwf)
+    disv = get_disv(gwf)
+    if dis is not None and disv is None:
+        nlay = int(dis.nlay.data)
+        nrow = int(dis.nrow.data)
+        ncol = int(dis.ncol.data)
+        return {
+            "type": "DIS",
+            "nlay": nlay,
+            "nrow": nrow,
+            "ncol": ncol,
+            "per_layer": nrow * ncol,
+            "ncell": nlay * nrow * ncol,
+        }
+    if disv is not None:
+        nlay = int(disv.nlay.data)
+        ncpl = int(disv.ncpl.data)
+        return {
+            "type": "DISV",
+            "nlay": nlay,
+            "ncpl": ncpl,
+            "per_layer": ncpl,
+            "ncell": nlay * ncpl,
+        }
+    disu = get_disu(gwf)
+    if disu is None:
+        raise ValueError("No grid package (DIS/DISV/DISU) found on the model.")
+    nnodes = int(disu.nodes.data)
+    return {
+        "type": "DISU",
+        "nlay": 1,
+        "nnodes": nnodes,
+        "per_layer": nnodes,
+        "ncell": nnodes,
+    }
+
+
+def _normalise_multiplier_parameterisation(model: str, parameterisation: dict) -> dict:
+    """Validate a single-factor K multiplier parameterisation (scope="multiplier").
+
+    Unlike ``scope="zones"`` (which derives zones from equal K values and is
+    infeasible on a field with thousands of distinct values), this mode puts
+    **every** cell in one zone, so the external multiplier file holds a single
+    value and the K template holds a single token regardless of grid size. The
+    forward wrapper computes ``k = base_k × factor`` per run, preserving the
+    base spatial pattern (the 6d rerun-5 ``scope="all"`` collapse).
+
+    ``initial`` defaults to ``1.0`` (the shipped base field); ``lower_factor`` /
+    ``upper_factor`` default to 0.1/10.0; ``partrans`` defaults to ``"log"``.
+
+    The base K array itself is deliberately **not** read here: the caller reads
+    it from ``_restore_or_snapshot_k_base`` so a repeated setup cannot
+    parameterise a previously mutated field.
+    """
+    if not isinstance(parameterisation, dict):
+        raise ValueError(
+            "parameterisation must be a dict mapping parameter name → spec, "
+            f"got {type(parameterisation).__name__}."
+        )
+    if not parameterisation:
+        raise ValueError("parameterisation must name at least one parameter.")
+    if len(parameterisation) != 1:
+        raise ValueError(
+            "scope='multiplier' takes exactly one parameter (a single factor "
+            f"applied to the whole K field); got {len(parameterisation)}."
+        )
+    gwf = get_gwf(model)
+    if gwf.get_package("npf") is None:
+        raise ValueError(
+            "No NPF package found; run add_npf_package before parameterising k."
+        )
+    grid = _grid_info(gwf)
+
+    parameters: list[dict] = []
+    for name, spec in parameterisation.items():
+        key = str(name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits and underscores."
+            )
+        if len(key) > 12:
+            raise ValueError(
+                f"Parameter name '{key}' is {len(key)} characters; PEST caps "
+                "parameter names at 12 characters. Use a shorter name."
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{key}' must be a spec dict.")
+        scope = spec.get("scope", "all")
+        if scope != "multiplier":
+            raise ValueError(
+                "Multiplier parameterisation cannot be combined with scope "
+                f"'{scope}' (parameter '{key}'); use scope='multiplier' for "
+                "every parameter."
+            )
+        target = spec.get("target")
+        if target not in _SUPPORTED_TARGETS:
+            raise ValueError(
+                f"Unsupported parameterisation target '{target}'. Supported: "
+                f"{list(_SUPPORTED_TARGETS)}."
+            )
+        initial = float(spec.get("initial", 1.0))
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"Parameter '{key}' initial multiplier must be positive.")
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+            )
+        partrans = str(spec.get("partrans", "log")).lower()
+        parameters.append(
+            {
+                "name": key,
+                "target": target,
+                "scope": "multiplier",
+                "layer": None,
+                "initial": initial,
+                "lower_bound": initial * lower_factor,
+                "upper_bound": initial * upper_factor,
+                "partrans": partrans,
+            }
+        )
+
+    ncell = int(grid["ncell"])
+    zones = [
+        {
+            "name": p["name"],
+            "index": 1,
+            "layer": None,
+            "n_cells": ncell,
+            "initial": p["initial"],
+            "lower_bound": p["lower_bound"],
+            "upper_bound": p["upper_bound"],
+            "partrans": p["partrans"],
+        }
+        for p in parameters
+    ]
+    return {
+        "grid": grid,
+        "zone_map": np.ones(ncell, dtype=int),
+        "zones": zones,
+        "parameters": parameters,
+        "multiplier": True,
+    }
+
+
 def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dict:
     """Validate and normalise a ``setup_calibration`` zoned parameterisation.
 
@@ -1130,45 +1307,9 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
         raise ValueError(
             "No NPF package found; run add_npf_package before zoned parameterisation."
         )
-    dis = get_dis(gwf)
-    disv = get_disv(gwf)
-    if dis is not None and disv is None:
-        nlay = int(dis.nlay.data)
-        nrow = int(dis.nrow.data)
-        ncol = int(dis.ncol.data)
-        per_layer = nrow * ncol
-        grid = {
-            "type": "DIS",
-            "nlay": nlay,
-            "nrow": nrow,
-            "ncol": ncol,
-            "per_layer": per_layer,
-            "ncell": nlay * per_layer,
-        }
-    elif disv is not None:
-        nlay = int(disv.nlay.data)
-        ncpl = int(disv.ncpl.data)
-        per_layer = ncpl
-        grid = {
-            "type": "DISV",
-            "nlay": nlay,
-            "ncpl": ncpl,
-            "per_layer": per_layer,
-            "ncell": nlay * per_layer,
-        }
-    else:
-        disu = get_disu(gwf)
-        if disu is None:
-            raise ValueError("No grid package (DIS/DISV/DISU) found on the model.")
-        per_layer = int(disu.nodes.data)
-        nlay = 1
-        grid = {
-            "type": "DISU",
-            "nlay": nlay,
-            "nnodes": per_layer,
-            "per_layer": per_layer,
-            "ncell": per_layer,
-        }
+    grid = _grid_info(gwf)
+    nlay = int(grid["nlay"])
+    per_layer = int(grid["per_layer"])
 
     k_base = np.asarray(npf.k.array, dtype=float).reshape(-1)
     if k_base.size != grid["ncell"]:
@@ -2338,6 +2479,14 @@ def _impl_setup_da_control(
     simulated heads into the next cycle), and writes the cycle tables and
     ``da_*`` options ``pestpp-da`` v5.2.16 accepts.
 
+    The K parameterisation supports the ``setup_calibration`` scopes ``"all"`` /
+    ``"layer"`` / ``"cells"`` and, additionally, ``"multiplier"``: a single
+    dimensionless factor multiplies the existing K array
+    (``k = base_k × factor``) through the zoned-multiplier machinery with one
+    all-cells zone, so the base spatial pattern is preserved and the K template
+    holds one token regardless of grid size. ``scope="multiplier"`` takes
+    exactly one parameter and cannot be mixed with the other scopes.
+
     ``cycles`` are DA cycle indices; ``obs_cycles`` maps each registered site
     name to ``{cycle: observed value}``. Sequential DA runs one MODFLOW 6
     stress period / one time step per cycle, so ``NPER=1``/``NSTP=1`` is
@@ -2446,7 +2595,21 @@ def _impl_setup_da_control(
     # before ``_restore_or_snapshot_k_base`` and the K/IC rewires, so a rejected
     # setup leaves NPF ``k`` and IC ``strt`` untouched (the 6d run log's
     # secondary finding: a failed DISU setup left uniform K=1).
-    norm = _normalise_parameterisation(model, parameterisation)
+    mult_specs = {
+        str(n): s
+        for n, s in parameterisation.items()
+        if isinstance(s, dict) and s.get("scope") == "multiplier"
+    }
+    multiplier = bool(mult_specs)
+    if multiplier:
+        if len(mult_specs) != len(parameterisation):
+            raise ValueError(
+                "Multiplier parameterisation cannot be combined with scope "
+                "'all'/'layer'/'cells'; use scope='multiplier' for every parameter."
+            )
+        norm = _normalise_multiplier_parameterisation(model, parameterisation)
+    else:
+        norm = _normalise_parameterisation(model, parameterisation)
 
     name_by_flat: dict[int, str] = {}
     site_values: dict[str, list[float]] = {}
@@ -2530,16 +2693,39 @@ def _impl_setup_da_control(
     # previously each helper flushed the whole model, serialising a large DISU
     # grid twice. The tpl substitution runs after the flush so flopy cannot
     # overwrite the substituted external arrays with the pre-substitution ones.
-    _restore_or_snapshot_k_base(model)
-    ext_file = _impl_rewire_npf_k_external(model, flush=False)["external_file"]
+    k_base = np.asarray(_restore_or_snapshot_k_base(model), dtype=float).reshape(-1)
+    gwf_name = get_gwf(model).name
+    k_name = f"{gwf_name}_k.dat"
+    if multiplier:
+        # Scope="multiplier": one all-cells multiplier file, one template token,
+        # and a wrapper that rewrites k = base_k × factor before each run. The
+        # base array and the zone map are written here (the caller's K template
+        # targets the multiplier file, not the NPF k array).
+        mult_name = f"{gwf_name}_k_mult.dat"
+        np.savetxt(ws / f"{gwf_name}_k_base.dat", k_base, fmt="%.10g")
+        np.savetxt(ws / f"{gwf_name}_k_zone.dat", norm["zone_map"], fmt="%d")
+        ext_file = _impl_rewire_npf_k_external(model, filename=k_name, flush=False)[
+            "external_file"
+        ]
+    else:
+        ext_file = _impl_rewire_npf_k_external(model, flush=False)["external_file"]
     ic_info = _impl_rewire_ic_strt_external(model, flush=False)
     flush_model(model)
 
-    k_tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
+    if multiplier:
+        k_tpl = _impl_generate_zone_mult_tpl(model, norm["zones"], mult_name)
+    else:
+        k_tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
     k_tpl_path = Path(k_tpl["tpl_path"])
     k_target = Path(k_tpl["target"])
     k_initial = {p["name"]: p["initial"] for p in norm["parameters"]}
     _tpl_substitute(k_tpl_path, k_target, k_initial)
+    if multiplier:
+        # Keep the on-disk k consistent with the initial factor (the wrapper
+        # rewrites it on every realisation).
+        mult = np.array([k_initial[p["name"]] for p in norm["parameters"]])
+        factor = np.where(norm["zone_map"] > 0, mult[norm["zone_map"] - 1], 1.0)
+        np.savetxt(ws / k_name, k_base * factor, fmt="%.10g")
 
     # -- IC state parameterisation ----------------------------------------
     ic_base = ic_info["array"]
@@ -2642,9 +2828,14 @@ def _impl_setup_da_control(
     )
     pst.model_output_data.index = [ins_path.name]
 
-    # Forward command: the MF6 binary (or a space-free Python wrapper).
+    # Forward command: the MF6 binary (or a space-free Python wrapper). The
+    # multiplier scope always needs the wrapper — it computes k = base × factor
+    # before each run.
     wrapper = None
-    if _needs_forward_wrapper(model):
+    if multiplier:
+        wrapper = _generate_forward_wrapper(model, multiply_k=True)
+        pst.model_command = list(wrapper["model_command"])
+    elif _needs_forward_wrapper(model):
         wrapper = _generate_forward_wrapper(model)
         pst.model_command = list(wrapper["model_command"])
     else:
@@ -3480,6 +3671,12 @@ def _impl_summarise_da(
     ``<case>.<cycle>.<iter>.base.rei`` (per-cycle residuals — the observed
     values are the cycle-table values for that cycle).
 
+    The summary is **run-isolated**: the current run's cycle set is taken from
+    its own (overwritten) per-cycle phi file, and the posterior ensemble and
+    residuals are read from that run's final cycle. A second DA run with fewer
+    cycles in a reused workspace therefore reports its own posterior/residuals,
+    not the earlier run's higher-cycle leftovers (6d rerun-4 finding F2).
+
     ``residuals`` is capped at ``max_residuals``; the full table is written to
     ``<model>_da_residuals.csv`` and ``residual_statistics`` is computed over
     all observations.
@@ -3522,7 +3719,12 @@ def _impl_summarise_da(
 
     cycles = _read_da_cycle_phi(ws, base_name)
     final = cycles[-1] if cycles else None
-    parameter_ensemble = _read_da_parameter_ensemble(ws, base_name)
+    # The current run is scoped by its own per-cycle phi file (pestpp-da
+    # overwrites it each run), so the posterior ensemble and residuals come from
+    # THAT run's final cycle — not from a stale higher-cycle number left by an
+    # earlier run in the same workspace.
+    final_cycle = int(final["cycle"]) if final is not None else None
+    parameter_ensemble = _read_da_parameter_ensemble(ws, base_name, cycle=final_cycle)
 
     residual_stats: dict = {
         "rmse": None,
@@ -3531,7 +3733,7 @@ def _impl_summarise_da(
         "n_observations": 0,
     }
     residuals: list[dict] = []
-    rei_path = _latest_da_residual_file(ws, base_name)
+    rei_path = _latest_da_residual_file(ws, base_name, cycle=final_cycle)
     if rei_path is not None:
         res_df = pyemu.pst.pst_utils.read_resfile(str(rei_path))
         residual_stats = _compute_residual_stats(res_df)
@@ -3750,6 +3952,15 @@ def register(mcp: FastMCP) -> None:
         must run one stress period with one time step per cycle (NPER=1,
         NSTP=1) — otherwise the OBS-CSV instruction file would not read the
         end-of-cycle value; a clear error is returned otherwise.
+
+        The K parameterisation accepts the setup_calibration scopes `"all"`,
+        `"layer"` and `"cells"`, plus `"multiplier"`: one dimensionless factor
+        multiplied into the existing K array (`k = base_k × factor`) via a
+        single all-cells zone, so the base spatial pattern is preserved and the
+        K template holds one token regardless of grid size (the per-cell "all"
+        template replaced a heterogeneous 10,413-value K field with one value,
+        and its size was reported to exceed the client timeout). Exactly one
+        parameter is allowed and it cannot be mixed with the other scopes.
 
         Run the assimilation afterwards with run_pestpp_da, then
         summarise_da."""
@@ -4013,8 +4224,13 @@ def register(mcp: FastMCP) -> None:
         ``<case>.global.phi.actual.csv``), the final-cycle phi mean/std, the
         posterior parameter statistics (``mean``/``std``/``min``/``max`` from
         the final ``<case>.global.<cycle>.pe.csv``, excluding the ``base``
-        row), and residuals from the latest per-cycle base ``.rei`` (capped at
-        ``max_residuals``; the full table is written to CSV)."""
+        row), and residuals from that cycle's per-cycle base ``.rei`` (capped at
+        ``max_residuals``; the full table is written to CSV).
+
+        The summary is run-isolated: the current run's cycles come from its own
+        (overwritten) per-cycle phi file, so a second DA run with fewer cycles
+        in a reused workspace reports its own posterior and residuals rather
+        than the earlier run's higher-cycle leftovers."""
         try:
             return _impl_summarise_da(model, pst_file, max_residuals)
         except KeyError as exc:

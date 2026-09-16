@@ -13,6 +13,7 @@ import asyncio
 import csv
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -128,17 +129,22 @@ def _da_model(
     nper: int = 1,
     with_obs: bool = True,
     spatial_dir: str | None = None,
+    k: float | np.ndarray | None = None,
 ) -> str:
     """A single-time-step transient DIS model that can host a sequential DA run.
 
     ``spatial_dir`` inserts an extra (space-containing) path component so a test
-    can exercise a workspace whose path contains a space.
+    can exercise a workspace whose path contains a space. ``k`` overrides the
+    uniform 5.0 m/d K field (used by the multiplier-scope test to prove the
+    spatial pattern survives).
     """
     ws = str(tmp_path / (spatial_dir or "") / name)
     _impl_create_model(name, ws, "METERS", "DAYS")
     _impl_set_simulation(name, nper, [1.0] * nper, [1] * nper, "simple")
     _impl_add_dis_package(name, 1, 3, 3, 100.0, 100.0, 50.0, [30.0])
-    _impl_add_npf_package(name, icelltype=0, k=5.0, k33=None, save_flows=True)
+    _impl_add_npf_package(
+        name, icelltype=0, k=5.0 if k is None else k, k33=None, save_flows=True
+    )
     _impl_add_ic_package(name, strt=25.0)
     _impl_add_sto_package(name, iconvert=0, ss=1e-4, sy=None, steady_state=[], save_flows=True)
     _impl_add_boundary_package(
@@ -659,6 +665,66 @@ def test_summarise_da_without_ensemble_but_with_cycle_phi(tmp_path):
     assert summary["parameter_ensemble"] == {}
 
 
+def test_summarise_da_second_run_with_fewer_cycles_is_isolated(tmp_path):
+    """A second DA run in a reused workspace must report ITS OWN posterior and
+    residuals, not the first run's higher-cycle leftovers (6d rerun-4 finding
+    F2: the control returned run-1's k=10.0 and 2018-12-20 residuals)."""
+    model = _da_model(tmp_path, name="daiso")
+    res = _impl_setup_da_control(
+        model,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+    ws = resolve_workspace(model)
+    case = Path(res["pst_file"]).stem
+
+    # run 1 (6 cycles, 0..5) left its final-cycle ensemble and residuals behind
+    (ws / f"{case}.global.5.pe.csv").write_text(
+        "real_name,k,h\n0,10.0,1\n1,10.0,1\nbase,10.0,1\n"
+    )
+    (ws / f"{case}.5.1.base.rei").write_text(
+        " MODEL OUTPUTS AT END OF OPTIMISATION ITERATION NO. 1:-\n\n\n"
+        " Name        Group      Measured      Modelled      Residual      Weight\n"
+        " s1          head       99.0          90.0          9.0           1.0\n"
+    )
+
+    # run 2 (3 cycles, 0..2) overwrote the cycle phi file and wrote its own
+    # lower-cycle ensemble + residuals; run-1's cycle-5 files are now stale.
+    (ws / f"{case}.global.phi.actual.csv").write_text(
+        "cycle,iteration,mean,standard_deviation,min,max,0\n"
+        "0,0,5.0,4.0,1.0,9.0,5.0\n"
+        "0,1,4.0,3.0,1.0,7.0,4.0\n"
+        "1,0,3.0,2.0,1.0,5.0,3.0\n"
+        "1,1,2.0,1.0,1.0,3.0,2.0\n"
+        "2,0,1.5,0.5,1.0,2.0,1.5\n"
+        "2,1,1.0,0.2,0.9,1.1,1.0\n"
+    )
+    (ws / f"{case}.global.2.pe.csv").write_text(
+        "real_name,k,h\n0,2.0,1\n1,2.0,1\n2,2.0,1\nbase,2.0,1\n"
+    )
+    (ws / f"{case}.2.1.base.rei").write_text(
+        " MODEL OUTPUTS AT END OF OPTIMISATION ITERATION NO. 1:-\n\n\n"
+        " Name        Group      Measured      Modelled      Residual      Weight\n"
+        " s1          head       32.0          30.0          2.0           1.0\n"
+        " s2          head       30.0          29.0          1.0           1.0\n"
+    )
+
+    summary = _impl_summarise_da(model, res["pst_file"])
+
+    assert [c["cycle"] for c in summary["cycles"]] == [0, 1, 2]
+    assert summary["final_phi_mean"] == pytest.approx(1.0)
+    # run-2 posterior (2.0), not run-1's stale cycle-5 ensemble (10.0)
+    assert summary["parameter_ensemble"]["k"]["mean"] == pytest.approx(2.0)
+    assert summary["parameter_ensemble"]["k"]["n"] == 3
+    # run-2 residuals (2 observations, 32/30), not run-1's stale 99/90
+    assert summary["residual_statistics"]["n_observations"] == 2
+    assert {r["obs_name"] for r in summary["residuals"]} == {"s1", "s2"}
+    assert max(r["measured"] for r in summary["residuals"]) == pytest.approx(32.0)
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -999,6 +1065,118 @@ def test_setup_da_control_space_workspace_uses_space_free_command(tmp_path):
     assert command == [_find_mf6_binary()], command
     assert " " not in command[0], command
     assert "gwmcp_run_" not in command[0], command
+
+
+@requires_mf6
+def test_setup_da_control_multiplier_scope_preserves_base_k(tmp_path):
+    """scope="multiplier" keeps ONE adjustable factor over the existing K
+    pattern instead of replacing the heterogeneous field with one uniform
+    value (the 6d rerun-5 uniform-K collapse / 31,522-token timeout)."""
+    base = np.array([[[1.0, 2.0, 4.0], [8.0, 16.0, 32.0], [64.0, 128.0, 256.0]]])
+    name = _da_model(tmp_path, name="damult", k=base)
+    res = _impl_setup_da_control(
+        name,
+        {
+            "k_mult": {
+                "target": "npf:k",
+                "scope": "multiplier",
+                "initial": 1.0,
+                "lower_factor": 0.2,
+                "upper_factor": 5.0,
+            }
+        },
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 1
+    assert res["n_state_parameters"] == 3
+
+    ws = resolve_workspace(name)
+    gwf_name = get_gwf(name).name
+
+    # the K template holds exactly one token (the multiplier file), not 9
+    tpl_lines = Path(res["template_file"]).read_text().splitlines()
+    assert tpl_lines[0].strip() == "ptf ~"
+    assert len(tpl_lines) == 2, tpl_lines
+    assert "k_mult" in tpl_lines[1]
+    assert len(tpl_lines[1]) - 2 >= 15
+
+    pst = pyemu.Pst(res["pst_file"])
+    k_pars = pst.parameter_data[pst.parameter_data["pargp"] == "k"]
+    assert list(k_pars.index) == ["k_mult"]
+    assert float(k_pars.loc["k_mult", "parlbnd"]) == pytest.approx(0.2)
+    assert float(k_pars.loc["k_mult", "parubnd"]) == pytest.approx(5.0)
+    # the multiplier template is the K input of the PST
+    assert Path(res["template_file"]).name in set(pst.model_input_data["pest_file"])
+
+    # one all-cells zone; at factor 1.0 the written K equals the base pattern
+    assert list(np.loadtxt(ws / f"{gwf_name}_k_zone.dat", dtype=int)) == [1] * 9
+    assert (ws / f"{gwf_name}_k_base.dat").exists()
+    np.testing.assert_allclose(
+        np.loadtxt(ws / f"{gwf_name}_k.dat"), base.reshape(-1)
+    )
+
+    # the routed forward wrapper multiplies the base field: factor 2 doubles it
+    np.savetxt(ws / f"{gwf_name}_k_mult.dat", np.array([2.0]), fmt="%.10g")
+    proc = subprocess.run(
+        [sys.executable, res["forward_wrapper"]],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    np.testing.assert_allclose(
+        np.loadtxt(ws / f"{gwf_name}_k.dat"), base.reshape(-1) * 2.0
+    )
+
+
+def test_setup_da_control_multiplier_rejects_mixed_scope(tmp_path):
+    """A multiplier spec cannot be mixed with all/layer/cells."""
+    name = _da_model(tmp_path, name="damix")
+    with pytest.raises(ValueError, match="multiplier"):
+        _impl_setup_da_control(
+            name,
+            {
+                "k_mult": {"target": "npf:k", "scope": "multiplier", "initial": 1.0},
+                "k_all": {"target": "npf:k", "scope": "all", "initial": 5.0},
+            },
+            cycles=[0, 1],
+            obs_cycles=_obs_cycles(),
+        )
+
+
+@requires_mf6
+def test_setup_da_control_multiplier_scope_disu_one_token(tmp_path):
+    """scope="multiplier" works on a DISU grid (the holdout's grid type) and
+    still emits a one-token K template over an all-cells zone."""
+    name = _disu_da_model(tmp_path, "disumult", nnodes=5)
+    res = _impl_setup_da_control(
+        name,
+        {
+            "k_mult": {
+                "target": "npf:k",
+                "scope": "multiplier",
+                "initial": 1.0,
+                "lower_factor": 0.2,
+                "upper_factor": 5.0,
+            }
+        },
+        cycles=[0, 1],
+        obs_cycles=_disu_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 1
+    ws = resolve_workspace(name)
+    gwf_name = get_gwf(name).name
+    tpl_lines = Path(res["template_file"]).read_text().splitlines()
+    assert len(tpl_lines) == 2
+    assert "k_mult" in tpl_lines[1]
+    assert list(np.loadtxt(ws / f"{gwf_name}_k_zone.dat", dtype=int)) == [1] * 5
+    base = np.array([5.0, 10.0, 20.0, 40.0, 80.0])
+    np.testing.assert_allclose(np.loadtxt(ws / f"{gwf_name}_k.dat"), base)
 
 
 @requires_mf6

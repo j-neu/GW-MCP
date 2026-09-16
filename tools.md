@@ -436,6 +436,11 @@ cap) to a spec dict:
   **0-based**, unlike observation cell ids which are 1-based on DISU), or
   `"zones"` (with `"layer": N`). Scopes must partition the array
   exactly for all/layer/cells; `zones` is the multiplier mode below.
+  `setup_da_control` additionally accepts `"multiplier"` (see the DA section):
+  a **single** dimensionless factor over the whole existing K array. It cannot
+  be combined with `all`/`layer`/`cells`, and is deliberately not accepted by
+  `setup_calibration` (its `"all"` scope is an absolute replacement, not a
+  multiplier).
 - `initial` (required, > 0) sets the base value; `lower_factor` /
   `upper_factor` (defaults `0.1`/`10.0`) set the bounds as
   `initial × factor`; `partrans` defaults to `"log"`.
@@ -454,6 +459,35 @@ MODFLOW 6 run — so the base spatial pattern is preserved and only the zone
 magnitudes are calibrated. `check_parameter_sensitivity` re-applies the
 multipliers before its direct runs. The result adds a `zones` block (name,
 layer, base_k, n_cells, bounds) and `grid`.
+
+**Single-factor K multiplier (scope="multiplier", `setup_da_control` only):**
+one dimensionless parameter multiplies the **whole existing** `npf:k` array
+(`k = base_k × factor`), so the base spatial pattern is preserved and the K
+template holds **one** token regardless of grid size (the 31,522-token
+per-cell template is why `setup_da_control` was reported to exceed the client
+timeout on a heterogeneous DISU model, and the uniform replacement of
+`scope="all"` collapsed K and aborted a `pestpp-da` run). Reuses the zoned
+machinery with a single all-cells zone (zone id 1): it writes
+`<gwf>_k_base.dat`, `<gwf>_k_zone.dat` (all ones), `<gwf>_k_mult.dat.tpl`
+(one token), rewires NPF `k` to `<gwf>_k.dat`, and **always** emits the
+forward wrapper that computes `k = base_k × factor` before each run. `initial`
+defaults to `1.0` (the shipped base field), `lower_factor`/`upper_factor`
+default to 0.1/10.0, and `partrans` defaults to `"log"`. Exactly one parameter
+is allowed; it cannot be mixed with `all`/`layer`/`cells`.
+
+```json
+{"k_mult": {"target": "npf:k", "scope": "multiplier", "initial": 1.0,
+            "lower_factor": 0.2, "upper_factor": 5.0, "partrans": "log"}}
+```
+
+Measured on synthetic large models (32,000 cells / 32,000 DISU nodes): the K
+template goes from 32,000 tokens (593.8 kB) to **1** token (~20 B), and the
+array-parameterisation + template + substitution phase from 92 ms to 3 ms.
+Whole-setup wall time is ~0.6 s (DIS) / ~1.3 s (DISU) for both scopes on those
+fixtures — the flopy flush dominates and is common to both; the real
+31,831-node holdout's documented whole-setup ≈22–24 s (Task 9) is likewise
+flush-dominated, so the multiplier scope stays comfortably inside the ~90 s
+client timeout.
 
 The call then: (1) rewires NPF `k` to an external `OPEN/CLOSE <file>` array
 (so a template can target it — the model runs identically afterwards); (2)
@@ -511,7 +545,7 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 `run_pestpp_da` runs the PESTPP-DA binary against a **DA-ready `.pst`** — build one with `setup_da_control` (its cycle tables and `da_*` options are exactly what the binary expects). `num_reals` is the DA **ensemble size**, written to the `da_num_reals` `++` option; when omitted the PST's own `da_num_reals` is preserved (a `setup_da_control(num_reals=N)` PST stays at N). The PEST control `noptmax` is the number of update **iterations per assimilation cycle**, not the ensemble size — the optional `noptmax` overrides it and, when omitted, the PST's own value is preserved. Pass cycle options such as `{"da_observation_cycle_table": "obs_cycle_tbl.csv", "da_parameter_cycle_table": "par_cycle_tbl.csv"}` (or a `.pst` that already carries `da_*` options). PEST++-DA recognises `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states` and `da_noptmax_schedule`; there is **no** `da_cycle` / `da_obs_cycle_table` / `da_ensemble`, and an unrecognised `++` arg is a fatal parse error.
 
 | `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
-| `summarise_da` | `model: str`, `pst_file: str`, `max_residuals: int = 500` | Per-cycle phi table (post-update ensemble mean from `<case>.global.phi.actual.csv`), final-cycle phi mean/std, posterior parameter statistics (`mean`/`std`/`min`/`max` from the final `<case>.global.<cycle>.pe.csv`, excluding the `base` row), and residuals from the latest per-cycle base `.rei` (`residuals` capped at `max_residuals`, full table to CSV) |
+| `summarise_da` | `model: str`, `pst_file: str`, `max_residuals: int = 500` | Per-cycle phi table (post-update ensemble mean from `<case>.global.phi.actual.csv`), final-cycle phi mean/std, posterior parameter statistics (`mean`/`std`/`min`/`max` from the **current run's** final `<case>.global.<cycle>.pe.csv`, excluding the `base` row), and residuals from that run's per-cycle base `.rei` (`residuals` capped at `max_residuals`, full table to CSV) |
 | `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
 | `check_parameter_sensitivity` | `model: str`, `parameters: dict[str, float]`, `template_files: list[str]`, `delta: float = 0.1` | Per-parameter sensitivity (mean relative change of the simulated observations) over n+1 forward runs (7f-H3.1) |
 | `calibrate` | `model: str`, `par_data: dict`, `template_files: list[str]`, `time_budget_minutes: float = 30.0`, `noptmax: int = 10`, `num_reals: int = 50` | Chosen method + rationale + the run result (7f-H4.1) |
@@ -522,7 +556,7 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 
 `setup_da_control` emits the whole DA interface in one call (7f-DA):
 
-- rewires NPF `k` to an external `OPEN/CLOSE` array and generates the K template (reusing the `setup_calibration` machinery);
+- rewires NPF `k` to an external `OPEN/CLOSE` array and generates the K template (reusing the `setup_calibration` machinery). With `scope="multiplier"` the K template is the **one-token** `<gwf>_k_mult.dat.tpl` over an all-cells zone and the forward wrapper computes `k = base_k × factor` each run, so the base K pattern is preserved (see the single-factor K multiplier note above);
 - rewires the IC `strt` array and generates a **state-augmented IC template** — one state parameter per registered observation cell, sharing the observation name so `da_use_simulated_states True` carries each cycle's simulated heads into the next cycle's IC;
 - generates the MF6-OBS-CSV instruction file (the canonical `l1 ~,~ !name! …` pif reads the first data row, which is the end-of-cycle value because there is one time step per cycle);
 - writes the observation cycle table (`obs_cycles`), a weight cycle table when `obs_weights` is given (v5.2.16 ignores it — the authoritative weights are the non-zero values in `obs_data.csv`), and, when `par_cycles` supplies fixed forcing values, a populated parameter cycle table (a `perlen` entry templates the TDIS stress-period length). A `par_cycles` key that names an adjustable parameter is a hard `INVALID_INPUT` error (the cycle table would override the calibrated value every cycle);
@@ -535,7 +569,9 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 
 `cycles` are DA cycle indices; `obs_cycles` maps a registered site name to `{cycle: observed value}` (a missing cycle is a blank/off cycle). The state-augmented IC parameterisation supports **DIS, DISV and DISU** grids: on DIS/DISV a site's stored cell id is `(layer, row, col)` / `(layer, node)`, on DISU it is a scalar **1-based node** number (`import_obs_from_csv` stores `node + 1`; the flat IC index is `node - 1` on a `nnodes`-node grid). A site outside the grid is an `INVALID_INPUT` error, raised **before** any model write (NPF `k` / IC `strt` are rewired only once all grid, state-cell and cycle inputs validate). The model must have `NPER=1`/`NSTP=1` — `setup_da_control` returns a clear `INVALID_INPUT` error otherwise. `use_simulated_states=True` is the only supported value: pestpp-da v5.2.16 requires final-to-initial state linkages the tool does not emit, so `use_simulated_states=False` is rejected with `INVALID_INPUT`. Run the assimilation with `run_pestpp_da`, then `summarise_da`.
 
-**Reading DA outputs — `summarise_da`:** pestpp-da v5.2.16 writes a per-cycle phi file `<case>.global.phi.actual.csv` (`cycle,iteration,mean,standard_deviation,min,max,<reals...>`, two rows per cycle — iteration 0 = prior, ≥1 = post-update), a final-cycle parameter ensemble `<case>.global.<cycle>.pe.csv` (`real_name` column plus one column per parameter, with a `base` row alongside the realisations), and per-cycle base residual files `<case>.<cycle>.<iter>.base.rei`. `summarise_da` reports the **post-update** ensemble-mean phi for each cycle (never the cycle-0 prior), the final cycle's phi mean/std, posterior parameter statistics (the `base` row excluded — it is not an ensemble member), and residuals from the highest cycle/iteration `.rei` (whose observed values are that cycle's cycle-table values). `summarise_calibration` does **not** summarise DA runs; use `summarise_da`. A workspace with **no** run outputs at all (no `<case>.global.phi.actual.csv` and no per-cycle `<case>.global.<cycle>.pe.csv`) fails loudly with `OUTPUT_FILE_MISSING` rather than returning an empty success — a partial no-update run that wrote the cycle phi is still summarised.
+**Reading DA outputs — `summarise_da`:** pestpp-da v5.2.16 writes a per-cycle phi file `<case>.global.phi.actual.csv` (`cycle,iteration,mean,standard_deviation,min,max,<reals...>`, two rows per cycle — iteration 0 = prior, ≥1 = post-update), a final-cycle parameter ensemble `<case>.global.<cycle>.pe.csv` (`real_name` column plus one column per parameter, with a `base` row alongside the realisations), and per-cycle base residual files `<case>.<cycle>.<iter>.base.rei`. `summarise_da` reports the **post-update** ensemble-mean phi for each cycle (never the cycle-0 prior), the final cycle's phi mean/std, posterior parameter statistics (the `base` row excluded — it is not an ensemble member), and residuals from that cycle's highest-iteration `.rei` (whose observed values are that cycle's cycle-table values).
+
+**`summarise_da` is run-isolated:** the current run's cycle set is taken from its own (overwritten) per-cycle phi file, and the posterior ensemble and residuals are read from **that run's final cycle** — not from the highest cycle number present in the workspace. A second DA run with fewer cycles in a reused workspace therefore reports its own posterior and residuals rather than the earlier run's higher-cycle leftovers (the 6d rerun-4 finding F2: a 6-cycle control reporting run-1's `k=10.0` and its 2018-12-20 residuals). `summarise_calibration` does **not** summarise DA runs; use `summarise_da`. A workspace with **no** run outputs at all (no `<case>.global.phi.actual.csv` and no per-cycle `<case>.global.<cycle>.pe.csv`) fails loudly with `OUTPUT_FILE_MISSING` rather than returning an empty success — a partial no-update run that wrote the cycle phi is still summarised.
 
 `summarise_calibration` returns a **verdict** (7f-H4.2): `improved` (phi
 reduction versus the previous run — the prior phi is stored per model),
