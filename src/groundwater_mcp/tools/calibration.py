@@ -1653,10 +1653,12 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     # pestpp runs the model command with cwd = the model workspace; reference
     # the wrapper by relative name when it lives there, absolute otherwise.
     cmd_target = wrapper_path.name if wrapper_path.parent == ws else str(wrapper_path)
-    # A wrapper command that itself contains a space is what pestpp cannot
-    # launch (Task 9), so use a space-free interpreter when one exists; the
-    # stdlib-only wrapper runs on the base interpreter just as well. The
-    # multiply_k wrapper needs this venv's numpy, so it keeps sys.executable.
+    # The wrapper is a stand-in for the model command, so keep it as clean as
+    # the direct command it replaces: a space-free interpreter when one exists
+    # (proven launchable by pestpp-da either way, but a space-free command saves
+    # the quoting question entirely). The stdlib-only wrapper runs on the base
+    # interpreter just as well; the multiply_k wrapper needs this venv's numpy,
+    # so it keeps sys.executable.
     interpreter = sys.executable if multiply_k else (_space_free_interpreter() or sys.executable)
     # A quoted "exe path" ensures CreateProcess splits the command correctly.
     if " " in interpreter:
@@ -1824,9 +1826,11 @@ def _impl_setup_calibration(
         (A2.2).
     3.  The instruction file is generated from the model's OBS CSV header
         (A2.3).
-    4.  When the default forward command would be unsafe on Windows (spaces in
-        the workspace or the MF6 binary path), a Python wrapper is written at a
-        space-free path (A2.4).
+    4.  When the MF6 binary path contains spaces (the one case pestpp on Windows
+        cannot name directly; a space in the *workspace* path is fine because
+        pestpp runs the command with the workspace as its cwd), a Python wrapper
+        is written at a space-free path and referenced through a space-free
+        interpreter (A2.4).
     5.  The ``.pst`` is assembled with safe numeric defaults: ``derinclb > 0``
         on every parameter group and default bounds base/10–base×10 (A2.5).
 

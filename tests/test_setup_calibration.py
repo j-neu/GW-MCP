@@ -15,6 +15,7 @@ See tasks.md § 7e Tier A.
 from __future__ import annotations
 
 import csv
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -450,9 +451,59 @@ def test_generate_forward_wrapper_space_free_and_runs(tmp_path):
     ws_dir = resolve_workspace(name)
     assert list(ws_dir.glob("*.hds")), "expected a head output file"
 
-    # The PST can use this command (quoted python + space-free wrapper path).
+    # The PST can use this command (space-free interpreter + space-free wrapper
+    # path, so nothing on the command line needs quoting).
     assert "gwmcp_run_" in result["model_command"][0]
     assert str(wrapper) in result["model_command"][0]
+
+
+@requires_mf6
+def test_generate_forward_wrapper_command_executes_with_spaced_mf6(tmp_path, monkeypatch):
+    """The generated wrapper *command* itself runs the model.
+
+    This is the one case that still produces a wrapper — an MF6 binary whose
+    own path contains a space — so it covers the interpreter choice and the
+    quoting of ``model_command`` (Task 9). The real MF6 binary is copied to a
+    space-containing path (offline, no download) so the command is genuinely
+    executable, and the command string is tokenised the way pestpp/shell would
+    before being run.
+    """
+    import shutil
+
+    import groundwater_mcp.tools.calibration as cal
+    from groundwater_mcp.tools.calibration import (
+        _generate_forward_wrapper,
+        _space_free_interpreter,
+    )
+
+    name = _build_base_model(tmp_path, "wrap_spacedbin")
+    spaced_bin = tmp_path / "bin dir" / "mf6 spaced.exe"
+    spaced_bin.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_find_mf6_binary(), spaced_bin)
+    monkeypatch.setattr(cal, "_find_mf6_binary", lambda: str(spaced_bin))
+
+    assert cal._needs_forward_wrapper(name), "a space-containing binary path needs a wrapper"
+    result = _generate_forward_wrapper(name)
+    command = result["model_command"][0]
+    assert "gwmcp_run_" in command
+
+    # The command carries no space in any *path* when a space-free interpreter
+    # exists: the wrapper is stdlib-only, so the base interpreter is used and no
+    # quoting of a space-containing exe path is needed. (The single space that
+    # separates the interpreter from the wrapper script is structural.)
+    wrapper = Path(result["wrapper_path"])
+    args = [tok.strip('"') for tok in shlex.split(command, posix=False)]
+    assert all(" " not in tok for tok in args), args
+    assert Path(args[0]).exists(), args
+    assert args[1] in (wrapper.name, str(wrapper)), args
+    space_free = _space_free_interpreter()
+    if space_free is not None:
+        assert args[0] == space_free, args
+
+    ws_dir = resolve_workspace(name)
+    proc = subprocess.run(args, cwd=str(ws_dir), capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert list(ws_dir.glob("*.hds")), "expected the wrapper command to run the model"
 
 
 @requires_mf6

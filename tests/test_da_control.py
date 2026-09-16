@@ -76,7 +76,26 @@ def _pestpp_da_available() -> bool:
         return False
 
 
+def _mf6_binary_has_space() -> bool:
+    """True when the MF6 binary itself lives under a space-containing directory.
+
+    ``_needs_forward_wrapper`` keys off the **binary** path (Task 9), so on such
+    a host a wrapper is legitimately generated and a "direct command" assertion
+    would false-fail.
+    """
+    try:
+        from groundwater_mcp.tools.runner import _find_mf6_binary
+
+        return " " in _find_mf6_binary()
+    except RuntimeError:
+        return False
+
+
 requires_mf6 = pytest.mark.skipif(not _mf6_available(), reason="MODFLOW 6 binary not installed")
+requires_space_free_mf6 = pytest.mark.skipif(
+    _mf6_binary_has_space(),
+    reason="MF6 binary path contains a space; a wrapper is expected (see _needs_forward_wrapper)",
+)
 requires_pestpp_da = pytest.mark.skipif(
     not _pestpp_da_available(), reason="pestpp-da binary not installed"
 )
@@ -945,6 +964,7 @@ def test_setup_da_control_end_to_end(tmp_path):
     assert run["final_phi_mean"] == run["final_phi_mean"]  # not NaN
 
 
+@requires_space_free_mf6
 @requires_mf6
 def test_setup_da_control_space_workspace_uses_space_free_command(tmp_path):
     """Task 9: a space-containing workspace must not force a wrapper command.
@@ -952,8 +972,13 @@ def test_setup_da_control_space_workspace_uses_space_free_command(tmp_path):
     pestpp runs the model command with the workspace as its working directory,
     so a space in the workspace path never enters the command line. Emitting a
     Python-wrapper command instead (``"<venv python>" ...\\gwmcp_run_<model>.py``)
-    both wasted an interpreter launch per realisation and produced a command
-    pestpp cannot be relied on to launch.
+    cost two extra process launches per realisation and left a space in the
+    command line (the venv interpreter path) — unnecessary, and it also baked
+    the absolute workspace into the wrapper. (It was launchable; see the Task 9
+    report §1b.)
+
+    Skipped when the MF6 *binary* path itself contains a space: there a wrapper
+    is legitimately expected (``_needs_forward_wrapper``).
     """
     from groundwater_mcp.tools.calibration import _find_mf6_binary, _needs_forward_wrapper
 

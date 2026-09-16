@@ -422,8 +422,10 @@ def test_da_completes_in_space_containing_workspace(tmp_path):
     """Both launch paths assimilate >=2 cycles in a space-containing workspace.
 
     The mandated holdout workspace path (``...\\MODFLOW 6\\sim``) contains a
-    space. The model command must stay space-free: pestpp runs it with the
-    workspace as cwd, so only the *binary* path can force a wrapper (Task 9).
+    space. The model command stays space-free whenever the MF6 **binary** path
+    is space-free (pestpp runs the command with the workspace as cwd, so only
+    the binary path can force a wrapper — Task 9); when the binary path itself
+    contains a space a wrapper is expected and only the run is asserted.
     """
     from groundwater_mcp.tools.calibration import _find_mf6_binary
 
@@ -432,9 +434,15 @@ def test_da_completes_in_space_containing_workspace(tmp_path):
     assert " " in str(ws), "fixture must exercise a space-containing workspace"
 
     command = pyemu.Pst(str(pst_file)).model_command
-    assert command == [_find_mf6_binary()], command
-    assert " " not in command[0], command
-    assert "gwmcp_run_" not in command[0], command
+    assert len(command) == 1, command
+    if " " in _find_mf6_binary():
+        # A space-containing binary path is the one case that legitimately
+        # generates a wrapper; the run below is then the assertion.
+        assert "gwmcp_run_" in command[0], command
+    else:
+        assert command == [_find_mf6_binary()], command
+        assert "gwmcp_run_" not in command[0], command
+        assert " " not in command[0], command
 
     # Background launch path (start_calibration -> job registry).
     start = _impl_start_calibration(name, str(pst_file), method="da")
