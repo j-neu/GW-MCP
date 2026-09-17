@@ -1132,6 +1132,61 @@ def test_setup_da_control_multiplier_scope_preserves_base_k(tmp_path):
     )
 
 
+@requires_mf6
+def test_multiplier_forward_command_is_space_free_and_stdlib_only(tmp_path):
+    """The multiplier scope ALWAYS needs a wrapper, so its model_command must
+    stay launchable by pestpp on Windows: a space-free interpreter and a
+    stdlib-only wrapper.
+
+    On this host the venv interpreter is ``D:\\Claude Projects\\...\\.venv\\
+    Scripts\\python.exe`` — space-containing — and pestpp cannot launch a
+    space-containing executable path (its child freezes before numpy is even
+    imported and pestpp-da spins at 100 % CPU: 6d rerun-6, 4/4 attempts). The
+    space-free base interpreter exists but has no numpy, so the wrapper cannot
+    import it.
+    """
+    from groundwater_mcp.tools.calibration import _space_free_interpreter
+
+    space_free = _space_free_interpreter()
+    if space_free is None:
+        pytest.skip("no space-free Python interpreter on this host")
+
+    base = np.array([[[1.0, 2.0, 4.0], [8.0, 16.0, 32.0], [64.0, 128.0, 256.0]]])
+    name = _da_model(tmp_path, name="dacmd", k=base)
+    res = _impl_setup_da_control(
+        name,
+        {"k_mult": {"target": "npf:k", "scope": "multiplier", "initial": 1.0}},
+        cycles=[0, 1],
+        obs_cycles=_obs_cycles(),
+        num_reals=3,
+    )
+    assert "error" not in res, res
+
+    body = Path(res["forward_wrapper"]).read_text()
+    assert "numpy" not in body, body
+
+    command = pyemu.Pst(res["pst_file"]).model_command
+    assert len(command) == 1, command
+    first_token = command[0].split()[0]
+    assert first_token == space_free, command
+    assert " " not in first_token, command
+
+    # the space-free interpreter (no numpy) can actually run the wrapper
+    ws = resolve_workspace(name)
+    gwf_name = get_gwf(name).name
+    np.savetxt(ws / f"{gwf_name}_k_mult.dat", np.array([2.0]), fmt="%.10g")
+    proc = subprocess.run(
+        [space_free, res["forward_wrapper"]],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    np.testing.assert_allclose(
+        np.loadtxt(ws / f"{gwf_name}_k.dat"), base.reshape(-1) * 2.0
+    )
+
+
 def test_setup_da_control_multiplier_rejects_mixed_scope(tmp_path):
     """A multiplier spec cannot be mixed with all/layer/cells."""
     name = _da_model(tmp_path, name="damix")

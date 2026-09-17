@@ -1709,10 +1709,10 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     no spaces, in the workspace when the workspace path is space-free and in a
     space-free system directory otherwise — that runs MODFLOW 6 in the model
     workspace (the OBS package writes the observations CSV as part of the
-    run). The returned ``model_command`` references the wrapper via the
-    current Python executable, preferring a space-free interpreter so the
-    command itself carries no space (Task 9); the ``multiply_k`` wrapper needs
-    numpy from this venv, so it keeps ``sys.executable``.
+    run). The returned ``model_command`` references the wrapper through a
+    space-free interpreter when one exists so the command itself carries no
+    space (Task 9); both wrapper flavours are stdlib-only, so the base
+    interpreter works even though it has no site-packages.
 
     Returns ``{wrapper_path, model_command}`` where ``model_command`` is a
     one-element list suitable for ``pst.model_command``.
@@ -1750,15 +1750,17 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
         zone_name = f"{gwf_name}_k_zone.dat"
         mult_name = f"{gwf_name}_k_mult.dat"
         k_name = f"{gwf_name}_k.dat"
-        # Self-contained: the multiplier logic is inlined (no import from
-        # groundwater_mcp), so a PEST++ forward run does not depend on the
-        # installed package or on any private helper.
+        # Self-contained AND stdlib-only: the multiplier logic is inlined with
+        # no ``numpy`` import, so the wrapper runs on a space-free *base*
+        # interpreter (which has no site-packages) as well as on this venv's
+        # interpreter. This matters because pestpp on Windows cannot launch a
+        # space-containing interpreter path, and the venv interpreter here lives
+        # under "Claude Projects" — the numpy-importing wrapper deadlocked
+        # pestpp-da 4/4 attempts on the 6d rerun-6 holdout run.
         wrapper_path.write_text(
             "import os\n"
             "import subprocess\n"
             "import sys\n"
-            "\n"
-            "import numpy as np\n"
             "\n"
             f"WS = {str(ws)!r}\n"
             f"MF6 = {mf6_exe!r}\n"
@@ -1768,13 +1770,17 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             f"KFILE = os.path.join(WS, {k_name!r})\n"
             "\n"
             "os.chdir(WS)\n"
-            "base = np.loadtxt(BASE, dtype=float).reshape(-1)\n"
-            "zone = np.loadtxt(ZONE, dtype=int).reshape(-1)\n"
-            "mult = np.atleast_1d(np.loadtxt(MULT, dtype=float)).reshape(-1)\n"
-            "factor = np.ones_like(base, dtype=float)\n"
-            "zoned = zone > 0\n"
-            "factor[zoned] = mult[zone[zoned] - 1]\n"
-            'np.savetxt(KFILE, base * factor, fmt="%.10g")\n'
+            "with open(BASE) as fh:\n"
+            "    base = [float(tok) for tok in fh.read().split()]\n"
+            "with open(ZONE) as fh:\n"
+            "    zone = [int(tok) for tok in fh.read().split()]\n"
+            "with open(MULT) as fh:\n"
+            "    mult = [float(tok) for tok in fh.read().split()]\n"
+            "with open(KFILE, 'w') as fh:\n"
+            "    for i, value in enumerate(base):\n"
+            "        z = zone[i] if i < len(zone) else 0\n"
+            "        factor = mult[z - 1] if z > 0 else 1.0\n"
+            "        fh.write('%.10g\\n' % (value * factor))\n"
             "proc = subprocess.run([MF6], cwd=WS)\n"
             "sys.exit(proc.returncode)\n"
         )
@@ -1795,12 +1801,12 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     # the wrapper by relative name when it lives there, absolute otherwise.
     cmd_target = wrapper_path.name if wrapper_path.parent == ws else str(wrapper_path)
     # The wrapper is a stand-in for the model command, so keep it as clean as
-    # the direct command it replaces: a space-free interpreter when one exists
-    # (proven launchable by pestpp-da either way, but a space-free command saves
-    # the quoting question entirely). The stdlib-only wrapper runs on the base
-    # interpreter just as well; the multiply_k wrapper needs this venv's numpy,
-    # so it keeps sys.executable.
-    interpreter = sys.executable if multiply_k else (_space_free_interpreter() or sys.executable)
+    # the direct command it replaces: a space-free interpreter when one exists.
+    # pestpp on Windows cannot launch a space-containing executable path, and
+    # BOTH wrapper flavours are stdlib-only, so the space-free base interpreter
+    # is always a valid choice (6d rerun-6: the numpy-importing multiplier
+    # wrapper forced this venv's space-containing interpreter and deadlocked).
+    interpreter = _space_free_interpreter() or sys.executable
     # A quoted "exe path" ensures CreateProcess splits the command correctly.
     if " " in interpreter:
         model_command = [f'"{interpreter}" {cmd_target}']

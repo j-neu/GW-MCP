@@ -80,23 +80,28 @@ requires_da_stack = pytest.mark.skipif(
 )
 
 
-def _build_model(tmp_path: Path) -> None:
-    """Build the tiny 1×4×4 transient model plus 2 registered gauge observations."""
-    ws = str(tmp_path / _MODEL)
+def _build_model(tmp_path: Path, name: str = _MODEL, subdir: str | None = None) -> None:
+    """Build the tiny 1×4×4 transient model plus 2 registered gauge observations.
+
+    ``subdir`` inserts a space-containing path component so a test can prove a
+    workspace whose path contains a space still yields a pestpp-launchable
+    model command.
+    """
+    ws = str(tmp_path / (subdir or "") / name)
     _call(
         "create_model",
-        {"name": _MODEL, "workspace": ws, "units": "METERS", "time_units": "DAYS"},
+        {"name": name, "workspace": ws, "units": "METERS", "time_units": "DAYS"},
     )
     # One stress period / one time step — the sequential-DA requirement: the
     # cycle's only OBS-CSV row is its end-of-cycle value.
     _call(
         "set_simulation",
-        {"model": _MODEL, "nper": 1, "perlen": [50.0], "nstp": [1], "ims_complexity": "simple"},
+        {"model": name, "nper": 1, "perlen": [50.0], "nstp": [1], "ims_complexity": "simple"},
     )
     _call(
         "add_dis_package",
         {
-            "model": _MODEL,
+            "model": name,
             "nlay": 1,
             "nrow": 4,
             "ncol": 4,
@@ -106,17 +111,17 @@ def _build_model(tmp_path: Path) -> None:
             "botm": [30.0],
         },
     )
-    _call("add_npf_package", {"model": _MODEL, "icelltype": 0, "k": 5.0, "k33": None, "save_flows": True})
-    _call("add_ic_package", {"model": _MODEL, "strt": 25.0})
+    _call("add_npf_package", {"model": name, "icelltype": 0, "k": 5.0, "k33": None, "save_flows": True})
+    _call("add_ic_package", {"model": name, "strt": 25.0})
     _call(
         "add_sto_package",
-        {"model": _MODEL, "iconvert": 0, "ss": 1e-4, "sy": None, "steady_state": [], "save_flows": True},
+        {"model": name, "iconvert": 0, "ss": 1e-4, "sy": None, "steady_state": [], "save_flows": True},
     )
     # CHD gradient: high head in the (0,0) corner, low head in the (3,3) corner.
     _call(
         "add_boundary_package",
         {
-            "model": _MODEL,
+            "model": name,
             "package": "CHD",
             "stress_period_data": {"0": [[[0, 0, 0], 40.0], [[0, 3, 3], 10.0]]},
             "kwargs": None,
@@ -124,10 +129,10 @@ def _build_model(tmp_path: Path) -> None:
     )
     _call(
         "add_oc_package",
-        {"model": _MODEL, "head_filerecord": None, "budget_filerecord": None, "saverecord": None, "printrecord": None},
+        {"model": name, "head_filerecord": None, "budget_filerecord": None, "saverecord": None, "printrecord": None},
     )
 
-    obs_csv = tmp_path / "gauges.csv"
+    obs_csv = tmp_path / f"{name}_gauges.csv"
     with obs_csv.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["site", "date", "value", "cell"])
@@ -136,7 +141,7 @@ def _build_model(tmp_path: Path) -> None:
     _call(
         "import_obs_from_csv",
         {
-            "model": _MODEL,
+            "model": name,
             "csv_file": str(obs_csv),
             "obs_type": "HEAD",
             "site_col": "site",
@@ -302,6 +307,71 @@ def test_mcp_only_sequential_da_run(tmp_path):
     assert [c["cycle"] for c in summary["cycles"]] == [0, 1]
     assert summary["final_phi_mean"] is not None
     assert math.isfinite(summary["final_phi_mean"])
+
+
+@requires_da_stack
+def test_mcp_only_sequential_da_run_multiplier_space_workspace(tmp_path):
+    """6d rerun-6 regression: the multiplier scope forces a forward wrapper, and
+    a space-containing workspace (the real holdout is ``...\\MODFLOW 6\\sim``)
+    puts it in tempdir, so the emitted ``model_command`` must be launchable by
+    ``pestpp-da`` — a space-free interpreter and a stdlib-only wrapper.
+
+    Before the fix the command was ``"<venv python under 'Claude
+    Projects'>" C:\\...\\Temp\\gwmcp_run_*.py``: pestpp-da spun at 100 % CPU
+    while its child froze before importing numpy, and ``mf6.exe`` never ran
+    (4/4 attempts). The wrapper no longer imports numpy, so the space-free base
+    interpreter runs it.
+    """
+    import numpy as np
+    import pyemu
+
+    from groundwater_mcp.tools.calibration import _space_free_interpreter
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = "da_e2e_space"
+    _build_model(tmp_path, name=name, subdir="space dir")
+
+    setup = _call(
+        "setup_da_control",
+        {
+            "model": name,
+            "parameterisation": {
+                "k_mult": {"target": "npf:k", "scope": "multiplier", "initial": 1.0}
+            },
+            "cycles": [0, 1],
+            "obs_cycles": {"G1": {0: 31.0, 1: 32.0}, "G2": {0: 23.0, 1: 24.0}},
+            "num_reals": 5,
+        },
+    )
+    assert setup["n_adjustable_parameters"] == 1, setup
+    assert setup["n_state_parameters"] == 2, setup
+
+    ws = resolve_workspace(name)
+    assert " " in str(ws), "fixture must exercise a space-containing workspace"
+    pst_file = setup["pst_file"]
+
+    command = pyemu.Pst(pst_file).model_command
+    assert len(command) == 1, command
+    first_token = command[0].split()[0]
+    assert " " not in first_token, command
+    space_free = _space_free_interpreter()
+    if space_free is not None:
+        assert first_token == space_free, command
+
+    run = _call("run_pestpp_da", {"model": name, "pst_file": pst_file})
+    assert run["converged"], run
+    assert run["cycles"] >= 2, run
+    assert math.isfinite(run["final_phi_mean"])
+
+    summary = _call("summarise_da", {"model": name, "pst_file": pst_file})
+    assert summary["engine"] == "da"
+    assert [c["cycle"] for c in summary["cycles"]] == [0, 1]
+
+    # the multiplier preserved the uniform base K pattern (k = base × factor)
+    base = np.loadtxt(ws / f"{name}_k_base.dat")
+    scaled = np.loadtxt(ws / f"{name}_k.dat")
+    ratio = scaled / base
+    assert np.allclose(ratio, ratio[0]), ratio
 
 
 @requires_da_stack
