@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 73
+_EXPECTED_TOOL_COUNT = 74
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -74,6 +74,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "assign_array_from_raster",
         "import_river_from_shapefile",
         "import_obs_from_csv",
+        "import_subsidence_observations",
     ],
     "builder": [
         "create_model",

@@ -607,3 +607,108 @@ def test_plot_subsidence_respects_output_file_name(tmp_path):
     out = Path(res["output_file"])
     assert out.name == "custom_subsidence.png"
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# import_subsidence_observations
+# ---------------------------------------------------------------------------
+
+
+def test_import_subsidence_observations_registers_series(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+    from groundwater_mcp.utils import model_store
+
+    name = _csub_model(tmp_path, nlay=1)
+    obs = tmp_path / "H201_sub_data.csv"
+    obs.write_text("datetime,Subsidence_ft\n2010-01-01,0.0\n2011-01-01,0.5\n")
+    res = _impl_import_subsidence_observations(name, str(obs))
+    assert "error" not in res, res
+    assert res["n_observations"] == 2
+    meta = model_store.read_meta(name)
+    block = meta["derived_observations"]["subsidence"]
+    assert block["dates"] == ["2010-01-01", "2011-01-01"]
+    assert block["values"] == pytest.approx([0.0, 0.5])
+    assert block["sim_source"]["csv"].endswith(".csub.obs.csv")
+    assert block["sim_source"]["sum_cols"] == ["compaction"]
+    assert block["sim_source"]["time_col"] == "time"
+
+
+def test_import_subsidence_observations_unnamed_index_sorted_drops_nonfinite(tmp_path):
+    """Holdout layout: the time column is the unnamed first (index) column;
+    rows are sorted ascending and non-finite values are dropped."""
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+    from groundwater_mcp.utils import model_store
+
+    name = _csub_model(tmp_path, nlay=1)
+    obs = tmp_path / "H201_sub_data.csv"
+    obs.write_text(",Subsidence_ft\n2011-01-01,0.5\n2012-01-01,\n2010-01-01,0.1\n")
+    res = _impl_import_subsidence_observations(name, str(obs))
+    assert "error" not in res, res
+    assert res["n_observations"] == 2
+    block = model_store.read_meta(name)["derived_observations"]["subsidence"]
+    assert block["dates"] == ["2010-01-01", "2011-01-01"]
+    assert block["values"] == pytest.approx([0.1, 0.5])
+
+
+def test_import_subsidence_observations_uses_csub_meta_obs_csv(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+    from groundwater_mcp.utils import model_store
+
+    name = _csub_model(tmp_path, nlay=1)
+    meta = model_store.read_meta(name)
+    meta["csub"] = {"obs_output_csv": "custom.csub.obs.csv"}
+    model_store.write_meta(name, meta)
+    obs = tmp_path / "obs.csv"
+    obs.write_text("datetime,Subsidence_ft\n2010-01-01,0.1\n")
+    res = _impl_import_subsidence_observations(name, str(obs))
+    assert "error" not in res, res
+    assert res["sim_source"]["csv"] == "custom.csub.obs.csv"
+    stored = model_store.read_meta(name)["derived_observations"]["subsidence"]
+    assert stored["sim_source"]["csv"] == "custom.csub.obs.csv"
+
+
+def test_import_subsidence_observations_custom_sim_source_merged(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+    from groundwater_mcp.utils import model_store
+
+    name = _csub_model(tmp_path, nlay=1)
+    obs = tmp_path / "obs.csv"
+    obs.write_text("datetime,Subsidence_ft\n2010-01-01,0.1\n")
+    res = _impl_import_subsidence_observations(
+        name, str(obs), sim_source={"sum_cols": ["compaction", "elastic"]}
+    )
+    assert "error" not in res, res
+    stored = model_store.read_meta(name)["derived_observations"]["subsidence"]
+    assert stored["sim_source"]["sum_cols"] == ["compaction", "elastic"]
+    assert stored["sim_source"]["csv"].endswith(".csub.obs.csv")
+
+
+def test_import_subsidence_observations_missing_file_is_invalid_input(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+
+    name = _csub_model(tmp_path, nlay=1)
+    res = _impl_import_subsidence_observations(name, str(tmp_path / "absent.csv"))
+    assert res["error"] is True
+    assert res["code"] == "INVALID_INPUT"
+
+
+def test_import_subsidence_observations_no_value_column_is_invalid_input(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+
+    name = _csub_model(tmp_path, nlay=1)
+    obs = tmp_path / "obs.csv"
+    obs.write_text("datetime,note\n2010-01-01,a\n2011-01-01,b\n")
+    res = _impl_import_subsidence_observations(name, str(obs))
+    assert res["error"] is True
+    assert res["code"] == "INVALID_INPUT"
+
+
+def test_import_subsidence_observations_zero_finite_is_invalid_input(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+
+    name = _csub_model(tmp_path, nlay=1)
+    obs = tmp_path / "obs.csv"
+    obs.write_text("datetime,Subsidence_ft\n2010-01-01,\n2011-01-01,\n")
+    res = _impl_import_subsidence_observations(name, str(obs))
+    assert res["error"] is True
+    assert res["code"] == "INVALID_INPUT"

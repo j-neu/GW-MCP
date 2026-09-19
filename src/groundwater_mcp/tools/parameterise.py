@@ -1794,6 +1794,170 @@ def _impl_import_obs_from_csv(
     }
 
 
+def _impl_import_subsidence_observations(
+    model: str,
+    observed_csv: str,
+    time_col: str = "datetime",
+    value_col: str = "Subsidence_ft",
+    sim_source: dict | None = None,
+    name: str = "subsidence",
+) -> dict:
+    """Register a derived time-series subsidence observation target.
+
+    The observed series is read from ``observed_csv`` (dates + ``value_col``)
+    and stored in ``.gwmcp_meta.json`` under ``derived_observations`` alongside
+    a ``sim_source`` describing how to derive the simulated series: the CSUB
+    observation CSV (``csv``), the compaction columns to sum (``sum_cols``) and
+    the time column to match on (``time_col``). No model files change now —
+    Task 8's generated forward wrapper materialises the derived series at run
+    time.
+
+    ``time_col`` falls back to the first CSV column when it is not present in
+    the header, so the holdout's unnamed index (time) column works. Dates are
+    stored as ISO ``YYYY-MM-DD`` strings, sorted ascending, with rows whose
+    value is not finite dropped. Errors are returned as ``INVALID_INPUT``
+    envelopes for a missing file, no usable value column, or no finite rows.
+    """
+    from pathlib import Path
+
+    import pandas as pd
+
+    gwf = get_gwf(model)
+    ws = resolve_workspace(model)
+
+    p = Path(observed_csv)
+    cand = p if p.is_absolute() else ws / p
+    if not cand.exists():
+        return _err(
+            "INVALID_INPUT",
+            f"Observed subsidence CSV not found: {cand}",
+            "Pass observed_csv as a two-column time,subsidence CSV.",
+        )
+
+    try:
+        df = pd.read_csv(cand)
+    except Exception as exc:  # empty file, unreadable, malformed
+        return _err(
+            "INVALID_INPUT",
+            f"Could not read observed subsidence CSV {cand}: {exc}",
+            "Pass observed_csv as a two-column time,subsidence CSV.",
+        )
+    df.columns = [str(c).strip() for c in df.columns]
+    if df.empty:
+        return _err(
+            "INVALID_INPUT",
+            f"Observed subsidence CSV {cand} has no rows.",
+            "Pass a CSV with at least one (date, value) row.",
+        )
+
+    # An explicit time_col wins; otherwise the holdout's unnamed index column
+    # (pandas names it "Unnamed: 0") is the time column.
+    resolved_time = str(time_col) if str(time_col) in df.columns else None
+    if resolved_time is None:
+        for col in df.columns:
+            if str(col).lower() == str(time_col).lower():
+                resolved_time = str(col)
+                break
+    if resolved_time is None:
+        resolved_time = str(df.columns[0])
+
+    # Value column: exact match, then case-insensitive, else fail loudly.
+    resolved_value = str(value_col) if str(value_col) in df.columns else None
+    if resolved_value is None:
+        for col in df.columns:
+            if str(col).lower() == str(value_col).lower():
+                resolved_value = str(col)
+                break
+    if resolved_value is None:
+        return _err(
+            "INVALID_INPUT",
+            f"Column '{value_col}' not found in {cand.name}. "
+            f"Available: {list(df.columns)}",
+            "Pass value_col naming the subsidence value column.",
+        )
+
+    raw_time = df[resolved_time]
+    parsed = pd.to_datetime(raw_time, errors="coerce")
+    if bool(parsed.notna().all()):
+        sort_keys = parsed.to_numpy()
+        date_strings = parsed.dt.strftime("%Y-%m-%d").tolist()
+    else:
+        numeric_time = pd.to_numeric(raw_time, errors="coerce")
+        if bool(numeric_time.notna().all()):
+            sort_keys = numeric_time.to_numpy(dtype="float64")
+            date_strings = [f"{float(v):g}" for v in numeric_time.tolist()]
+        else:
+            sort_keys = np.arange(len(df))
+            date_strings = [str(v) for v in raw_time.tolist()]
+
+    values_num = pd.to_numeric(df[resolved_value], errors="coerce")
+    finite = np.isfinite(values_num.to_numpy(dtype="float64"))
+    if not bool(finite.any()):
+        return _err(
+            "INVALID_INPUT",
+            f"No finite values in column '{resolved_value}' of {cand.name}.",
+            "The observed subsidence series must contain at least one numeric value.",
+        )
+
+    work = pd.DataFrame(
+        {
+            "value": values_num.to_numpy(dtype="float64"),
+            "date": date_strings,
+            "sort": sort_keys,
+        }
+    )
+    work = work[finite].sort_values("sort", kind="stable")
+    values = [float(v) for v in work["value"].tolist()]
+    dates = [str(d) for d in work["date"].tolist()]
+
+    meta = read_meta(model)
+    csub_meta = meta.get("csub") or {}
+    default_csv = str(csub_meta.get("obs_output_csv") or f"{gwf.name}.csub.obs.csv")
+    resolved_sim: dict = {
+        "csv": default_csv,
+        "sum_cols": ["compaction"],
+        "time_col": "time",
+    }
+    if sim_source:
+        resolved_sim.update(sim_source)
+    sum_cols = resolved_sim.get("sum_cols")
+    if isinstance(sum_cols, str):
+        resolved_sim["sum_cols"] = [sum_cols]
+
+    # save_sim is the read-only guard (MODEL_ADOPTED_READONLY): it raises
+    # before any metadata is written. Nothing in the simulation changed, so the
+    # staged model is a no-op at the next flush.
+    written = save_sim(model, gwf.simulation)
+
+    derived = meta.setdefault("derived_observations", {})
+    used = {str(k).lower() for k in derived if str(k).lower() != str(name).lower()}
+    safe_name = _safe_obs_name(name, used)
+    derived[safe_name] = {
+        "observed_csv": str(cand),
+        "time_col": resolved_time,
+        "value_col": resolved_value,
+        "values": values,
+        "dates": dates,
+        "sim_source": resolved_sim,
+    }
+    meta.setdefault("provenance", {})[f"derived_observations.{safe_name}"] = {
+        "source": str(cand),
+        "tool": "import_subsidence_observations",
+    }
+    write_meta(model, meta)
+
+    return {
+        "model": model,
+        "name": safe_name,
+        "observed_csv": str(cand),
+        "time_col": resolved_time,
+        "value_col": resolved_value,
+        "n_observations": len(values),
+        "sim_source": dict(resolved_sim),
+        "written": written,
+    }
+
+
 # ---------------------------------------------------------------------------
 # MCP registration
 # ---------------------------------------------------------------------------
@@ -2194,3 +2358,44 @@ def register(mcp) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("OBS_IMPORT_FAILED", str(exc))
+
+    @mcp.tool()
+    def import_subsidence_observations(
+        model: str,
+        observed_csv: str,
+        time_col: str = "datetime",
+        value_col: str = "Subsidence_ft",
+        sim_source: dict | None = None,
+        name: str = "subsidence",
+    ) -> dict:
+        """Register a derived time-series subsidence observation target.
+
+        Reads a measured subsidence CSV (``time_col`` + ``value_col``) and
+        stores it under ``derived_observations`` in ``.gwmcp_meta.json``. This
+        does not write a MODFLOW 6 observation package — a derived series has
+        no native MF6 observation type. Instead it records the simulated-series
+        recipe (``sim_source``) that the calibration forward wrapper uses to
+        build a compaction-summed ``<gwf>_subsidence.csv`` before PEST++ reads
+        it (``setup_calibration(obs_source="derived")``).
+
+        ``sim_source`` defaults to the model's CSUB observation CSV
+        (``meta["csub"]["obs_output_csv"]``, else ``<gwf>.csub.obs.csv``), the
+        layer compaction columns (``sum_cols=["compaction"]``) and
+        ``time_col="time"``. ``dates`` are stored as ISO ``YYYY-MM-DD`` strings
+        sorted ascending; rows with a non-finite value are dropped. ``time_col``
+        falls back to the first CSV column when it is not named in the header,
+        so an unnamed date index (the holdout layout) works. A missing file, no
+        usable value column, or no finite rows returns ``INVALID_INPUT``.
+        """
+        try:
+            return _impl_import_subsidence_observations(
+                model, observed_csv, time_col, value_col, sim_source, name
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("SUBSIDENCE_OBS_IMPORT_FAILED", str(exc))

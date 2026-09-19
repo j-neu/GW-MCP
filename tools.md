@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-73 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+74 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -64,6 +64,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
 | `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None` | Observation summary: site count, record count, date range, written observation file path |
+| `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`) |
 
 `import_obs_from_csv` persists the observation targets as model state
 (7f-F1.1): the site → cellid map, observed values and dates are stored in
@@ -88,6 +89,7 @@ re-established before further calls (2026-08-30 rerun-5 finding).
 - `assign_array_from_raster` is the catch-all for any other model array driven by a raster: an enumerated target table names the (package, array) pair — `NPF.k`/`NPF.k33`, `IC.strt`, `STO.ss`/`STO.sy` (per layer) and `RCHA.recharge`, `EVTA.surface`/`EVTA.rate`/`EVTA.depth` (per stress period, on the layer-0 footprint = topmost active cell per column, the MF6 default). Rate targets (`RCHA.recharge`, `EVTA.rate`) accept `rate_units` (e.g. `mm/yr`) and convert to m/d, recording the declared units. Odd values (negative ET rates, non-positive ET depth) are reported in `value_warnings`, never written silently. RCHA/EVTA packages are created on first use; NPF/IC/STO need their builder call first. This completes the file-based ingestion path — an agent names a file, never a payload of cell values.
 - `import_river_from_shapefile` intersects the river network with the model grid and snaps reaches to cell faces.
 - `import_obs_from_csv` matches observation sites to model cells by an explicit `cellid_col` cell-id column if provided (0-based node on DISU → written 1-based; `layer,row,col`/`layer,node` on DIS/DISV), otherwise by (x, y) coordinate if provided, otherwise sequentially. The explicit column is required where coordinates are ambiguous (DISU/DISV layers stack in x/y).
+- `import_subsidence_observations` registers a **derived** time-series target under `derived_observations` in `.gwmcp_meta.json` — a measured subsidence CSV plus the recipe (`sim_source`) for the simulated series, which the calibration forward wrapper materialises as `<gwf>_subsidence.csv` before PEST++ reads it (`setup_calibration(obs_source="derived")`). `time_col` falls back to the first CSV column when the header does not name it (an unnamed date index works); `dates` are stored as ISO `YYYY-MM-DD` sorted ascending with non-finite values dropped. It writes no MODFLOW 6 observation package because a derived series has no native MF6 observation type.
 
 ---
 

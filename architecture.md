@@ -6,7 +6,7 @@ An open-source Python MCP server for AI-assisted groundwater modelling with MODF
 
 ## Overview
 
-The server exposes 73 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 74 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -78,7 +78,7 @@ groundwater-mcp/
 │       ├── server.py           ← MCP entrypoint, tool registration
 │       ├── tools/
 │       │   ├── docs.py         ← search_docs, search_tutorials, get_doc_file
-│       │   ├── parameterise.py ← import_grid_from_shapefile, assign_top_from_raster, assign_k_from_zones, assign_k_from_raster, assign_ic_from_raster, assign_array_from_raster, import_river_from_shapefile, import_obs_from_csv
+│       │   ├── parameterise.py ← import_grid_from_shapefile, assign_top_from_raster, assign_k_from_zones, assign_k_from_raster, assign_ic_from_raster, assign_array_from_raster, import_river_from_shapefile, import_obs_from_csv, import_subsidence_observations
 │       │   ├── builder.py      ← create_model, adopt_model, add_*_package, summarise_model
 │       │   ├── runner.py       ← run_simulation, check_model, get_run_log
 │       │   ├── postprocess.py  ← read_heads, read_budget, read_compaction, plot_*, compute_*
