@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-70 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+71 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -128,6 +128,7 @@ Fully unstructured (DISU) grids are defined by explicit node connectivity: `node
 | `add_npf_package` | `model: str`, `icelltype: int \| list`, `k: float \| list`, `k33: float \| list \| None`, `save_flows: bool = True`, `k_units: str = "m/d"` | Confirmation |
 | `add_ic_package` | `model: str`, `strt: float \| list` | Confirmation |
 | `add_sto_package` | `model: str`, `iconvert: int \| list`, `ss: float \| list`, `sy: float \| list \| None`, `steady_state: list[int] \| None`, `save_flows: bool = True` | Package summary with resolved steady/transient periods |
+| `add_csub_package` | `model: str`, `packagedata: list \| dict`, `ninterbeds: int \| None`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr: float \| list \| None`, `head_based: bool`, `initial_preconsolidation_head: bool`, `specified_initial_interbed_state: bool`, `update_material_properties: bool`, `ndelaycells: int \| None`, `beta`/`gammaw: float \| None`, `interbeddata: list \| None`, `stress_period_data: dict \| None`, `observations: dict \| None`, `filerecords: dict \| None`, `print_input: bool`, `save_flows: bool`, `pname: str \| None` | CSUB package summary (interbed count, delay count, layers, filerecords, obs CSV) |
 | `add_boundary_package` | `model: str`, `package: str`, `stress_period_data: dict`, `kwargs: dict`, `save_flows: bool = True`, `rate_units: str \| None = None`, `pname: str \| None = None` | Package summary with cell count per stress period |
 
 **Units (7f-H1.1):** `add_npf_package` accepts `k_units` (default "m/d";
@@ -152,6 +153,8 @@ m/d. Declared units are recorded in `.gwmcp_meta.json` and reported by
 **Registry scoping (7e-B4.2):** the model registry is scoped per workspace root. Models created with an explicit `workspace` register in a `.<root>/.gwmcp_registry.json` next to that workspace; models created without one register under the default root. Re-registering the same name+path is idempotent; the same name under different roots is legal; the same name twice in one root with different paths errors.
 
 `add_sto_package` defines aquifer storage (required for transient simulations). `steady_state` lists the **0-based** stress-period indices that are steady-state; all other periods run transient. Default `[0]` → first period steady, rest transient; `[]` → all periods transient. `sy` (specific yield) is required when any cell is convertible (`iconvert > 0`). **Without an STO package, a multi-time-step model runs as steady state** — `check_model` and `run_simulation` return a warning when they detect that configuration.
+
+`add_csub_package` defines the CSUB (subsidence) package. `packagedata` is a list of 11-field interbed records (`[icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc, sse_cr, theta, kv, h0]`, all indices 0-based and contiguous from `icsubno=0`) or `{"filename": ...}` to reference a pre-externalised file (then `ninterbeds` is required; a dict may also carry `"data"` to write it external on flush). `sgm`/`sgs`/`cg_theta`/`cg_ske_cr` accept a scalar or one value per layer. `ndelaycells` is **required** when any interbed has `cdelay="delay"` — it is never defaulted silently. `observations` maps a CSV name to `[(name, obs_type, index), ...]`: cell types (`compaction`, `preconstress`, `elastic-compaction`, `inelastic-compaction`; the `-cell` suffix is optional) take a cellid, interbed types (`interbed-compaction-pct`, `delay-preconstress`, `delay-head`) take a 0-based interbed number; the registered output CSV (`obs_output_csv`/`obs_names`) is persisted in `.gwmcp_meta.json` under the `csub` block for post-processing. `filerecords` accepts `zdisplacement`, `package_convergence`, `strainib`, `compaction`. Re-adding replaces the existing CSUB package(s) unless distinct `pname` values are used.
 | `add_oc_package` | `model: str`, `head_filerecord: str \| None`, `budget_filerecord: str \| None`, `saverecord: list`, `printrecord: list \| None` | Confirmation |
 | `summarise_model` | `model: str` | Structured summary: packages, grid dimensions (+ `n_active` when idomain present), stress periods, boundary types, storage (STO steady/transient periods), registered `observations` count, `reloaded_from_disk` flag |
 | `model_status` | `model: str` | `{ runnable: bool, missing_required: list[str], missing_recommended: list[str], next_steps: list[str], warnings: list[str] }` — ordered build-order status (7e-C8) |

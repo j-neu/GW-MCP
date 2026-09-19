@@ -8,7 +8,7 @@ from pathlib import Path
 import flopy.mf6 as mf6
 import numpy as np
 
-from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
+from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv, grid_size
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_sim,
@@ -687,6 +687,390 @@ def _impl_add_sto_package(
     }
     if replaced:
         result["warning"] = "A previous STO package was removed and replaced by this call."
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CSUB (subsidence)
+# ---------------------------------------------------------------------------
+
+# FloPy's ``ModflowGwfcsub._package_type`` is ``"csub"`` (the MF6 name-file
+# type is ``CSUB6``). ``_packages_of_type`` matches on flopy's ``package_type``,
+# so ``"csub"`` is the value that actually finds an existing package.
+_CSUB_PKG_TYPE = "csub"
+
+# Canonical MF6 CSUB cell-observation type names.
+_CSUB_OBS_TYPES = {
+    "compaction-cell",
+    "preconstress-cell",
+    "elastic-compaction-cell",
+    "inelastic-compaction-cell",
+}
+# The four cell types may also be given without the ``-cell`` suffix.
+_CSUB_OBS_TYPE_ALIASES = {
+    "compaction": "compaction-cell",
+    "preconstress": "preconstress-cell",
+    "elastic-compaction": "elastic-compaction-cell",
+    "inelastic-compaction": "inelastic-compaction-cell",
+}
+# Interbed observations take a 0-based interbed number (and, for the delay
+# types, an optional delay-cell index).
+_CSUB_INTERBED_OBS_TYPES = {
+    "interbed-compaction-pct",
+    "delay-preconstress",
+    "delay-head",
+}
+_CSUB_FILERECORDS = {
+    "zdisplacement": "zdisplacement_filerecord",
+    "package_convergence": "package_convergence_filerecord",
+    "strainib": "strainib_filerecord",
+    "compaction": "compaction_filerecord",
+}
+
+
+def _normalise_csub_packagedata(packagedata, nlay: int) -> list:
+    """Validate CSUB packagedata records and return them as lists.
+
+    A record is ``[icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc,
+    sse_cr, theta, kv, h0]``. ``icsubno`` must be contiguous from 0 (the file
+    is renumbered to 1-based by flopy on write). ``pcs0`` is deliberately not
+    validated: the holdout sets ``pcs0=0.0`` whenever
+    ``initial_preconsolidation_head=True``.
+    """
+    recs = []
+    for i, rec in enumerate(packagedata):
+        rec = list(rec)
+        if len(rec) != 11:
+            raise ValueError(
+                f"packagedata record {i} has {len(rec)} fields, expected 11 "
+                "(icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc, "
+                "sse_cr, theta, kv, h0)."
+            )
+        icsubno, cellid, cdelay, _pcs0, thick_frac, rnb, _ssv_cc, _sse_cr, \
+            theta, _kv, _h0 = rec
+        if int(icsubno) != i:
+            raise ValueError(
+                f"packagedata icsubno must be contiguous from 0 (record {i})."
+            )
+        cdelay = str(cdelay).lower()
+        if cdelay not in ("delay", "nodelay"):
+            raise ValueError(
+                f"packagedata record {i}: cdelay must be 'delay' or 'nodelay'."
+            )
+        if isinstance(cellid, (list, tuple)):
+            if not cellid:
+                raise ValueError(f"packagedata record {i}: empty cellid.")
+            layer = int(cellid[0])
+            if not 0 <= layer < nlay:
+                raise ValueError(
+                    f"packagedata record {i}: layer {layer} outside 0..{nlay - 1}."
+                )
+        elif int(cellid) < 0:
+            # DISU cell ids are a single node number.
+            raise ValueError(f"packagedata record {i}: node id must be >= 0.")
+        if float(thick_frac) <= 0.0:
+            raise ValueError(f"packagedata record {i}: thick_frac must be > 0.")
+        if float(rnb) < 1.0:
+            raise ValueError(f"packagedata record {i}: rnb must be >= 1.")
+        if not 0.0 < float(theta) < 1.0:
+            raise ValueError(f"packagedata record {i}: theta must be in (0, 1).")
+        recs.append(rec)
+    return recs
+
+
+def _per_layer_values(value, nlay: int, field: str) -> list:
+    """Broadcast a scalar to ``nlay`` values, or validate an explicit list."""
+    vals = list(value) if isinstance(value, (list, tuple)) else [value] * nlay
+    if len(vals) != nlay:
+        raise ValueError(f"{field} has {len(vals)} values, expected nlay={nlay}.")
+    return vals
+
+
+def _normalise_csub_observations(
+    observations: dict, gwf_name: str
+) -> tuple[dict, str, list]:
+    """Validate CSUB observations into flopy's ``continuous`` structure.
+
+    ``observations`` maps a CSV name to ``[(name, obs_type, index), ...]``. A
+    CSV name that does not end in ``.csv`` is treated as a label and the default
+    ``<gwf>.csub.obs.csv`` is used. Cell types take a cellid; interbed types
+    take a 0-based interbed number (converted to MF6's 1-based ``icsubno``).
+    """
+    continuous: dict = {}
+    obs_names: list[str] = []
+    default_csv = f"{gwf_name}.csub.obs.csv"
+    output_csv = default_csv
+    accepted = sorted(_CSUB_OBS_TYPES | _CSUB_INTERBED_OBS_TYPES)
+    for csv_name, records in observations.items():
+        out_csv = str(csv_name)
+        if not out_csv.lower().endswith(".csv"):
+            out_csv = default_csv
+        entries: list = []
+        for record in records:
+            if len(record) != 3:
+                raise ValueError(
+                    "each CSUB observation record must be "
+                    "(name, obs_type, index)."
+                )
+            obs_name, obs_type, index = record
+            obs_name = str(obs_name)
+            obs_type = _CSUB_OBS_TYPE_ALIASES.get(str(obs_type), str(obs_type))
+            if obs_type in _CSUB_OBS_TYPES:
+                if not isinstance(index, (list, tuple)):
+                    raise ValueError(
+                        f"observation '{obs_name}': cell observation "
+                        f"'{obs_type}' requires a cellid (layer, row, col) or "
+                        "(layer, node)."
+                    )
+                entries.append((obs_name, obs_type, tuple(int(v) for v in index)))
+            elif obs_type in _CSUB_INTERBED_OBS_TYPES:
+                if isinstance(index, (list, tuple)):
+                    idx = [int(v) for v in index]
+                    if not idx:
+                        raise ValueError(
+                            f"observation '{obs_name}': empty interbed index."
+                        )
+                    idx[0] += 1  # 0-based interbed number -> MF6 icsubno
+                    entries.append((obs_name, obs_type, tuple(idx)))
+                else:
+                    entries.append((obs_name, obs_type, int(index) + 1))
+            else:
+                raise ValueError(
+                    f"observation '{obs_name}': unknown obs_type '{obs_type}'. "
+                    f"Accepted: {', '.join(accepted)}."
+                )
+            obs_names.append(obs_name)
+        continuous[out_csv] = entries
+        output_csv = out_csv
+    return continuous, output_csv, obs_names
+
+
+def _impl_add_csub_package(
+    model: str,
+    packagedata: list | dict,
+    ninterbeds: int | None = None,
+    sgm: float | list | None = None,
+    sgs: float | list | None = None,
+    cg_theta: float | list | None = None,
+    cg_ske_cr: float | list | None = None,
+    head_based: bool = False,
+    initial_preconsolidation_head: bool = False,
+    specified_initial_interbed_state: bool = False,
+    update_material_properties: bool = False,
+    ndelaycells: int | None = None,
+    beta: float | None = None,
+    gammaw: float | None = None,
+    interbeddata: list | None = None,
+    stress_period_data: dict | None = None,
+    observations: dict | None = None,
+    filerecords: dict | None = None,
+    print_input: bool = True,
+    save_flows: bool = True,
+    pname: str | None = None,
+) -> dict:
+    """Add or replace the CSUB (subsidence) package on a GWF model.
+
+    ``packagedata`` is a list of interbed records or ``{"filename": ...}`` (a
+    pre-externalised file, in which case ``ninterbeds`` is required); a dict
+    may also carry ``"data"`` to write the external file on flush. Per-layer
+    arrays (``sgm``/``sgs``/``cg_theta``/``cg_ske_cr``) accept a scalar or one
+    value per layer. ``ndelaycells`` is required when any interbed has
+    ``cdelay="delay"`` — it is never defaulted silently.
+    """
+    gwf = get_gwf(model)
+    sim = get_sim(model)
+    nlay, _ = grid_size(gwf)
+
+    pkg_filename: str | None = None
+    recs: list | None = None
+    try:
+        if isinstance(packagedata, dict):
+            pkg_filename = packagedata.get("filename")
+            if not pkg_filename:
+                raise ValueError(
+                    "packagedata dict must contain a 'filename' key."
+                )
+            data = packagedata.get("data")
+            if data is not None:
+                recs = _normalise_csub_packagedata(data, nlay)
+        else:
+            recs = _normalise_csub_packagedata(packagedata, nlay)
+
+        if recs is not None:
+            if ninterbeds is None:
+                ninterbeds = len(recs)
+            elif int(ninterbeds) != len(recs):
+                raise ValueError(
+                    f"ninterbeds={ninterbeds} does not match "
+                    f"len(packagedata)={len(recs)}."
+                )
+        elif ninterbeds is None:
+            raise ValueError(
+                "ninterbeds is required when packagedata is given as "
+                "{'filename': ...} without 'data'."
+            )
+        ninterbeds = int(ninterbeds)
+
+        if ndelaycells is not None:
+            ndelaycells = int(ndelaycells)
+            if ndelaycells <= 0:
+                raise ValueError("ndelaycells must be a positive integer.")
+        has_delay = recs is not None and any(
+            str(r[2]).lower() == "delay" for r in recs
+        )
+        if has_delay and ndelaycells is None:
+            raise ValueError(
+                "ndelaycells is required when any interbed has cdelay='delay'."
+            )
+
+        kw: dict = {}
+        if print_input:
+            kw["print_input"] = True
+        if save_flows:
+            kw["save_flows"] = True
+        if head_based:
+            kw["head_based"] = True
+        if initial_preconsolidation_head:
+            kw["initial_preconsolidation_head"] = True
+        if specified_initial_interbed_state:
+            kw["specified_initial_interbed_state"] = True
+        if update_material_properties:
+            kw["update_material_properties"] = True
+        if ndelaycells is not None:
+            kw["ndelaycells"] = ndelaycells
+        if beta is not None:
+            kw["beta"] = float(beta)
+        if gammaw is not None:
+            kw["gammaw"] = float(gammaw)
+        for field, value in (
+            ("sgm", sgm),
+            ("sgs", sgs),
+            ("cg_theta", cg_theta),
+            ("cg_ske_cr", cg_ske_cr),
+        ):
+            if value is not None:
+                kw[field] = _per_layer_values(value, nlay, field)
+        for key, target in (filerecords or {}).items():
+            if key not in _CSUB_FILERECORDS:
+                raise ValueError(
+                    f"Unknown filerecord '{key}'. Accepted: "
+                    f"{', '.join(sorted(_CSUB_FILERECORDS))}."
+                )
+            kw[_CSUB_FILERECORDS[key]] = target
+        if stress_period_data is not None:
+            kw["stress_period_data"] = stress_period_data
+        if interbeddata is not None:
+            kw["interbeddata"] = interbeddata
+        if pname:
+            kw["pname"] = pname
+
+        obs_continuous: dict | None = None
+        obs_output_csv: str | None = None
+        obs_names: list[str] = []
+        if observations:
+            obs_continuous, obs_output_csv, obs_names = _normalise_csub_observations(
+                observations, gwf.name
+            )
+    except ValueError as exc:
+        return _err("INVALID_INPUT", str(exc))
+
+    # Replacement semantics (matching add_boundary_package): with an explicit
+    # ``pname`` only that package is replaced; otherwise every CSUB package.
+    existing = _packages_of_type(gwf, _CSUB_PKG_TYPE)
+    if pname:
+        targets = [p for p in existing if _pkg_nam_name(p).lower() == pname.lower()]
+    else:
+        targets = existing
+    for pkg in targets:
+        gwf.remove_package(pkg)
+    replaced = bool(targets)
+
+    if recs is not None:
+        pkg = mf6.ModflowGwfcsub(
+            gwf, ninterbeds=ninterbeds, packagedata=recs, **kw
+        )
+    else:
+        pkg = mf6.ModflowGwfcsub(gwf, ninterbeds=ninterbeds, **kw)
+        # Pre-externalised packagedata: reference the caller's file without
+        # reading or rewriting it.
+        pkg.packagedata.set_data({"filename": pkg_filename}, check_data=False)
+
+    if obs_continuous is not None:
+        pkg.obs.initialize(
+            filename=f"{gwf.name}.csub.obs",
+            digits=10,
+            print_input=True,
+            continuous=obs_continuous,
+        )
+
+    written = save_sim(model, sim)
+
+    if recs is not None:
+        layers: list = [
+            int(r[1][0]) if isinstance(r[1], (list, tuple)) else None
+            for r in recs
+        ]
+        interbeds = [
+            {
+                "icsubno": i,
+                "layer": layers[i],
+                "cdelay": str(r[2]).lower(),
+            }
+            for i, r in enumerate(recs)
+        ]
+        n_delay: int | None = sum(
+            1 for r in recs if str(r[2]).lower() == "delay"
+        )
+    else:
+        layers = []
+        interbeds = []
+        n_delay = None
+
+    ws = resolve_workspace(model)
+    meta = _read_meta(ws)
+    csub_meta: dict = {
+        "ninterbeds": ninterbeds,
+        "n_delay_interbeds": n_delay,
+        "ndelaycells": ndelaycells,
+        "layers": layers,
+        "interbeds": interbeds,
+        "filerecords": dict(filerecords or {}),
+    }
+    if pkg_filename is not None:
+        csub_meta["packagedata_filename"] = str(pkg_filename)
+    if obs_output_csv is not None:
+        csub_meta["obs_output_csv"] = obs_output_csv
+        csub_meta["obs_names"] = obs_names
+    meta["csub"] = csub_meta
+    _write_meta(ws, meta)
+
+    result: dict = {
+        "model": model,
+        "package": "CSUB",
+        "ninterbeds": ninterbeds,
+        "n_delay_interbeds": n_delay,
+        "ndelaycells": ndelaycells,
+        "layers": layers,
+        "filerecords": dict(filerecords or {}),
+        "written": written,
+    }
+    if pkg_filename is not None:
+        result["packagedata_filename"] = str(pkg_filename)
+    if obs_output_csv is not None:
+        result["obs_output_csv"] = obs_output_csv
+        result["obs_names"] = obs_names
+    if replaced:
+        if pname:
+            result["warning"] = (
+                f"A previous CSUB package named '{pname}' was removed and "
+                "replaced by this call."
+            )
+        else:
+            result["warning"] = (
+                "A previous CSUB package was removed and replaced by this "
+                "call. Pass a distinct pname to keep multiple CSUB packages "
+                "side by side."
+            )
     return result
 
 
@@ -1465,6 +1849,81 @@ def register(mcp) -> None:
         try:
             return _impl_add_sto_package(
                 model, iconvert, ss, sy, steady_state, save_flows
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_csub_package(
+        model: str,
+        packagedata: list | dict,
+        ninterbeds: int | None = None,
+        sgm: float | list | None = None,
+        sgs: float | list | None = None,
+        cg_theta: float | list | None = None,
+        cg_ske_cr: float | list | None = None,
+        head_based: bool = False,
+        initial_preconsolidation_head: bool = False,
+        specified_initial_interbed_state: bool = False,
+        update_material_properties: bool = False,
+        ndelaycells: int | None = None,
+        beta: float | None = None,
+        gammaw: float | None = None,
+        interbeddata: list | None = None,
+        stress_period_data: dict | None = None,
+        observations: dict | None = None,
+        filerecords: dict | None = None,
+        print_input: bool = True,
+        save_flows: bool = True,
+        pname: str | None = None,
+    ) -> dict:
+        """Add or replace the CSUB (subsidence) package on a MODFLOW 6 GWF model.
+
+        ``packagedata`` is a list of 11-field interbed records
+        ``[icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc, sse_cr,
+        theta, kv, h0]`` with 0-based ``icsubno`` (contiguous from 0) and
+        0-based cellids, or ``{"filename": ...}`` to reference a
+        pre-externalised file (then ``ninterbeds`` is required).
+        ``sgm``/``sgs``/``cg_theta``/``cg_ske_cr`` take a scalar or one value
+        per layer. ``ndelaycells`` is required — never defaulted — when any
+        interbed has ``cdelay="delay"``.
+
+        ``observations`` maps a CSV name to ``[(name, obs_type, index), ...]``:
+        cell types (compaction, preconstress, elastic-compaction,
+        inelastic-compaction; the ``-cell`` suffix is optional) take a cellid;
+        interbed types (interbed-compaction-pct, delay-preconstress, delay-head)
+        take a 0-based interbed number. ``filerecords`` accepts zdisplacement,
+        package_convergence, strainib and compaction. Re-adding replaces the
+        existing CSUB package(s) unless distinct ``pname`` values are used."""
+        try:
+            return _impl_add_csub_package(
+                model,
+                packagedata,
+                ninterbeds,
+                sgm,
+                sgs,
+                cg_theta,
+                cg_ske_cr,
+                head_based,
+                initial_preconsolidation_head,
+                specified_initial_interbed_state,
+                update_material_properties,
+                ndelaycells,
+                beta,
+                gammaw,
+                interbeddata,
+                stress_period_data,
+                observations,
+                filerecords,
+                print_input,
+                save_flows,
+                pname,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

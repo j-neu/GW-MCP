@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 70
+_EXPECTED_TOOL_COUNT = 71
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -86,6 +86,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "add_npf_package",
         "add_ic_package",
         "add_sto_package",
+        "add_csub_package",
         "add_oc_package",
         "add_boundary_package",
         "summarise_model",
