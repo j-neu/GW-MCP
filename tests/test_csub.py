@@ -194,6 +194,17 @@ def test_add_csub_package_unknown_filerecord(tmp_path):
     assert res["code"] == "INVALID_INPUT"
 
 
+def test_add_csub_package_rejects_interbeddata(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+
+    name = _csub_model(tmp_path, nlay=1)
+    res = _impl_add_csub_package(
+        name, packagedata=[_rec(layer=0)], interbeddata=[[(0, 0, 0), 0.0]]
+    )
+    assert res["code"] == "INVALID_INPUT"
+    assert "interbeddata" in res["message"]
+
+
 def test_add_csub_package_scalar_per_layer_values_broadcast(tmp_path):
     from groundwater_mcp.tools.builder import _impl_add_csub_package
 

@@ -960,7 +960,11 @@ def _impl_add_csub_package(
         if stress_period_data is not None:
             kw["stress_period_data"] = stress_period_data
         if interbeddata is not None:
-            kw["interbeddata"] = interbeddata
+            raise ValueError(
+                "interbeddata is not supported by flopy 3.10's CSUB6 dfn; "
+                "specify the initial interbed state via packagedata (h0) "
+                "and/or stress_period_data"
+            )
         if pname:
             kw["pname"] = pname
 
