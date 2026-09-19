@@ -729,7 +729,13 @@ _SENSITIVITY_TOLERANCE = 1e-3
 def _tpl_substitute(tpl: Path, target: Path, values: dict[str, float]) -> None:
     """Write the model-input file for *values* from a template, preserving
     token widths so fixed-width files stay valid. The template header line
-    (``ptf ~``) and the token markers are not part of the model input file."""
+    (``ptf ~``) and the token markers are not part of the model input file.
+
+    Every occurrence of a token is replaced: a constant per-layer CSUB array
+    parameter legitimately appears once per cell of its layer (each layer is
+    several rows in the external ``LAYERED`` array file), and PEST likewise
+    substitutes all occurrences.
+    """
     lines = tpl.read_text().splitlines()
     marker = lines[0].split()[1]
     out = []
@@ -739,12 +745,12 @@ def _tpl_substitute(tpl: Path, target: Path, values: dict[str, float]) -> None:
             pat = re.compile(
                 re.escape(marker) + r"\s*" + re.escape(name) + r"\s*" + re.escape(marker)
             )
-            m = pat.search(new)
-            if m:
-                token = m.group(0)
-                inner_len = len(token) - 2 * len(marker)
-                inner = f"{value!s}".center(inner_len)
-                new = new[: m.start()] + inner + new[m.end() :]
+
+            def _repl(match, value=value):
+                span = len(match.group(0)) - 2 * len(marker)
+                return f"{value!s}".center(span)
+
+            new = pat.sub(_repl, new)
         out.append(new)
     target.write_text("\n".join(out) + "\n")
 
@@ -1028,7 +1034,13 @@ def _impl_rewire_npf_k_external(
     return _impl_rewire_npf_array_external(model, "k", filename=filename, flush=flush)
 
 
-_SUPPORTED_TARGETS = ("npf:k", "npf:k33")
+_SUPPORTED_TARGETS = (
+    "npf:k",
+    "npf:k33",
+    "csub:packagedata",
+    "csub:cg_theta",
+    "csub:cg_ske_cr",
+)
 _TPL_TOKEN_WIDTH = 15
 
 
@@ -1288,6 +1300,11 @@ def _normalise_multiplier_parameterisation(model: str, parameterisation: dict) -
                 f"Unsupported parameterisation target '{target}'. Supported: "
                 f"{list(_SUPPORTED_TARGETS)}."
             )
+        if target != "npf:k":
+            raise ValueError(
+                "Multiplier parameterisation supports target 'npf:k' only; "
+                f"got '{target}'."
+            )
         initial = float(spec.get("initial", 1.0))
         if not np.isfinite(initial) or initial <= 0:
             raise ValueError(f"Parameter '{key}' initial multiplier must be positive.")
@@ -1389,6 +1406,11 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
             raise ValueError(
                 f"Unsupported parameterisation target '{target}'. Supported: "
                 f"{list(_SUPPORTED_TARGETS)}."
+            )
+        if target != "npf:k":
+            raise ValueError(
+                "Zoned parameterisation supports target 'npf:k' only; "
+                f"got '{target}'."
             )
         layer = spec.get("layer")
         if layer is None:
@@ -1568,20 +1590,24 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
                 f"Unsupported parameterisation target '{target}'. Supported: "
                 f"{list(_SUPPORTED_TARGETS)}."
             )
-        if target in _NPF_TARGET_KEYWORDS:
-            keyword = _NPF_TARGET_KEYWORDS[target]
-            npf = gwf.get_package("npf")
-            if npf is None:
-                raise ValueError(
-                    "No NPF package found; run add_npf_package before "
-                    f"parameterising {keyword}."
-                )
-            field = getattr(npf, keyword, None)
-            if field is None or getattr(field, "array", None) is None:
-                raise ValueError(
-                    f"NPF has no '{keyword}' array; add it with "
-                    f"add_npf_package(..., {keyword}=...)."
-                )
+        if target not in _NPF_TARGET_KEYWORDS:
+            raise ValueError(
+                f"'{target}' is not an NPF array target; parameterise it "
+                "through setup_calibration's target resolver."
+            )
+        keyword = _NPF_TARGET_KEYWORDS[target]
+        npf = gwf.get_package("npf")
+        if npf is None:
+            raise ValueError(
+                "No NPF package found; run add_npf_package before "
+                f"parameterising {keyword}."
+            )
+        field = getattr(npf, keyword, None)
+        if field is None or getattr(field, "array", None) is None:
+            raise ValueError(
+                f"NPF has no '{keyword}' array; add it with "
+                f"add_npf_package(..., {keyword}=...)."
+            )
         scope = spec.get("scope", "all")
         if scope not in ("all", "layer", "cells"):
             raise ValueError(f"scope must be 'all', 'layer' or 'cells', got '{scope}'.")
@@ -1638,23 +1664,23 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
                 )
             cell_param[idx] = p["name"]
 
-    # A parameterisation may target at most one NPF array per call (one
-    # external file / one template). ``npf:k`` keeps the whole-array coverage
-    # guard: a partial K template silently flattens the unparameterised cells
-    # (the neversink rerun-2 bug). Other arrays (``npf:k33``, and the CSUB
-    # targets added later) may be partial — the unparameterised cells keep
-    # their base value in the template.
-    npf_keywords = {
-        _NPF_TARGET_KEYWORDS[p["target"]]
-        for p in params
-        if p["target"] in _NPF_TARGET_KEYWORDS
+    # Each call normalises exactly one NPF array: the target resolver registry
+    # partitions a multi-target spec into one group per target, so the
+    # whole-array coverage guard is evaluated per array rather than from a
+    # mixed target set. ``npf:k`` keeps the strict guard (a partial K template
+    # silently flattens the unparameterised cells — the neversink rerun-2 bug);
+    # other arrays (``npf:k33``) may be partial, with unparameterised cells
+    # keeping their base value in the template.
+    npf_targets = {
+        p["target"] for p in params if p["target"] in _NPF_TARGET_KEYWORDS
     }
-    if len(npf_keywords) > 1:
+    if len(npf_targets) > 1:
         raise ValueError(
-            "A parameterisation may target only one NPF array per setup call; "
-            f"got {sorted(npf_keywords)}."
+            "A single normalisation may target only one NPF array; the "
+            "setup_calibration registry resolves one target group per array. "
+            f"Got {sorted(npf_targets)}."
         )
-    if npf_keywords == {"k"} and len(cell_param) != ncell:
+    if npf_targets == {"npf:k"} and len(cell_param) != ncell:
         raise ValueError(
             f"Parameterisation covers {len(cell_param)} of {ncell} cells; "
             f"{ncell - len(cell_param)} cells are unassigned. Add a parameter "
@@ -2020,6 +2046,654 @@ def _needs_forward_wrapper(model: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# 7e-A2 (Task 7) — target resolver registry: csub:packagedata / csub:cg_*
+# ---------------------------------------------------------------------------
+
+
+# CSUB per-layer array target -> flopy CSUB attribute name.
+_CSUB_ARRAY_TARGET_KEYWORDS = {
+    "csub:cg_theta": "cg_theta",
+    "csub:cg_ske_cr": "cg_ske_cr",
+}
+
+# Packagedata numeric column -> field index counted from the END of the record
+# line. The external file holds ``icsubno cellid... cdelay pcs0 thick_frac rnb
+# ssv_cc sse_cr theta kv h0`` where ``cellid`` is 3 tokens on DIS, 2 on DISV
+# and 1 on DISU, so counting from the end resolves every grid type (spike §2).
+_CSUB_PACKAGEDATA_COLUMNS = {
+    "pcs0": -8,
+    "thick_frac": -7,
+    "rnb": -6,
+    "ssv_cc": -5,
+    "sse_cr": -4,
+    "theta": -3,
+    "kv": -2,
+    "h0": -1,
+}
+
+# Packagedata columns whose base value may be dimensionless/order-one, so the
+# default partrans is "none" rather than "log" (spike design notes).
+_CSUB_PARTANS_NONE = ("rnb", "thick_frac")
+
+
+def _get_csub_package(gwf):
+    """Return the GWF model's CSUB package, or ``None``.
+
+    flopy's ``package_type`` for the CSUB6 package is ``"csub"`` (Task 2), so
+    ``get_package`` finds it; the packagelist scan is a defensive fallback.
+    """
+    pkg = gwf.get_package("csub")
+    if pkg is not None:
+        return pkg
+    for candidate in gwf.packagelist:
+        if getattr(candidate, "package_type", None) == "csub":
+            return candidate
+    return None
+
+
+def _impl_externalise_csub_packagedata(
+    model: str, filename: str | None = None
+) -> dict:
+    """Write the CSUB ``packagedata`` as an external ``OPEN/CLOSE`` file.
+
+    When the model still carries inline records (or a caller supplies a new
+    ``filename`` that does not exist yet) the records are written with
+    ``pkg.packagedata.set_data({"filename": ..., "data": ...})`` — the exact
+    mechanic the Task 1 spike proved, and the one Task 2's builder uses. The
+    file lives at the workspace root because the generated ``.pst`` maps model
+    input files by basename, so a sub-directory would be silently stripped and
+    run un-substituted (spike pitfall 1).
+
+    Returns ``{external_file, path, ninterbeds}``.
+    """
+    gwf = get_gwf(model)
+    ws = resolve_workspace(model)
+    pkg = _get_csub_package(gwf)
+    if pkg is None:
+        raise ValueError(
+            "No CSUB package found; run add_csub_package before parameterising "
+            "csub:packagedata."
+        )
+    meta = read_meta(model)
+    csub_meta = dict(meta.get("csub") or {})
+    recorded = csub_meta.get("packagedata_filename")
+    if filename is None:
+        filename = recorded or f"{gwf.name}.csub_packagedata.dat"
+    filename = str(filename)
+    if os.path.dirname(filename):
+        raise ValueError(
+            "csub:packagedata requires a workspace-root external filename (no "
+            f"sub-directory); got '{filename}'. The generated PST maps model "
+            "input files by basename, so a sub-directory would be substituted "
+            "at the wrong path (spike pitfall 1)."
+        )
+    path = ws / filename
+    if not path.exists():
+        try:
+            records = pkg.packagedata.get_data()
+        except Exception as exc:  # pragma: no cover - flopy read failure
+            raise ValueError(
+                f"Cannot read the CSUB packagedata for '{model}': {exc}"
+            ) from exc
+        if records is None or len(records) == 0:
+            raise ValueError(
+                f"CSUB packagedata external file '{filename}' does not exist "
+                "and the model has no inline packagedata to externalise."
+            )
+        rows = (
+            records.tolist()
+            if hasattr(records, "tolist")
+            else [list(r) for r in records]
+        )
+        pkg.packagedata.set_data({"filename": filename, "data": rows})
+        save_sim(model, gwf.simulation)
+        flush_model(model)
+    if recorded != filename:
+        csub_meta["packagedata_filename"] = filename
+        meta["csub"] = csub_meta
+        write_meta(model, meta)
+    ninterbeds = int(csub_meta.get("ninterbeds") or 0)
+    return {
+        "external_file": filename,
+        "path": str(path),
+        "ninterbeds": ninterbeds,
+    }
+
+
+def _read_csub_packagedata_records(
+    ws: Path, external_file: str, ninterbeds: int
+) -> list[list[str]]:
+    """Read the external packagedata file as a list of whitespace fields."""
+    path = ws / external_file
+    if not path.exists():
+        raise ValueError(f"CSUB packagedata external file not found: {path}")
+    text = path.read_text().replace("\r\n", "\n")
+    lines = [line for line in text.split("\n") if line.strip()]
+    if len(lines) != ninterbeds:
+        raise ValueError(
+            f"CSUB packagedata file '{external_file}' has {len(lines)} record(s); "
+            f"the model registers {ninterbeds} interbed(s)."
+        )
+    records = [line.split() for line in lines]
+    for i, rec in enumerate(records):
+        if len(rec) < 9:
+            raise ValueError(
+                f"CSUB packagedata record {i} has {len(rec)} field(s); expected "
+                "at least 9 (icsubno, cellid, cdelay + 8 numeric columns)."
+            )
+    return records
+
+
+def _select_csub_interbeds(
+    interbeds: list,
+    ninterbeds: int,
+    layers,
+    interbed_filter,
+    nlay: int,
+) -> list[int]:
+    """Resolve a layers/interbeds filter to 0-based record indices."""
+    layers_known = len(interbeds) == ninterbeds and all(
+        b.get("layer") is not None for b in interbeds
+    )
+    rows = list(range(ninterbeds))
+    if layers is not None:
+        if not layers_known:
+            raise ValueError(
+                "A 'layers' filter needs the registered interbed layers, which "
+                "are unavailable for a pre-externalised CSUB package. Re-add "
+                "the CSUB package with packagedata 'data' first."
+            )
+        wanted_layers = {int(layer) for layer in layers}
+        for layer in wanted_layers:
+            if not (0 <= layer < nlay):
+                raise ValueError(
+                    f"csub:packagedata layer {layer} out of range (nlay={nlay})."
+                )
+        rows = [
+            int(b["icsubno"])
+            for b in interbeds
+            if int(b["layer"]) in wanted_layers
+        ]
+    if interbed_filter is not None:
+        wanted_rows = {int(i) for i in interbed_filter}
+        for i in wanted_rows:
+            if not (0 <= i < ninterbeds):
+                raise ValueError(
+                    f"csub:packagedata interbed {i} out of range "
+                    f"(0..{ninterbeds - 1})."
+                )
+        rows = [r for r in rows if r in wanted_rows]
+    if not rows:
+        raise ValueError("The csub:packagedata spec selects no interbeds.")
+    return rows
+
+
+def _normalise_csub_packagedata_parameterisation(
+    model: str, parameterisation: dict, external_file: str
+) -> dict:
+    """Validate a ``csub:packagedata`` spec into parameter/token records.
+
+    One parameter per selected ``(column x interbed)``, named
+    ``f"{key}_{column}_{icsubno}"`` where ``icsubno`` is the 1-based value in
+    the external file. ``layers`` (list of 0-based layers) and ``interbeds``
+    (list of 0-based interbed numbers) optionally restrict the rows; bounds
+    default to ``value x 0.05`` / ``value x 20`` (the holdout's priors), and
+    ``partrans`` defaults to ``"none"`` for ``rnb``/``thick_frac`` and
+    ``"log"`` for the positive-only columns.
+    """
+    if not isinstance(parameterisation, dict) or not parameterisation:
+        raise ValueError("csub:packagedata requires at least one parameter spec.")
+    gwf = get_gwf(model)
+    ws = resolve_workspace(model)
+    grid = _grid_info(gwf)
+    nlay = int(grid["nlay"])
+    meta = read_meta(model)
+    csub_meta = meta.get("csub") or {}
+    ninterbeds = int(csub_meta.get("ninterbeds") or 0)
+    interbeds = list(csub_meta.get("interbeds") or [])
+    if ninterbeds <= 0:
+        raise ValueError(
+            "No CSUB interbeds registered in .gwmcp_meta.json; run "
+            "add_csub_package before parameterising csub:packagedata."
+        )
+    records = _read_csub_packagedata_records(ws, external_file, ninterbeds)
+    disk_icsubno = [int(rec[0]) for rec in records]
+    row_layer = {
+        int(b["icsubno"]): b.get("layer") for b in interbeds
+    }
+
+    parameters: list[dict] = []
+    tokens: dict[tuple[int, str], str] = {}
+    used: set[str] = set()
+    for name, spec in parameterisation.items():
+        key = str(name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits "
+                "and underscores."
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{key}' must be a spec dict.")
+        columns = spec.get("columns")
+        if not isinstance(columns, list) or not columns:
+            raise ValueError(
+                f"Parameter '{key}' csub:packagedata requires a non-empty "
+                "'columns' list."
+            )
+        for column in columns:
+            if column not in _CSUB_PACKAGEDATA_COLUMNS:
+                raise ValueError(
+                    f"Parameter '{key}': unsupported packagedata column "
+                    f"'{column}'. Accepted columns: "
+                    f"{sorted(_CSUB_PACKAGEDATA_COLUMNS)}."
+                )
+        rows = _select_csub_interbeds(
+            interbeds,
+            ninterbeds,
+            spec.get("layers"),
+            spec.get("interbeds"),
+            nlay,
+        )
+        lower_factor = float(spec.get("lower_factor", 0.05))
+        upper_factor = float(spec.get("upper_factor", 20.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and "
+                "upper_factor > 1."
+            )
+        explicit_initial = spec.get("initial")
+        partrans_in = spec.get("partrans")
+        for row_index in rows:
+            rec = records[row_index]
+            for column in columns:
+                pname = f"{key}_{column}_{disk_icsubno[row_index]}"
+                if pname in used:
+                    raise ValueError(
+                        f"Duplicate csub:packagedata parameter name '{pname}'."
+                    )
+                base = float(rec[_CSUB_PACKAGEDATA_COLUMNS[column]])
+                initial = (
+                    float(explicit_initial)
+                    if explicit_initial is not None
+                    else base
+                )
+                if not np.isfinite(initial) or initial <= 0:
+                    raise ValueError(
+                        f"Parameter '{pname}' initial must be a positive "
+                        f"number (packagedata value is {base:g}); supply a "
+                        "positive 'initial' and non-positive column values "
+                        "cannot be parameterised."
+                    )
+                if partrans_in is not None:
+                    partrans = str(partrans_in).lower()
+                else:
+                    partrans = (
+                        "none" if column in _CSUB_PARTANS_NONE else "log"
+                    )
+                lower_bound = initial * lower_factor
+                upper_bound = initial * upper_factor
+                if partrans == "log" and lower_bound <= 0:
+                    raise ValueError(
+                        f"Parameter '{pname}': partrans='log' needs a positive "
+                        f"lower bound (base={base:g}); use partrans='none'."
+                    )
+                used.add(pname)
+                tokens[(row_index, column)] = pname
+                parameters.append(
+                    {
+                        "name": pname,
+                        "target": "csub:packagedata",
+                        "scope": "column",
+                        "layer": row_layer.get(row_index),
+                        "column": column,
+                        "icsubno": disk_icsubno[row_index],
+                        "initial": initial,
+                        "lower_bound": lower_bound,
+                        "upper_bound": upper_bound,
+                        "partrans": partrans,
+                    }
+                )
+    return {"parameters": parameters, "tokens": tokens, "records": records}
+
+
+def _impl_generate_csub_table_tpl(
+    model: str, external_file: str, norm: dict
+) -> dict:
+    """Template the selected packagedata columns over the external file.
+
+    Each packagedata line is reproduced with the selected numeric field(s)
+    replaced in place by a wide ``~name~`` token; every other field is copied
+    verbatim (spike §3). Returns ``{tpl_path, target, target_file}``.
+    """
+    ws = resolve_workspace(model)
+    target = ws / external_file
+    tpl_path = ws / f"{external_file}.tpl"
+    tokens = norm["tokens"]
+    lines = ["ptf ~"]
+    for row_index, rec in enumerate(norm["records"]):
+        fields = list(rec)
+        for (token_row, column), pname in tokens.items():
+            if token_row != row_index:
+                continue
+            fields[_CSUB_PACKAGEDATA_COLUMNS[column]] = (
+                "~" + f"{pname:^{_TPL_TOKEN_WIDTH}s}" + "~"
+            )
+        lines.append("  ".join(fields))
+    tpl_path.write_text("\n".join(lines) + "\n")
+    return {
+        "tpl_path": str(tpl_path),
+        "target": str(target),
+        "target_file": external_file,
+    }
+
+
+def _restore_or_snapshot_csub_array(model: str, keyword: str) -> np.ndarray:
+    """Return the base CSUB per-layer array, snapshotting it on first use.
+
+    Mirrors :func:`_restore_or_snapshot_package_array` for the CSUB
+    ``cg_theta``/``cg_ske_cr`` arrays: the base values live in
+    ``<gwf>_csub_<keyword>_pristine.npy`` and are restored before every setup,
+    so a repeated ``setup_calibration`` cannot parameterise a previously
+    substituted external array.
+    """
+    if keyword not in _CSUB_ARRAY_TARGET_KEYWORDS.values():
+        raise ValueError(
+            f"Unsupported CSUB array keyword '{keyword}'. Supported: "
+            f"{sorted(_CSUB_ARRAY_TARGET_KEYWORDS.values())}."
+        )
+    gwf = get_gwf(model)
+    pkg = _get_csub_package(gwf)
+    if pkg is None:
+        raise ValueError(
+            "No CSUB package found; run add_csub_package before parameterising "
+            f"csub:{keyword}."
+        )
+    field = getattr(pkg, keyword, None)
+    if field is None or getattr(field, "array", None) is None:
+        raise ValueError(f"CSUB has no '{keyword}' array to parameterise.")
+    path = resolve_workspace(model) / f"{gwf.name}_csub_{keyword}_pristine.npy"
+    current = np.asarray(field.array, dtype=float)
+    if path.exists():
+        base = np.load(path)
+        if current.shape != base.shape:
+            raise ValueError(
+                f"CSUB {keyword} shape {current.shape} does not match the "
+                f"pristine snapshot shape {base.shape}."
+            )
+    else:
+        base = current.copy()
+        np.save(path, base)
+    field.set_data(base)
+    return base
+
+
+def _impl_rewire_csub_array_external(
+    model: str, keyword: str, filename: str | None = None, flush: bool = True
+) -> dict:
+    """Rewire a CSUB ``cg_theta``/``cg_ske_cr`` array to an external file.
+
+    Mirrors :func:`_impl_rewire_npf_array_external`, but on the CSUB package:
+    the per-layer array is written to ``<gwf>.csub_<keyword>.dat`` and the
+    package block rewritten to ``OPEN/CLOSE`` so a template can target it.
+    """
+    if keyword not in _CSUB_ARRAY_TARGET_KEYWORDS.values():
+        raise ValueError(
+            f"Unsupported CSUB array keyword '{keyword}'. Supported: "
+            f"{sorted(_CSUB_ARRAY_TARGET_KEYWORDS.values())}."
+        )
+    gwf = get_gwf(model)
+    pkg = _get_csub_package(gwf)
+    if pkg is None:
+        raise ValueError(
+            "No CSUB package found; run add_csub_package before rewiring "
+            f"{keyword} to an external array."
+        )
+    field = getattr(pkg, keyword, None)
+    if field is None or getattr(field, "array", None) is None:
+        raise ValueError(f"CSUB has no '{keyword}' array to rewire.")
+    filename = filename or f"{gwf.name}.csub_{keyword}.dat"
+    arr = np.asarray(field.array)
+    field.set_data({"filename": filename, "data": arr})
+    save_sim(model, gwf.simulation)
+    if flush:
+        flush_model(model)
+    return {
+        "model": model,
+        "package": "CSUB",
+        "keyword": keyword,
+        "external_file": filename,
+        "written": True,
+    }
+
+
+def _normalise_csub_layer_array_parameterisation(
+    model: str, target: str, parameterisation: dict
+) -> dict:
+    """Validate a per-layer ``csub:cg_theta``/``csub:cg_ske_cr`` spec.
+
+    ``scope`` must be ``"layer"``; each spec names one ``layer`` (or a
+    ``layers`` list) and contributes one constant parameter per requested
+    layer. Bounds default to ``initial x 0.1`` / ``x 10`` and ``partrans``
+    defaults to ``"log"``.
+    """
+    if target not in _CSUB_ARRAY_TARGET_KEYWORDS:
+        raise ValueError(f"Unsupported CSUB per-layer target '{target}'.")
+    if not isinstance(parameterisation, dict) or not parameterisation:
+        raise ValueError(f"{target} requires at least one parameter spec.")
+    keyword = _CSUB_ARRAY_TARGET_KEYWORDS[target]
+    gwf = get_gwf(model)
+    pkg = _get_csub_package(gwf)
+    if pkg is None:
+        raise ValueError(
+            "No CSUB package found; run add_csub_package before parameterising "
+            f"{target}."
+        )
+    field = getattr(pkg, keyword, None)
+    if field is None or getattr(field, "array", None) is None:
+        raise ValueError(f"CSUB has no '{keyword}' array to parameterise.")
+    nlay = int(np.asarray(field.array).shape[0])
+
+    parameters: list[dict] = []
+    seen_layers: set[int] = set()
+    for name, spec in parameterisation.items():
+        key = str(name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits "
+                "and underscores."
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{key}' must be a spec dict.")
+        if spec.get("scope", "layer") != "layer":
+            raise ValueError(
+                f"Parameter '{key}': {target} requires scope='layer', got "
+                f"'{spec.get('scope')}'."
+            )
+        layers_raw = spec.get("layers")
+        multi = layers_raw is not None
+        if multi:
+            if not isinstance(layers_raw, list) or not layers_raw:
+                raise ValueError(
+                    f"Parameter '{key}': 'layers' must be a non-empty list."
+                )
+            layers = [int(layer) for layer in layers_raw]
+        else:
+            layer = spec.get("layer")
+            if layer is None:
+                raise ValueError(
+                    f"Parameter '{key}' scope=layer requires 'layer'."
+                )
+            layers = [int(layer)]
+        if "initial" not in spec:
+            raise ValueError(f"Parameter '{key}' is missing required 'initial'.")
+        initial = float(spec["initial"])
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(
+                f"Parameter '{key}' initial must be a positive number."
+            )
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and "
+                "upper_factor > 1."
+            )
+        partrans = str(spec.get("partrans", "log")).lower()
+        for layer in layers:
+            if not (0 <= layer < nlay):
+                raise ValueError(
+                    f"Parameter '{key}' layer {layer} out of range "
+                    f"(nlay={nlay})."
+                )
+            if layer in seen_layers:
+                raise ValueError(
+                    f"Layer {layer} is claimed by more than one {target} "
+                    "parameter; each layer may appear once."
+                )
+            seen_layers.add(layer)
+            pname = f"{key}_{layer}" if multi else key
+            parameters.append(
+                {
+                    "name": pname,
+                    "target": target,
+                    "scope": "layer",
+                    "layer": layer,
+                    "initial": initial,
+                    "lower_bound": initial * lower_factor,
+                    "upper_bound": initial * upper_factor,
+                    "partrans": partrans,
+                }
+            )
+    return {"parameters": parameters, "nlay": nlay, "keyword": keyword}
+
+
+def _impl_generate_csub_layer_tpl(
+    model: str, external_file: str, norm: dict
+) -> dict:
+    """Template a constant token per parameterised CSUB layer.
+
+    flopy writes the CSUB ``cg_theta``/``cg_ske_cr`` arrays as ``LAYERED``
+    grids: the external file holds ``nrow`` rows (each ``ncol`` values) per
+    layer, so a constant per-layer parameter is the same token on every value
+    of every line belonging to that layer. Unparameterised layers keep their
+    base values. Returns ``{tpl_path, target, target_file}``.
+    """
+    ws = resolve_workspace(model)
+    target = ws / external_file
+    tpl_path = ws / f"{external_file}.tpl"
+    text = target.read_text().replace("\r\n", "\n")
+    lines = [line for line in text.split("\n") if line.strip()]
+    nlay = int(norm["nlay"])
+    if nlay <= 0 or len(lines) % nlay != 0:
+        raise ValueError(
+            f"CSUB array file '{external_file}' has {len(lines)} value row(s), "
+            f"which is not a whole number of rows per layer (nlay={nlay})."
+        )
+    lines_per_layer = len(lines) // nlay
+    by_layer = {int(p["layer"]): p["name"] for p in norm["parameters"]}
+    out = ["ptf ~"]
+    for index, line in enumerate(lines):
+        values = line.split()
+        layer = index // lines_per_layer
+        if layer in by_layer:
+            token = "~" + f"{by_layer[layer]:^{_TPL_TOKEN_WIDTH}s}" + "~"
+            out.append("  ".join([token] * len(values)))
+        else:
+            out.append("  ".join(values))
+    tpl_path.write_text("\n".join(out) + "\n")
+    return {
+        "tpl_path": str(tpl_path),
+        "target": str(target),
+        "target_file": external_file,
+    }
+
+
+def _resolve_npf_array_target(model: str, specs: dict) -> dict:
+    """Resolve one NPF array target group (``npf:k`` / ``npf:k33``)."""
+    norm = _normalise_parameterisation(model, specs)
+    keyword = _npf_keyword_from_norm(norm)
+    if keyword is None:
+        raise ValueError(
+            "NPF array target resolution needs exactly one array per group."
+        )
+    _restore_or_snapshot_package_array(model, keyword)
+    external_file = _impl_rewire_npf_array_external(model, keyword)["external_file"]
+    tpl = _impl_generate_tpl(model, specs, target_file=external_file)
+    return {
+        "external_files": [external_file],
+        "templates": [
+            {
+                "tpl_path": tpl["tpl_path"],
+                "target": tpl["target"],
+                "initial_values": {
+                    p["name"]: p["initial"] for p in norm["parameters"]
+                },
+            }
+        ],
+        "parameters": norm["parameters"],
+    }
+
+
+def _resolve_csub_packagedata_target(model: str, specs: dict) -> dict:
+    """Resolve a ``csub:packagedata`` target group."""
+    ext = _impl_externalise_csub_packagedata(model)
+    norm = _normalise_csub_packagedata_parameterisation(
+        model, specs, ext["external_file"]
+    )
+    tpl = _impl_generate_csub_table_tpl(model, ext["external_file"], norm)
+    return {
+        "external_files": [ext["external_file"]],
+        "templates": [
+            {
+                "tpl_path": tpl["tpl_path"],
+                "target": tpl["target"],
+                "initial_values": {
+                    p["name"]: p["initial"] for p in norm["parameters"]
+                },
+            }
+        ],
+        "parameters": norm["parameters"],
+    }
+
+
+def _resolve_csub_layer_array_target(model: str, specs: dict) -> dict:
+    """Resolve a ``csub:cg_theta`` / ``csub:cg_ske_cr`` target group."""
+    target = str(next(iter(specs.values()))["target"])
+    keyword = _CSUB_ARRAY_TARGET_KEYWORDS[target]
+    norm = _normalise_csub_layer_array_parameterisation(model, target, specs)
+    _restore_or_snapshot_csub_array(model, keyword)
+    ext = _impl_rewire_csub_array_external(model, keyword)
+    tpl = _impl_generate_csub_layer_tpl(model, ext["external_file"], norm)
+    return {
+        "external_files": [ext["external_file"]],
+        "templates": [
+            {
+                "tpl_path": tpl["tpl_path"],
+                "target": tpl["target"],
+                "initial_values": {
+                    p["name"]: p["initial"] for p in norm["parameters"]
+                },
+            }
+        ],
+        "parameters": norm["parameters"],
+    }
+
+
+# Target -> resolver. ``setup_calibration`` partitions a spec set by target and
+# resolves each group independently, so a single call assembles one .pst from
+# several targets (npf + csub) and the NPF coverage guard is evaluated per
+# array.
+_TARGET_RESOLVERS = {
+    "npf:k": _resolve_npf_array_target,
+    "npf:k33": _resolve_npf_array_target,
+    "csub:packagedata": _resolve_csub_packagedata_target,
+    "csub:cg_theta": _resolve_csub_layer_array_target,
+    "csub:cg_ske_cr": _resolve_csub_layer_array_target,
+}
+assert set(_SUPPORTED_TARGETS) == set(_TARGET_RESOLVERS)
+
+
 def _impl_setup_calibration_zoned(
     model: str,
     parameterisation: dict,
@@ -2152,13 +2826,17 @@ def _impl_setup_calibration(
     One call generates every file the calibration chain needs, with zero
     hand-authored artifacts:
 
-    1.  The targeted NPF array (``k`` for target ``npf:k``, ``k33`` for target
-        ``npf:k33``) is rewired to an external array (``OPEN/CLOSE <file>``) so
-        a template can target it (A2.1).
-    2.  A template with wide fixed-width tokens (>= 15 chars) is generated over
-        the parameterised cells — scope ``all``, ``layer`` or ``cells`` (zones)
-        (A2.2). ``npf:k`` requires every cell to be claimed; ``npf:k33`` may be
-        partial, with unparameterised cells keeping their base value.
+    1.  Each requested parameter target is externalised so a template can
+        target it (A2.1). NPF arrays (``k``, ``k33``) are rewritten to
+        ``OPEN/CLOSE <gwf>_<keyword>.dat``; ``csub:packagedata`` is written to
+        ``<gwf>.csub_packagedata.dat``; ``csub:cg_theta``/``csub:cg_ske_cr``
+        to ``<gwf>.csub_<keyword>.dat``.
+    2.  A wide-token template (>= 15 chars) is generated per target (A2.2).
+        NPF scopes are ``all``/``layer``/``cells``; ``npf:k`` requires every
+        cell to be claimed while ``npf:k33`` may be partial (base-value
+        literals fill the rest). ``csub:packagedata`` selects
+        ``columns`` (x optional ``layers``/``interbeds``); the per-layer CSUB
+        arrays require ``scope="layer"``.
     3.  The instruction file is generated from the model's OBS CSV header
         (A2.3).
     4.  When the MF6 binary path contains spaces (the one case pestpp on Windows
@@ -2175,17 +2853,20 @@ def _impl_setup_calibration(
     (scope may be ``"all"``, ``"layer"`` with ``layer``, or ``"cells"`` with
     ``cells`` as a list of ``[layer, row, col]`` — DIS — or ``[layer, node]``
     — DISV. ``lower_factor``/``upper_factor`` default 0.1/10.0 and set the
-    bounds from ``initial``; ``partrans`` defaults to ``"log"``.) The target
-    may also be ``npf:k33`` (vertical conductivity), which supports the same
-    scopes and externalises ``<gwf>_k33.dat``; zones/multiplier scopes remain
-    ``npf:k``-only.
+    bounds from ``initial``; ``partrans`` defaults to ``"log"``.) ``npf:k33``
+    supports the same scopes. ``csub:packagedata`` takes ``columns`` (one
+    parameter per column x interbed, named ``<key>_<column>_<icsubno>``) with
+    optional ``layers``/``interbeds`` filters and bounds defaulting to
+    ``value x 0.05``/``x 20``. ``csub:cg_theta``/``csub:cg_ske_cr`` take
+    ``scope="layer"`` with ``layer`` (or ``layers``) and one constant
+    parameter per requested layer. Several targets assemble into one ``.pst``.
 
     ``obs_source`` must be ``"model"`` (the default): observation targets
     registered by ``import_obs_from_csv`` provide the observed values and the
     instruction file reads the model's obs CSV.
 
-    The template is applied with the initial parameter values so the on-disk
-    input array matches the PST's initial state. Run the calibration with
+    Each template is applied with the initial parameter values so the on-disk
+    input files match the PST's initial state. Run the calibration with
     ``run_pestpp_glm``/``run_pestpp_ies`` (or ``calibrate``) afterwards.
     """
     if not isinstance(parameterisation, dict):
@@ -2205,25 +2886,38 @@ def _impl_setup_calibration(
                 "'all'/'layer'/'cells'; use scope='zones' for every parameter."
             )
         return _impl_setup_calibration_zoned(model, parameterisation, obs_source, noptmax)
+    if not parameterisation:
+        raise ValueError("parameterisation must name at least one parameter.")
     ws = resolve_workspace(model)
-    norm = _normalise_parameterisation(model, parameterisation)
-    keyword = _npf_keyword_from_norm(norm)
-    if keyword is None:
-        raise ValueError(
-            "setup_calibration requires the parameterisation to target exactly "
-            "one NPF array (npf:k or npf:k33) in this iteration."
-        )
-    _restore_or_snapshot_package_array(model, keyword)
 
-    # 1. Rewire the targeted NPF array to an external array so the template
-    #    can target it.
-    ext_file = _impl_rewire_npf_array_external(model, keyword)["external_file"]
+    # Partition the spec set by target and resolve each group independently, so
+    # several targets (npf:k/npf:k33/csub:*) assemble into one .pst. Every
+    # group gets its own external file and template; the NPF coverage guard is
+    # therefore evaluated per array (Task 6's deferred per-array coverage).
+    groups: dict[str, dict] = {}
+    for name, spec in parameterisation.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{name}' must be a spec dict.")
+        target = spec.get("target")
+        if target not in _TARGET_RESOLVERS:
+            raise ValueError(
+                f"Unsupported parameterisation target '{target}'. Supported: "
+                f"{list(_SUPPORTED_TARGETS)}."
+            )
+        groups.setdefault(str(target), {})[name] = spec
 
-    # 2. Generate the wide-token template over the external array.
-    tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
-    tpl_path = Path(tpl["tpl_path"])
+    templates: list[dict] = []
+    all_parameters: list[dict] = []
+    external_files: list[str] = []
+    for target, group in groups.items():
+        resolved = _TARGET_RESOLVERS[target](model, group)
+        templates.extend(resolved["templates"])
+        all_parameters.extend(resolved["parameters"])
+        external_files.extend(resolved["external_files"])
+    if not templates:
+        raise ValueError("parameterisation produced no calibration template.")
 
-    # 3. Observation interface from the registered targets (obs_source="model").
+    # Observation interface from the registered targets (obs_source="model").
     if obs_source != "model":
         raise ValueError(f"setup_calibration supports obs_source='model', got '{obs_source}'.")
     obs_meta = read_meta(model).get("observations")
@@ -2235,8 +2929,8 @@ def _impl_setup_calibration(
         )
     ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
 
-    # 4. Forward-model command: the wrapper only when the default MF6 command
-    #    would be unsafe on Windows.
+    # Forward-model command: the wrapper only when the default MF6 command
+    # would be unsafe on Windows.
     wrapper = None
     model_command = None
     if _needs_forward_wrapper(model):
@@ -2244,9 +2938,9 @@ def _impl_setup_calibration(
         model_command = wrapper["model_command"]
         wrapper = wrapper["wrapper_path"]
 
-    # 5. Assemble the PST with safe numeric defaults.
+    # Assemble the PST with safe numeric defaults.
     par_data: dict = {}
-    for p in norm["parameters"]:
+    for p in all_parameters:
         par_data[p["name"]] = {
             "parval1": p["initial"],
             "parlbnd": p["lower_bound"],
@@ -2263,7 +2957,7 @@ def _impl_setup_calibration(
         model=model,
         obs_data=obs_data,
         par_data=par_data,
-        template_files=[str(tpl_path)],
+        template_files=[t["tpl_path"] for t in templates],
         instruction_files=ins_paths,
         obs_source="explicit",
         pestpp_options=pestpp_options,
@@ -2272,18 +2966,23 @@ def _impl_setup_calibration(
     if setup.get("error"):
         return setup
 
-    # Apply the template with the initial parameter values so the on-disk
-    # array matches the PST's initial state.
-    initial_values = {p["name"]: p["initial"] for p in norm["parameters"]}
-    _tpl_substitute(tpl_path, Path(tpl["target"]), initial_values)
+    # Apply every template with its initial parameter values so the on-disk
+    # inputs match the PST's initial state.
+    for t in templates:
+        _tpl_substitute(
+            Path(t["tpl_path"]), Path(t["target"]), t["initial_values"]
+        )
 
+    template_files = [t["tpl_path"] for t in templates]
     return {
         "model": model,
         "pst_file": setup["pst_file"],
-        "template_file": str(tpl_path),
-        "target_file": ext_file,
+        "template_file": template_files[0],
+        "template_files": template_files,
+        "target_file": external_files[0],
+        "target_files": list(external_files),
         "instruction_file": ins_paths[0],
-        "external_array": str(ws / ext_file),
+        "external_array": str(ws / external_files[0]),
         "forward_wrapper": wrapper,
         "n_observations": setup["n_observations"],
         "n_adjustable_parameters": setup["n_adjustable_parameters"],
@@ -2292,12 +2991,13 @@ def _impl_setup_calibration(
             {
                 "name": p["name"],
                 "scope": p["scope"],
+                "layer": p.get("layer"),
                 "initial": p["initial"],
                 "lower_bound": p["lower_bound"],
                 "upper_bound": p["upper_bound"],
                 "partrans": p["partrans"],
             }
-            for p in norm["parameters"]
+            for p in all_parameters
         ],
         "model_command": setup["model_command"],
         "next_steps": (
@@ -4061,6 +4761,14 @@ def register(mcp: FastMCP) -> None:
         "npf:k33" (vertical conductivity), externalised to <gwf>_k33.dat with
         the same scopes.
 
+        CSUB targets: {"ssv": {"target": "csub:packagedata", "columns":
+        ["ssv_cc", "sse_cr"], "layers": [0]}} parameterises one packagedata
+        column x interbed per parameter (named <key>_<column>_<icsubno>,
+        bounds default value x 0.05 / x 20); {"cg": {"target":
+        "csub:cg_theta", "scope": "layer", "layer": 0, "initial": 0.35}}
+        parameterises a per-layer CSUB array (cg_theta / cg_ske_cr). Several
+        targets assemble into one .pst.
+
         scope may also be "zones" (with "layer": N): zones are derived from
         equal positive K values in that layer and each zone becomes a
         dimensionless multiplier parameter (initial default 1.0, bounds
@@ -4068,13 +4776,12 @@ def register(mcp: FastMCP) -> None:
         before each run, preserving the base K pattern. One zones spec per
         layer; zones specs cannot be mixed with all/layer/cells.
 
-        This call: (1) rewires NPF k to an external OPEN/CLOSE array,
-        (2) generates a wide-token template (>= 15 chars) over the
-        parameterised cells, (3) generates the instruction file from the
-        model's OBS CSV header, (4) writes a Python forward wrapper at a
-        space-free path when the default MF6 command would be unsafe on
-        Windows, and (5) assembles the .pst with safe numeric defaults
-        (derinclb > 0, bounds base/10–base×10).
+        This call: (1) externalises each target to an OPEN/CLOSE file,
+        (2) generates a wide-token template (>= 15 chars) per target,
+        (3) generates the instruction file from the model's OBS CSV header,
+        (4) writes a Python forward wrapper at a space-free path when the
+        default MF6 command would be unsafe on Windows, and (5) assembles the
+        .pst with safe numeric defaults (derinclb > 0, bounds base/10–base×10).
 
         obs_source must be "model": observation targets registered via
         import_obs_from_csv provide the observed values and the instruction

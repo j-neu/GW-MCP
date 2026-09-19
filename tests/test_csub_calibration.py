@@ -24,6 +24,7 @@ import pytest
 
 from groundwater_mcp.tools.builder import (
     _impl_add_boundary_package,
+    _impl_add_csub_package,
     _impl_add_dis_package,
     _impl_add_ic_package,
     _impl_add_npf_package,
@@ -93,6 +94,41 @@ def _register_head_obs(tmp_path, name, sites=None):
         0,
         cellid_col="cell",
     )
+
+
+def _install_csub(tmp_path, name, nlay=2, ninterbeds=None):
+    """Add a CSUB package with one no-delay interbed per layer (test helper).
+
+    ``ssv_cc``/``sse_cr`` base values are ``0.05``/``0.02`` (the ``_rec``
+    defaults in ``test_csub.py``) so selected-column bounds are predictable.
+    """
+    if ninterbeds is None:
+        ninterbeds = nlay
+    records = [
+        [
+            i,
+            [min(i, nlay - 1), 0, 0],
+            "nodelay",
+            0.0,
+            0.5,
+            2.0,
+            0.05,
+            0.02,
+            0.35,
+            1e-6,
+            0.0,
+        ]
+        for i in range(ninterbeds)
+    ]
+    res = _impl_add_csub_package(
+        name,
+        packagedata=records,
+        cg_theta=[0.2] * nlay,
+        cg_ske_cr=[1e-5] * nlay,
+    )
+    assert "error" not in res, res
+    return res
+
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +371,288 @@ def test_setup_calibration_k33_pst_uses_initial_and_derinclb(tmp_path):
     np.testing.assert_allclose(np.loadtxt(ws / "model_k33.dat"), 0.2)
     meta = read_meta(name)
     assert "observations" in meta
+
+
+# ---------------------------------------------------------------------------
+# Target registry: csub:packagedata / csub:cg_theta / csub:cg_ske_cr (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def test_supported_targets_include_csub():
+    from groundwater_mcp.tools.calibration import _SUPPORTED_TARGETS
+
+    assert "csub:packagedata" in _SUPPORTED_TARGETS
+    assert "csub:cg_theta" in _SUPPORTED_TARGETS
+    assert "csub:cg_ske_cr" in _SUPPORTED_TARGETS
+
+
+def test_setup_calibration_csub_packagedata_columns(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)  # add_csub_package helper
+    _register_head_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ssv": {
+                "target": "csub:packagedata",
+                "columns": ["ssv_cc", "sse_cr"],
+                "lower_factor": 0.05,
+                "upper_factor": 20.0,
+                "partrans": "none",
+            }
+        },
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 4  # 2 columns x 2 interbeds
+    assert any(t.endswith("packagedata.dat.tpl") for t in res["template_files"])
+    assert res["target_files"] == ["model.csub_packagedata.dat"]
+
+    # The template carries one wide token per (column x interbed); every other
+    # packagedata field is preserved verbatim.
+    tpl = Path(res["template_file"])
+    lines = tpl.read_text().splitlines()
+    assert lines[0].replace(" ", "") == "ptf~"
+    assert len(lines) == 3  # header + 2 interbeds
+    names = pyemu.pst_utils.parse_tpl_file(str(tpl))
+    assert sorted(names) == [
+        "ssv_sse_cr_1",
+        "ssv_sse_cr_2",
+        "ssv_ssv_cc_1",
+        "ssv_ssv_cc_2",
+    ]
+
+    pst = pyemu.Pst(res["pst_file"])
+    par = pst.parameter_data
+    assert len(par) == 4
+    assert float(par.loc["ssv_ssv_cc_1", "parval1"]) == pytest.approx(0.05)
+    assert float(par.loc["ssv_ssv_cc_1", "parlbnd"]) == pytest.approx(0.05 * 0.05)
+    assert float(par.loc["ssv_ssv_cc_1", "parubnd"]) == pytest.approx(0.05 * 20.0)
+    assert (par["partrans"] == "none").all()
+
+
+def test_setup_calibration_multi_target_pst(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ssv": {
+                "target": "csub:packagedata",
+                "columns": ["ssv_cc"],
+                "layers": [0],
+                "lower_factor": 0.05,
+                "upper_factor": 20.0,
+                "partrans": "none",
+            },
+            "cgtheta": {
+                "target": "csub:cg_theta",
+                "scope": "layer",
+                "layer": 0,
+                "initial": 0.35,
+            },
+            "k33": {
+                "target": "npf:k33",
+                "scope": "layer",
+                "layer": 0,
+                "initial": 0.1,
+            },
+        },
+    )
+    assert "error" not in res, res
+    assert Path(res["pst_file"]).exists()
+    assert res["n_adjustable_parameters"] == 3
+    assert len(res["template_files"]) == 3
+    assert len(res["target_files"]) == 3
+    assert "model.csub_packagedata.dat" in res["target_files"]
+    assert "model.csub_cg_theta.dat" in res["target_files"]
+    assert "model_k33.dat" in res["target_files"]
+
+    pst = pyemu.Pst(res["pst_file"])
+    assert sorted(pst.parameter_data.index) == ["cgtheta", "k33", "ssv_ssv_cc_1"]
+    assert len(pst.model_input_data) == 3
+
+
+def test_setup_calibration_cg_theta_layer_scope(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "cgtheta": {
+                "target": "csub:cg_theta",
+                "scope": "layer",
+                "layer": 1,
+                "initial": 0.3,
+            }
+        },
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 1
+    assert res["target_file"] == "model.csub_cg_theta.dat"
+
+    ws = resolve_workspace(name)
+    ext = ws / "model.csub_cg_theta.dat"
+    assert ext.exists()
+    flat = np.loadtxt(ext).reshape(-1)
+    # flopy writes the LAYERED array as nrow rows per layer; the requested layer
+    # gets its initial value on every cell and layer 0 keeps the base 0.2.
+    by_layer = flat.reshape(2, -1)
+    assert np.all(by_layer[0] == pytest.approx(0.2))
+    assert np.all(by_layer[1] == pytest.approx(0.3))
+
+    pst = pyemu.Pst(res["pst_file"])
+    assert float(pst.parameter_data.loc["cgtheta", "parval1"]) == pytest.approx(0.3)
+
+
+def test_setup_calibration_cg_ske_cr_layer_scope(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ske": {
+                "target": "csub:cg_ske_cr",
+                "scope": "layer",
+                "layer": 0,
+                "initial": 2e-5,
+            }
+        },
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 1
+    assert res["target_file"] == "model.csub_cg_ske_cr.dat"
+    ws = resolve_workspace(name)
+    flat = np.loadtxt(ws / "model.csub_cg_ske_cr.dat").reshape(-1)
+    by_layer = flat.reshape(2, -1)
+    assert np.all(by_layer[0] == pytest.approx(2e-5))
+    assert np.all(by_layer[1] == pytest.approx(1e-5))
+
+
+def test_setup_calibration_cg_theta_requires_layer_scope(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    with pytest.raises(ValueError, match="scope"):
+        _impl_setup_calibration(
+            name,
+            {"cgtheta": {"target": "csub:cg_theta", "scope": "all", "initial": 0.3}},
+        )
+
+
+def test_setup_calibration_cg_theta_layer_out_of_range(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    with pytest.raises(ValueError, match="out of range"):
+        _impl_setup_calibration(
+            name,
+            {
+                "cgtheta": {
+                    "target": "csub:cg_theta",
+                    "scope": "layer",
+                    "layer": 5,
+                    "initial": 0.3,
+                }
+            },
+        )
+
+
+def test_setup_calibration_csub_packagedata_rejects_unknown_column(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    with pytest.raises(ValueError, match="column"):
+        _impl_setup_calibration(
+            name,
+            {
+                "ssv": {
+                    "target": "csub:packagedata",
+                    "columns": ["bogus"],
+                    "partrans": "none",
+                }
+            },
+        )
+
+
+def test_setup_calibration_csub_packagedata_layers_filter(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ssv": {
+                "target": "csub:packagedata",
+                "columns": ["ssv_cc"],
+                "layers": [1],
+                "partrans": "none",
+            }
+        },
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 1
+    tpl_text = Path(res["template_file"]).read_text()
+    # Only the second interbed (layer 1) carries a token.
+    assert "ssv_ssv_cc_2" in tpl_text
+    assert "ssv_ssv_cc_1" not in tpl_text
+
+
+def test_setup_calibration_csub_packagedata_pst_substitutes_correct_file(tmp_path):
+    """Guard the Task 1 spike's silent no-substitution pitfall.
+
+    The .pst's model-input mapping must name the same file the CSUB package
+    opens, and ``write_input_files`` must substitute into *that* file (not a
+    basename-stripped copy at the workspace root while the model reads a
+    subfolder, and not an un-substituted literal).
+    """
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ssv": {
+                "target": "csub:packagedata",
+                "columns": ["ssv_cc"],
+                "lower_factor": 0.05,
+                "upper_factor": 20.0,
+                "partrans": "none",
+            }
+        },
+    )
+    assert "error" not in res, res
+    ws = resolve_workspace(name)
+    external = ws / "model.csub_packagedata.dat"
+    assert "model.csub_packagedata.dat" in (ws / "model.csub").read_text()
+
+    pst = pyemu.Pst(res["pst_file"])
+    pst.parameter_data.loc["ssv_ssv_cc_1", "parval1"] = 0.012
+    pst.parameter_data.loc["ssv_ssv_cc_2", "parval1"] = 0.013
+    pst.write_input_files(pst_path=str(ws))
+
+    lines = external.read_text().splitlines()
+    values = [float(line.split()[-5]) for line in lines]  # ssv_cc is 5th from end
+    assert values == pytest.approx([0.012, 0.013])
+
+
