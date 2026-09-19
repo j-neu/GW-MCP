@@ -1744,6 +1744,49 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             )
         wrapper_path = space_free / wrapper_name
 
+    # Diagnostic trace: every wrapper invocation appends "<epoch> pid=<pid>
+    # stage=<stage>" so a stall can be localised (process launch vs file I/O vs
+    # the mf6 child) without guessing. Truncated once per wrapper generation.
+    trace_path = wrapper_path.with_suffix(".trace")
+    trace_path.write_text("")
+    trace_def = (
+        f"TRACE = {str(trace_path)!r}\n"
+        "\n"
+        "def _trace(stage):\n"
+        "    try:\n"
+        "        with open(TRACE, 'a') as fh:\n"
+        "            fh.write('%.3f pid=%d stage=%s\\n' % (time.time(), os.getpid(), stage))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "\n"
+        "def _ctx():\n"
+        "    import stat as _stat\n"
+        "    parts = []\n"
+        "    for name in ('PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP', 'VIRTUAL_ENV',\n"
+        "                 'CONDA_PREFIX', 'TEMP', 'TMP', 'ELECTRON_RUN_AS_NODE',\n"
+        "                 'NODE_OPTIONS', 'COMSPEC'):\n"
+        "        value = os.environ.get(name)\n"
+        "        if value:\n"
+        "            parts.append(name + '=' + value)\n"
+        "    for label, stream in (('stdin', sys.stdin), ('stdout', sys.stdout),\n"
+        "                          ('stderr', sys.stderr)):\n"
+        "        try:\n"
+        "            mode = os.fstat(stream.fileno()).st_mode\n"
+        "            if _stat.S_ISFIFO(mode):\n"
+        "                kind = 'fifo'\n"
+        "            elif _stat.S_ISCHR(mode):\n"
+        "                kind = 'tty'\n"
+        "            else:\n"
+        "                kind = 'file'\n"
+        "        except Exception:\n"
+        "            kind = 'none'\n"
+        "        parts.append(label + '=' + kind)\n"
+        "    parts.append('ppid=%d' % os.getppid())\n"
+        "    parts.append('cwd=' + os.getcwd())\n"
+        "    return ' '.join(parts)\n"
+        "\n"
+    )
+
     if multiply_k:
         gwf_name = get_gwf(model).name
         base_name = f"{gwf_name}_k_base.dat"
@@ -1761,27 +1804,37 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "import os\n"
             "import subprocess\n"
             "import sys\n"
+            "import time\n"
             "\n"
             f"WS = {str(ws)!r}\n"
             f"MF6 = {mf6_exe!r}\n"
-            f"BASE = os.path.join(WS, {base_name!r})\n"
+            + trace_def
+            + f"BASE = os.path.join(WS, {base_name!r})\n"
             f"ZONE = os.path.join(WS, {zone_name!r})\n"
             f"MULT = os.path.join(WS, {mult_name!r})\n"
             f"KFILE = os.path.join(WS, {k_name!r})\n"
             "\n"
+            "_trace('start ' + _ctx())\n"
             "os.chdir(WS)\n"
+            "_trace('chdir')\n"
             "with open(BASE) as fh:\n"
             "    base = [float(tok) for tok in fh.read().split()]\n"
+            "_trace('base_read')\n"
             "with open(ZONE) as fh:\n"
             "    zone = [int(tok) for tok in fh.read().split()]\n"
+            "_trace('zone_read')\n"
             "with open(MULT) as fh:\n"
             "    mult = [float(tok) for tok in fh.read().split()]\n"
+            "_trace('mult_read')\n"
             "with open(KFILE, 'w') as fh:\n"
             "    for i, value in enumerate(base):\n"
             "        z = zone[i] if i < len(zone) else 0\n"
             "        factor = mult[z - 1] if z > 0 else 1.0\n"
             "        fh.write('%.10g\\n' % (value * factor))\n"
+            "_trace('k_written')\n"
+            "_trace('mf6_start')\n"
             "proc = subprocess.run([MF6], cwd=WS)\n"
+            "_trace('mf6_done rc=%d' % proc.returncode)\n"
             "sys.exit(proc.returncode)\n"
         )
     else:
@@ -1789,11 +1842,17 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "import os\n"
             "import subprocess\n"
             "import sys\n"
+            "import time\n"
             f"\nWS = {str(ws)!r}\n"
             f"MF6 = {mf6_exe!r}\n"
-            "\n"
+            + trace_def
+            + "\n"
+            "_trace('start ' + _ctx())\n"
             "os.chdir(WS)\n"
+            "_trace('chdir')\n"
+            "_trace('mf6_start')\n"
             "proc = subprocess.run([MF6], cwd=WS)\n"
+            "_trace('mf6_done rc=%d' % proc.returncode)\n"
             "sys.exit(proc.returncode)\n"
         )
 
