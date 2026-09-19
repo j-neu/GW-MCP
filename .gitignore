@@ -5,6 +5,9 @@
 # isolated git worktrees
 .worktrees/
 
+# subagent-driven-development scratch (ledger, task briefs, review packages)
+.superpowers/
+
 # python bytecode
 __pycache__/
 *.py[cod]
