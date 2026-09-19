@@ -1853,6 +1853,361 @@ def _space_free_interpreter() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Task 8 — derived time-series observations
+# ---------------------------------------------------------------------------
+
+# Tolerant normaliser for matching an observed date to a simulated time. Both
+# sides are folded the same way, so an ISO observed date matches an ISO
+# simulated time and a decimal-year simulated time (e.g. ``1904.0``) matches
+# ``1904-01-01``. A value that parses as neither a date nor a calendar year
+# keeps a numeric/string key; an unparseable pair never matches (it is skipped
+# and reported, never silently mis-aligned).
+_DERIVED_DATE_FORMATS = (
+    ("%Y-%m-%d", 10),
+    ("%Y/%m/%d", 10),
+    ("%m/%d/%Y", 10),
+    ("%d/%m/%Y", 10),
+    ("%Y-%m", 7),
+    ("%Y", 4),
+)
+
+
+def _derived_time_key(value) -> str | None:
+    """Return a canonical match key for an observed date / simulated time."""
+    import datetime as _dt
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt, width in _DERIVED_DATE_FORMATS:
+        try:
+            parsed = _dt.datetime.strptime(text[:width], fmt)
+        except ValueError:
+            continue
+        return parsed.strftime("%Y-%m-%d")
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return "str:" + text.lower()
+    if 1000.0 <= number <= 3000.0:
+        return f"{int(round(number)):04d}-01-01"
+    return "num:" + repr(round(number, 9))
+
+
+def _derived_sum_columns(columns, sum_cols) -> list:
+    """Columns summed into the derived subsidence series (prefix selectors).
+
+    Mirrors ``postprocess._compaction_column_layers``: a column counts when its
+    name starts (case-insensitively) with one of the ``sum_cols`` selectors,
+    excluding the time column and any elastic/inelastic compaction column. The
+    selectors are prefixes, **not** literal column names.
+    """
+    selects = [str(sel).strip().lower() for sel in sum_cols]
+    matched: list = []
+    for col in columns:
+        name = str(col).strip()
+        low = name.lower()
+        if low == "time" or "elastic" in low:
+            continue
+        if any(low.startswith(sel) for sel in selects):
+            matched.append(col)
+    return matched
+
+
+def _resolve_derived_time_col(columns, time_col) -> str | None:
+    """Resolve the simulated time column name (exact, then case-insensitive)."""
+    cols = [str(col).strip() for col in columns]
+    wanted = str(time_col).strip()
+    if wanted in cols:
+        return wanted
+    low = wanted.lower()
+    for col in cols:
+        if col.lower() == low:
+            return col
+    return cols[0] if cols else None
+
+
+def _derived_sim_series(
+    ws: Path, sim_csv: str, time_col: str, sum_cols
+) -> dict[str, float] | None:
+    """Sum the compaction columns of the CSUB obs CSV by normalised time key.
+
+    Returns ``None`` when the CSUB obs CSV does not exist yet (the model has not
+    run), so the caller can mark the match as deferred rather than mis-align.
+    """
+    path = Path(sim_csv)
+    if not path.is_absolute():
+        path = ws / sim_csv
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    cols = [str(col).strip() for col in df.columns]
+    df.columns = cols
+    resolved = _resolve_derived_time_col(cols, time_col)
+    if resolved is None:
+        return {}
+    sum_columns = _derived_sum_columns(cols, sum_cols)
+    series: dict[str, float] = {}
+    for _, row in df.iterrows():
+        key = _derived_time_key(row[resolved])
+        if key is None or key in series:
+            continue
+        total = 0.0
+        seen = False
+        for col in sum_columns:
+            raw = row[col]
+            if pd.isna(raw):
+                continue
+            try:
+                total += float(raw)
+            except (TypeError, ValueError):
+                continue
+            seen = True
+        if seen:
+            series[key] = total
+    return series
+
+
+def _derived_obs_tokens(name: str, count: int) -> list[str]:
+    """One PEST observation token per (matched) observed date.
+
+    Names are truncated to PEST's 20-character obsnme cap; a collision after
+    truncation is a hard error (mirrors ``_impl_generate_ins_from_obs_csv``).
+    """
+    tokens: list[str] = []
+    used: set[str] = set()
+    for index in range(1, count + 1):
+        token = f"{name}_{index}"[:20]
+        if token in used:
+            raise ValueError(
+                "Derived observation names collide after truncation to 20 "
+                f"characters (PEST obsnme limit) for group '{name}'."
+            )
+        used.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _derived_observation_plan(model: str) -> list[dict]:
+    """Resolve registered derived observations into a per-group match plan.
+
+    Each group records the observed dates/values to use (dates with no matching
+    simulated time are dropped and listed in ``skipped``), the derived-output
+    CSV name, the sum-column selectors and the PEST observation tokens. When
+    the CSUB obs CSV does not exist yet the match is ``deferred``: every
+    observation is planned and the run-time wrapper records any skip.
+    """
+    ws = resolve_workspace(model)
+    gwf = get_gwf(model)
+    meta = read_meta(model)
+    groups = meta.get("derived_observations") or {}
+    plan: list[dict] = []
+    for raw_name, raw_block in groups.items():
+        name = str(raw_name)
+        block = dict(raw_block or {})
+        sim = dict(block.get("sim_source") or {})
+        sim_csv = str(sim.get("csv") or f"{gwf.name}.csub.obs.csv")
+        time_col = str(sim.get("time_col") or "time")
+        sum_cols = sim.get("sum_cols") or ["compaction"]
+        if isinstance(sum_cols, str):
+            sum_cols = [sum_cols]
+        dates = [str(d) for d in (block.get("dates") or [])]
+        values = [float(v) for v in (block.get("values") or [])]
+        series = _derived_sim_series(ws, sim_csv, time_col, sum_cols)
+        deferred = series is None
+        kept_dates: list[str] = []
+        kept_values: list[float] = []
+        skipped: list[str] = []
+        for date, value in zip(dates, values):
+            key = _derived_time_key(date)
+            if series is None or (key is not None and key in series):
+                kept_dates.append(date)
+                kept_values.append(value)
+            else:
+                skipped.append(date)
+        plan.append(
+            {
+                "name": name,
+                "observed_csv": str(block.get("observed_csv") or ""),
+                "sim_csv": sim_csv,
+                "time_col": time_col,
+                "sum_cols": [str(sel) for sel in sum_cols],
+                "output_csv": f"{gwf.name}_{name}.csv",
+                "dates": kept_dates,
+                "values": kept_values,
+                "tokens": _derived_obs_tokens(name, len(kept_dates)),
+                "skipped": skipped,
+                "deferred": deferred,
+                "n_total": len(dates),
+            }
+        )
+    return plan
+
+
+def _build_derived_obs_interface(
+    model: str, ws: Path
+) -> tuple[list[str], dict, list[str]]:
+    """Build the obs interface from registered derived time-series targets.
+
+    Returns ``(instruction_file_paths, obs_data, output_files)`` for
+    ``setup_calibration(obs_source="derived")``. One pif line reads each
+    matched data row of the wrapper-derived ``<gwf>_<name>.csv`` (header at
+    line 1): ``l1 ~,~ !<name>_<i>!`` skips the header, then each bare ``l1``
+    consumes the next row and ``~,~`` skips the ``time`` field (the spike's
+    verified pif semantics). Observed dates with no matching simulated time are
+    omitted from the instruction file and reported by the caller.
+    """
+    plan = _derived_observation_plan(model)
+    if not plan:
+        raise ValueError(
+            "obs_source='derived' requires observation targets registered via "
+            "import_subsidence_observations. No 'derived_observations' entry "
+            "found in .gwmcp_meta.json for this model."
+        )
+    ins_paths: list[str] = []
+    output_files: list[str] = []
+    obs_data: dict = {}
+    for group in plan:
+        tokens = group["tokens"]
+        if not tokens:
+            raise ValueError(
+                f"Derived observation '{group['name']}' has no observed date "
+                f"matching a simulated time in {group['sim_csv']}; every "
+                "observation would be skipped."
+            )
+        lines = ["pif ~", "l1"]
+        for token in tokens:
+            lines.append(f"l1 ~,~   !{token}!".rstrip())
+        ins_path = ws / f"{group['output_csv']}.ins"
+        ins_path.write_text("\n".join(lines) + "\n")
+        for token, value in zip(tokens, group["values"]):
+            obs_data[token] = {
+                "obsval": float(value),
+                "weight": 1.0,
+                "obgnme": "subsidence_obs",
+            }
+        ins_paths.append(str(ins_path))
+        output_files.append(group["output_csv"])
+    return ins_paths, obs_data, output_files
+
+
+# Stdlib-only derived step injected into the generated forward wrapper. It runs
+# after MODFLOW 6 and materialises ``<gwf>_<name>.csv`` with a header row and
+# one data row per planned observation, in observed-date order. The key
+# function mirrors ``_derived_time_key``; the sum-column selection mirrors
+# ``_derived_sum_columns`` (prefix selectors, elastic columns excluded).
+_DERIVED_WRAPPER_BODY = (
+    "\n"
+    "def _ts_key(value):\n"
+    "    s = str(value).strip()\n"
+    "    if not s:\n"
+    "        return None\n"
+    "    for fmt, width in (('%Y-%m-%d', 10), ('%Y/%m/%d', 10),\n"
+    "                       ('%m/%d/%Y', 10), ('%d/%m/%Y', 10),\n"
+    "                       ('%Y-%m', 7), ('%Y', 4)):\n"
+    "        try:\n"
+    "            parsed = datetime.datetime.strptime(s[:width], fmt)\n"
+    "        except ValueError:\n"
+    "            continue\n"
+    "        return parsed.strftime('%Y-%m-%d')\n"
+    "    try:\n"
+    "        number = float(s)\n"
+    "    except ValueError:\n"
+    "        return 'str:' + s.lower()\n"
+    "    if 1000.0 <= number <= 3000.0:\n"
+    "        return '%04d-01-01' % int(round(number))\n"
+    "    return 'num:' + repr(round(number, 9))\n"
+    "\n"
+    "def _derive_subsidence():\n"
+    "    for spec in DERIVED:\n"
+    "        src = spec['src']\n"
+    "        if not os.path.isabs(src):\n"
+    "            src = os.path.join(WS, src)\n"
+    "        out = spec['out']\n"
+    "        if not os.path.isabs(out):\n"
+    "            out = os.path.join(WS, out)\n"
+    "        matched = {}\n"
+    "        try:\n"
+    "            with open(src, newline='') as fh:\n"
+    "                reader = csv.DictReader(fh)\n"
+    "                cols = [str(c).strip() for c in (reader.fieldnames or [])]\n"
+    "                time_col = spec['time_col']\n"
+    "                if time_col not in cols:\n"
+    "                    time_col = next(\n"
+    "                        (c for c in cols if c.lower() == str(time_col).strip().lower()),\n"
+    "                        None,\n"
+    "                    )\n"
+    "                if time_col is None and cols:\n"
+    "                    time_col = cols[0]\n"
+    "                selects = [str(s).strip().lower() for s in spec['sum_cols']]\n"
+    "                sum_cols = [\n"
+    "                    c for c in cols\n"
+    "                    if c.lower() != 'time'\n"
+    "                    and 'elastic' not in c.lower()\n"
+    "                    and any(c.lower().startswith(s) for s in selects)\n"
+    "                ]\n"
+    "                for row in reader:\n"
+    "                    key = _ts_key(row.get(time_col, '')) if time_col is not None else None\n"
+    "                    if key is None or key in matched:\n"
+    "                        continue\n"
+    "                    total = 0.0\n"
+    "                    seen = False\n"
+    "                    for col in sum_cols:\n"
+    "                        raw = row.get(col)\n"
+    "                        if raw is None or str(raw).strip() == '':\n"
+    "                            continue\n"
+    "                        try:\n"
+    "                            total += float(raw)\n"
+    "                        except ValueError:\n"
+    "                            continue\n"
+    "                        seen = True\n"
+    "                    if seen:\n"
+    "                        matched[key] = (row.get(time_col), total)\n"
+    "        except OSError as exc:\n"
+    "            with open(out + '.warnings', 'w') as fh:\n"
+    "                fh.write('could not read %s: %s\\n' % (src, exc))\n"
+    "            continue\n"
+    "        skipped = []\n"
+    "        with open(out, 'w', newline='') as fh:\n"
+    "            writer = csv.writer(fh)\n"
+    "            writer.writerow(['time', 'sim-subsidence-ft'])\n"
+    "            for date in spec['obs_dates']:\n"
+    "                key = _ts_key(date)\n"
+    "                if key is not None and key in matched:\n"
+    "                    sim_time, value = matched[key]\n"
+    "                    writer.writerow([sim_time, '%.10g' % value])\n"
+    "                else:\n"
+    "                    writer.writerow([date, ''])\n"
+    "                    skipped.append(str(date))\n"
+    "        if skipped:\n"
+    "            with open(out + '.warnings', 'w') as fh:\n"
+    "                fh.write('\\n'.join(skipped) + '\\n')\n"
+    "\n"
+    "_derive_subsidence()\n"
+)
+
+
+def _derived_wrapper_source(model: str) -> tuple[str, str]:
+    """Return ``(imports, step)`` for the wrapper's derived-series step."""
+    plan = _derived_observation_plan(model)
+    if not plan:
+        return "", ""
+    specs = [
+        {
+            "src": group["sim_csv"],
+            "time_col": group["time_col"],
+            "sum_cols": list(group["sum_cols"]),
+            "out": group["output_csv"],
+            "obs_dates": list(group["dates"]),
+        }
+        for group in plan
+    ]
+    return "import csv\nimport datetime\n", f"DERIVED = {specs!r}\n" + _DERIVED_WRAPPER_BODY
+
+
 def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
     """Generate a Python forward-run wrapper at a space-free path (7e-A2.4).
 
@@ -1940,6 +2295,21 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
         "\n"
     )
 
+    derived_imports, derived_step = _derived_wrapper_source(model)
+
+    def _tail(rc_expr: str) -> str:
+        # Run the derived-series step only after a successful model run, then
+        # propagate the MF6 return code.
+        body = f"sys.exit({rc_expr})\n"
+        if derived_step:
+            indented = "\n".join(
+                ("    " + line) if line else line for line in derived_step.splitlines()
+            )
+            body = (
+                f"if {rc_expr} == 0:\n" + indented + "\n" + f"sys.exit({rc_expr})\n"
+            )
+        return body
+
     if multiply_k:
         gwf_name = get_gwf(model).name
         base_name = f"{gwf_name}_k_base.dat"
@@ -1961,6 +2331,7 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "\n"
             f"WS = {str(ws)!r}\n"
             f"MF6 = {mf6_exe!r}\n"
+            + derived_imports
             + trace_def
             + f"BASE = os.path.join(WS, {base_name!r})\n"
             f"ZONE = os.path.join(WS, {zone_name!r})\n"
@@ -1988,7 +2359,7 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "_trace('mf6_start')\n"
             "proc = subprocess.run([MF6], cwd=WS)\n"
             "_trace('mf6_done rc=%d' % proc.returncode)\n"
-            "sys.exit(proc.returncode)\n"
+            + _tail("proc.returncode")
         )
     else:
         wrapper_path.write_text(
@@ -1996,7 +2367,8 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "import subprocess\n"
             "import sys\n"
             "import time\n"
-            f"\nWS = {str(ws)!r}\n"
+            + derived_imports
+            + f"\nWS = {str(ws)!r}\n"
             f"MF6 = {mf6_exe!r}\n"
             + trace_def
             + "\n"
@@ -2006,7 +2378,7 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "_trace('mf6_start')\n"
             "proc = subprocess.run([MF6], cwd=WS)\n"
             "_trace('mf6_done rc=%d' % proc.returncode)\n"
-            "sys.exit(proc.returncode)\n"
+            + _tail("proc.returncode")
         )
 
     # pestpp runs the model command with cwd = the model workspace; reference
@@ -2039,10 +2411,20 @@ def _needs_forward_wrapper(model: str) -> bool:
     ``tests/test_pestpp_da.py``), and it saves launching an interpreter — and
     its numpy import — for every realisation. The wrapper is now generated
     only for the case it exists for: a space-containing *executable* path.
+
+    A wrapper is also required whenever observation targets are registered from
+    a **derived** time series (``obs_source="derived"``, Task 8): the derived
+    subsidence CSV is produced by the wrapper's stdlib-only post-MF6 step, so
+    the wrapper is mandatory regardless of the MF6 binary path.
     """
     try:
-        return " " in _find_mf6_binary()
+        if " " in _find_mf6_binary():
+            return True
     except RuntimeError:
+        pass
+    try:
+        return bool(read_meta(model).get("derived_observations"))
+    except Exception:
         return False
 
 
@@ -2895,9 +3277,19 @@ def _impl_setup_calibration(
     ``scope="layer"`` with ``layer`` (or ``layers``) and one constant
     parameter per requested layer. Several targets assemble into one ``.pst``.
 
-    ``obs_source`` must be ``"model"`` (the default): observation targets
-    registered by ``import_obs_from_csv`` provide the observed values and the
-    instruction file reads the model's obs CSV.
+    ``obs_source`` must be ``"model"`` (the default) or ``"derived"``.
+    ``"model"`` uses observation targets registered by ``import_obs_from_csv``
+    (observed values from the registered records; the instruction file reads
+    the model's obs CSV). ``"derived"`` uses subsidence targets registered by
+    ``import_subsidence_observations``: the forward wrapper materialises the
+    simulated series into ``<gwf>_<name>.csv`` and the instruction file reads
+    its rows. Derived observations are matched to simulated times by date (a
+    decimal-year simulated time such as ``1904.0`` matches ``1904-01-01``); an
+    observed date with no match is skipped and listed under
+    ``derived_observations[*].skipped_dates``. When the CSUB obs CSV does not
+    exist yet the match is deferred (``matching_deferred``) and every
+    observation is planned, with any run-time skip recorded next to the
+    derived CSV.
 
     Each template is applied with the initial parameter values so the on-disk
     input files match the PST's initial state. Run the calibration with
@@ -2951,17 +3343,38 @@ def _impl_setup_calibration(
     if not templates:
         raise ValueError("parameterisation produced no calibration template.")
 
-    # Observation interface from the registered targets (obs_source="model").
-    if obs_source != "model":
-        raise ValueError(f"setup_calibration supports obs_source='model', got '{obs_source}'.")
-    obs_meta = read_meta(model).get("observations")
-    if not obs_meta or not obs_meta.get("sites"):
+    # Observation interface from the registered targets. ``"model"`` reads the
+    # model's obs CSV; ``"derived"`` reads the wrapper-derived subsidence CSV
+    # built from the targets registered by ``import_subsidence_observations``.
+    derived_report: dict | None = None
+    if obs_source == "model":
+        obs_meta = read_meta(model).get("observations")
+        if not obs_meta or not obs_meta.get("sites"):
+            raise ValueError(
+                "obs_source='model' requires observation targets registered via "
+                "import_obs_from_csv. No 'observations' entry found in "
+                ".gwmcp_meta.json for this model."
+            )
+        ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
+    elif obs_source == "derived":
+        ins_paths, obs_data, output_files = _build_derived_obs_interface(model, ws)
+        derived_report = {
+            group["name"]: {
+                "observed_csv": group["observed_csv"],
+                "sim_csv": group["sim_csv"],
+                "output_csv": group["output_csv"],
+                "n_observations": group["n_total"],
+                "n_matched": len(group["dates"]),
+                "skipped_dates": list(group["skipped"]),
+                "matching_deferred": group["deferred"],
+            }
+            for group in _derived_observation_plan(model)
+        }
+    else:
         raise ValueError(
-            "obs_source='model' requires observation targets registered via "
-            "import_obs_from_csv. No 'observations' entry found in "
-            ".gwmcp_meta.json for this model."
+            "setup_calibration supports obs_source='model' or 'derived', got "
+            f"'{obs_source}'."
         )
-    ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
 
     # Forward-model command: the wrapper only when the default MF6 command
     # would be unsafe on Windows.
@@ -3008,7 +3421,7 @@ def _impl_setup_calibration(
         )
 
     template_files = [t["tpl_path"] for t in templates]
-    return {
+    result = {
         "model": model,
         "pst_file": setup["pst_file"],
         "template_file": template_files[0],
@@ -3016,8 +3429,10 @@ def _impl_setup_calibration(
         "target_file": external_files[0],
         "target_files": list(external_files),
         "instruction_file": ins_paths[0],
+        "instruction_files": list(ins_paths),
         "external_array": str(ws / external_files[0]),
         "forward_wrapper": wrapper,
+        "obs_source": obs_source,
         "n_observations": setup["n_observations"],
         "n_adjustable_parameters": setup["n_adjustable_parameters"],
         "n_total_parameters": setup["n_total_parameters"],
@@ -3039,6 +3454,9 @@ def _impl_setup_calibration(
             "many parameters), then summarise_calibration."
         ),
     }
+    if derived_report is not None:
+        result["derived_observations"] = derived_report
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3921,6 +4339,9 @@ def _impl_setup_pest_control(
         registered by ``import_obs_from_csv`` (7f-F1.5): an instruction file
         is generated that reads the model's obs CSV (first output row), and
         each site's observed value is the mean of its registered records.
+        ``"derived"`` is accepted as an alias for the explicit branch (the
+        caller builds the interface from registered derived subsidence
+        targets, Task 8).
     pestpp_options:
         Optional PEST++ options written to the ++options section.  Special
         keys handled here (not written to ++options):
@@ -3951,8 +4372,10 @@ def _impl_setup_pest_control(
         instruction_files, obs_data, output_files = _build_model_obs_interface(model, ws)
         if output_files:
             pestpp_options["output_files"] = output_files
-    elif obs_source != "explicit":
-        raise ValueError(f"obs_source must be 'explicit' or 'model', got '{obs_source}'.")
+    elif obs_source not in ("explicit", "derived"):
+        raise ValueError(
+            f"obs_source must be 'explicit', 'model' or 'derived', got '{obs_source}'."
+        )
 
     # Resolve template/instruction paths relative to the workspace
     def _resolve(p: str) -> Path:
@@ -4817,11 +5240,14 @@ def register(mcp: FastMCP) -> None:
         default MF6 command would be unsafe on Windows, and (5) assembles the
         .pst with safe numeric defaults (derinclb > 0, bounds base/10–base×10).
 
-        obs_source must be "model": observation targets registered via
-        import_obs_from_csv provide the observed values and the instruction
-        file reads the model's obs CSV. Run the calibration afterwards with
-        run_pestpp_glm / run_pestpp_ies (or calibrate), then
-        summarise_calibration."""
+        obs_source must be "model" or "derived". "model": observation targets
+        registered via import_obs_from_csv provide the observed values and the
+        instruction file reads the model's obs CSV. "derived": subsidence
+        targets registered via import_subsidence_observations are matched to
+        the simulated CSUB time series, the forward wrapper writes
+        <gwf>_<name>.csv, and the instruction file reads its rows (Task 8).
+        Run the calibration afterwards with run_pestpp_glm / run_pestpp_ies
+        (or calibrate), then summarise_calibration."""
         try:
             return _impl_setup_calibration(model, parameterisation, obs_source, noptmax)
         except KeyError as exc:
@@ -4964,9 +5390,11 @@ def register(mcp: FastMCP) -> None:
         import_obs_from_csv (7f-F1.5): an instruction file is generated that
         reads the model's obs CSV (first output row — the single row for the
         steady-state models this targets) and each site's observed value is
-        the mean of its registered records. With obs_source="model" you still
-        supply par_data and template_files but may omit instruction_files and
-        obs_data.
+        the mean of its registered records. "derived" is accepted as an alias
+        for the explicit branch (setup_calibration builds the interface from
+        registered derived subsidence targets, Task 8). With
+        obs_source="model" you still supply par_data and template_files but
+        may omit instruction_files and obs_data.
 
         Template files must start with a `ptf`/`jtf` header.  The model input
         file a template writes is the .tpl filename with the suffix stripped

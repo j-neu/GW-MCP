@@ -16,6 +16,8 @@ Covers the generalised package-array machinery added by Task 6:
 from __future__ import annotations
 
 import csv
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -96,12 +98,15 @@ def _register_head_obs(tmp_path, name, sites=None):
     )
 
 
-def _install_csub(tmp_path, name, nlay=2, ninterbeds=None):
+def _install_csub(tmp_path, name, nlay=None, ninterbeds=None):
     """Add a CSUB package with one no-delay interbed per layer (test helper).
 
     ``ssv_cc``/``sse_cr`` base values are ``0.05``/``0.02`` (the ``_rec``
     defaults in ``test_csub.py``) so selected-column bounds are predictable.
+    ``nlay`` defaults to the model's own layer count.
     """
+    if nlay is None:
+        nlay = int(get_gwf(name).dis.nlay.array)
     if ninterbeds is None:
         ninterbeds = nlay
     records = [
@@ -129,6 +134,68 @@ def _install_csub(tmp_path, name, nlay=2, ninterbeds=None):
     assert "error" not in res, res
     return res
 
+
+def _register_subsidence_obs(
+    tmp_path,
+    name,
+    dates=None,
+    values=None,
+    sim_times=None,
+    sim_csv=None,
+):
+    """Register a derived subsidence target and fake the CSUB obs CSV (Task 8).
+
+    The model is not run in these tests, so the CSUB obs CSV the wrapper will
+    consume at run time is written by hand. Simulated times default to the
+    decimal year of each date (``1904-01-01`` <-> ``1904.0``), exercising the
+    date/decimal-year alignment rule. Returns ``(dates, values)``.
+    """
+    from groundwater_mcp.tools.parameterise import (
+        _impl_import_subsidence_observations,
+    )
+
+    dates = list(dates or ["1904-01-01", "1905-01-01"])
+    values = list(values or [0.0, 0.5])
+    obs_csv = tmp_path / f"{name}_sub_data.csv"
+    with obs_csv.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["Date", "Subsidence_ft"])
+        for date, value in zip(dates, values):
+            writer.writerow([date, value])
+    res = _impl_import_subsidence_observations(
+        name,
+        str(obs_csv),
+        time_col="Date",
+        value_col="Subsidence_ft",
+    )
+    assert "error" not in res, res
+
+    sim_times = list(sim_times) if sim_times is not None else [
+        float(date[:4]) for date in dates
+    ]
+    ws = resolve_workspace(name)
+    target = str(sim_csv) if sim_csv else f"{name}.csub.obs.csv"
+    with (ws / target).open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["time", "COMPACTION.01", "COMPACTION.02"])
+        for sim_time in sim_times:
+            writer.writerow([sim_time, 0.1, 0.2])
+    return dates, values
+
+
+def _mf6_available():
+    from groundwater_mcp.tools.calibration import _find_mf6_binary
+
+    try:
+        _find_mf6_binary()
+    except RuntimeError:
+        return False
+    return True
+
+
+requires_mf6 = pytest.mark.skipif(
+    not _mf6_available(), reason="MODFLOW 6 binary not installed"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +778,246 @@ def test_setup_calibration_csub_packagedata_reexternalises_after_inline_readd(
         if line.strip()
     ]
     assert values == pytest.approx([0.019, 0.021])
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — derived time-series observations (obs_source="derived")
+# ---------------------------------------------------------------------------
+
+
+def test_derived_time_key_matches_dates_and_decimal_years():
+    from groundwater_mcp.tools.calibration import _derived_time_key
+
+    assert _derived_time_key("1904-01-01") == _derived_time_key(1904.0)
+    assert _derived_time_key("1/25/1935") == _derived_time_key("1935-01-25")
+    assert _derived_time_key(0.0) == "num:0.0"
+    assert _derived_time_key("nodelay") == "str:nodelay"
+    assert _derived_time_key("") is None
+    assert _derived_time_key(None) is None
+
+
+def test_derived_sum_columns_prefix_and_elastic_exclusion():
+    from groundwater_mcp.tools.calibration import _derived_sum_columns
+
+    columns = [
+        "time",
+        "COMPACTION.01",
+        "compaction.02",
+        "ELASTIC-COMPACTION.01",
+        "INELASTIC-COMPACTION.01",
+        "PRECONSTRESS.01",
+    ]
+    assert _derived_sum_columns(columns, ["compaction"]) == [
+        "COMPACTION.01",
+        "compaction.02",
+    ]
+
+
+def test_build_derived_obs_interface_tokens_values_and_pif(tmp_path):
+    from groundwater_mcp.tools.calibration import _build_derived_obs_interface
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(tmp_path, name, values=[0.0, 0.5])
+    ws = resolve_workspace(name)
+
+    ins_paths, obs_data, output_files = _build_derived_obs_interface(name, ws)
+
+    assert output_files == ["model_subsidence.csv"]
+    assert sorted(obs_data) == ["subsidence_1", "subsidence_2"]
+    assert obs_data["subsidence_1"]["obsval"] == pytest.approx(0.0)
+    assert obs_data["subsidence_2"]["obsval"] == pytest.approx(0.5)
+    assert obs_data["subsidence_2"]["weight"] == pytest.approx(1.0)
+    assert obs_data["subsidence_2"]["obgnme"] == "subsidence_obs"
+
+    ins = Path(ins_paths[0])
+    assert ins.name == "model_subsidence.csv.ins"
+    text = ins.read_text()
+    assert text.startswith("pif")
+    assert "!subsidence_1!" in text
+    # The pif reads the header then one data row per matched observation; the
+    # `~,~` group discards the leading `time` field (spike semantics).
+    assert "l1 ~,~" in text
+    assert pyemu.pst_utils.parse_ins_file(str(ins)) == [
+        "subsidence_1",
+        "subsidence_2",
+    ]
+
+
+def test_derived_observation_plan_skips_unmatched_dates(tmp_path):
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    # Only the 1904 simulated row exists, so the 1905 observation must skip.
+    _register_subsidence_obs(tmp_path, name, sim_times=[1904.0])
+
+    plan = _derived_observation_plan(name)
+    assert len(plan) == 1
+    group = plan[0]
+    assert group["n_total"] == 2
+    assert group["dates"] == ["1904-01-01"]
+    assert group["skipped"] == ["1905-01-01"]
+    assert group["tokens"] == ["subsidence_1"]
+    assert group["deferred"] is False
+
+
+def test_derived_observation_plan_defers_without_sim_csv(tmp_path):
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(tmp_path, name)
+    # Remove the faked CSUB obs CSV: the model has not run, so matching defers.
+    (resolve_workspace(name) / "model.csub.obs.csv").unlink()
+
+    group = _derived_observation_plan(name)[0]
+    assert group["deferred"] is True
+    assert group["dates"] == ["1904-01-01", "1905-01-01"]
+    assert group["skipped"] == []
+
+
+def test_setup_calibration_derived_obs_builds_pif(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(tmp_path, name)
+
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ssv": {
+                "target": "csub:packagedata",
+                "columns": ["ssv_cc"],
+                "partrans": "none",
+            }
+        },
+        obs_source="derived",
+    )
+    assert "error" not in res, res
+    text = Path(res["instruction_file"]).read_text()
+    assert text.startswith("pif")
+    assert text.count("l") >= 2  # one read per observed date
+
+
+def test_setup_calibration_derived_reports_skips_and_pst(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(tmp_path, name, sim_times=[1904.0])
+
+    res = _impl_setup_calibration(
+        name,
+        {
+            "ssv": {
+                "target": "csub:packagedata",
+                "columns": ["ssv_cc"],
+                "partrans": "none",
+            }
+        },
+        obs_source="derived",
+    )
+    assert "error" not in res, res
+    report = res["derived_observations"]["subsidence"]
+    assert report["n_observations"] == 2
+    assert report["n_matched"] == 1
+    assert report["skipped_dates"] == ["1905-01-01"]
+    assert report["matching_deferred"] is False
+    assert report["output_csv"] == "model_subsidence.csv"
+    assert res["obs_source"] == "derived"
+    assert res["n_observations"] == 1
+
+    pst = pyemu.Pst(res["pst_file"])
+    assert list(pst.observation_data.index) == ["subsidence_1"]
+    assert res["forward_wrapper"] is not None
+    assert res["model_command"][0]
+    assert Path(res["forward_wrapper"]).exists()
+
+
+def test_setup_calibration_derived_requires_registered_observations(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    with pytest.raises(ValueError, match="derived"):
+        _impl_setup_calibration(
+            name,
+            {
+                "ssv": {
+                    "target": "csub:packagedata",
+                    "columns": ["ssv_cc"],
+                    "partrans": "none",
+                }
+            },
+            obs_source="derived",
+        )
+
+
+def test_needs_forward_wrapper_true_for_derived_observations(tmp_path, monkeypatch):
+    import groundwater_mcp.tools.calibration as cal
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    # A space-free MF6 path would normally need no wrapper.
+    monkeypatch.setattr(cal, "_find_mf6_binary", lambda: r"C:\bin\mf6.exe")
+    assert cal._needs_forward_wrapper(name) is False
+
+    _register_subsidence_obs(tmp_path, name)
+    assert cal._needs_forward_wrapper(name) is True
+
+
+def test_generate_forward_wrapper_injects_stdlib_derived_step(tmp_path):
+    from groundwater_mcp.tools.calibration import _generate_forward_wrapper
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(tmp_path, name)
+
+    out = _generate_forward_wrapper(name)
+    body = Path(out["wrapper_path"]).read_text()
+
+    assert "DERIVED = [" in body
+    assert "def _derive_subsidence():" in body
+    assert "model_subsidence.csv" in body
+    assert "numpy" not in body
+    assert "pandas" not in body
+    assert "groundwater_mcp" not in body
+
+
+def test_derived_wrapper_step_materialises_subsidence_csv(tmp_path):
+    """Execute only the generated stdlib derived step against a faked obs CSV."""
+    from groundwater_mcp.tools.calibration import _derived_wrapper_source
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(tmp_path, name)
+    ws = resolve_workspace(name)
+
+    imports, step = _derived_wrapper_source(name)
+    assert "import csv" in imports
+    script = tmp_path / "run_derived.py"
+    script.write_text(
+        "import os\n"
+        + imports
+        + f"WS = {str(ws)!r}\n"
+        + step
+    )
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    derived = (ws / "model_subsidence.csv").read_text().splitlines()
+    assert derived[0] == "time,sim-subsidence-ft"
+    assert len(derived) == 3  # header + one row per observation
+    assert derived[1].endswith(",0.3")
+    assert derived[2].endswith(",0.3")
+
 
 
 
