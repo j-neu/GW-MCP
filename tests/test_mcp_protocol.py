@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 71
+_EXPECTED_TOOL_COUNT = 72
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -120,6 +120,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "plot_cross_section",
         "read_simulated_observations",
         "compare_to_observed",
+        "read_compaction",
     ],
     "calibration": [
         "setup_calibration",

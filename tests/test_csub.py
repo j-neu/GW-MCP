@@ -388,3 +388,126 @@ def test_add_csub_package_external_filename_with_data(tmp_path):
     assert "nodelay" not in text.lower()  # records externalised, not inline
     meta = model_store.read_meta(name)
     assert meta["csub"]["packagedata_filename"] == "ext/csubmdl.csub_packagedata.dat"
+
+
+# ---------------------------------------------------------------------------
+# read_compaction
+# ---------------------------------------------------------------------------
+
+
+def _write_csub_obs(tmp_path, name, text, filename="model.csub.obs.csv"):
+    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    ws = resolve_workspace(name)
+    (ws / filename).write_text(text)
+    meta = model_store.read_meta(name)
+    meta["csub"] = {"obs_output_csv": filename}
+    model_store.write_meta(name, meta)
+    return ws
+
+
+def test_read_compaction_sums_layers_to_subsidence(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+
+    name = _csub_model(tmp_path, nlay=2)
+    _write_csub_obs(
+        tmp_path, name,
+        "time,COMPACTION.01,COMPACTION.02\n0.0,0.10,0.20\n1.0,0.15,0.25\n",
+    )
+    res = _impl_read_compaction(name)
+    assert "error" not in res, res
+    assert res["subsidence"] == pytest.approx([0.30, 0.40])
+    assert res["times"] == pytest.approx([0.0, 1.0])
+    assert res["layers"] == [1, 2]
+    assert res["output_csv"].endswith("model.csub.obs.csv")
+
+
+def test_read_compaction_excludes_elastic_and_interbed_columns(tmp_path):
+    """Only layer compaction columns sum to subsidence."""
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+
+    name = _csub_model(tmp_path, nlay=2)
+    _write_csub_obs(
+        tmp_path, name,
+        "time,compaction.01,COMPACTION.02,ELASTIC-COMPACTION.01,"
+        "INELASTIC-COMPACTION.01,PRECONSTRESS.01,INTERBED-COMPACTION-PCT.01\n"
+        "0.0,0.10,0.20,9.0,9.0,9.0,9.0\n"
+        "1.0,0.15,0.25,9.0,9.0,9.0,9.0\n",
+    )
+    res = _impl_read_compaction(name)
+    assert "error" not in res, res
+    assert res["subsidence"] == pytest.approx([0.30, 0.40])
+    assert res["layers"] == [1, 2]
+
+
+def test_read_compaction_missing_csv_returns_output_file_missing(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+
+    name = _csub_model(tmp_path, nlay=1)
+    res = _impl_read_compaction(name)
+    assert res["error"] is True
+    assert res["code"] == "OUTPUT_FILE_MISSING"
+
+
+def test_read_compaction_truncates_and_writes_full_table(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+
+    name = _csub_model(tmp_path, nlay=1)
+    ws = _write_csub_obs(
+        tmp_path, name,
+        "time,COMPACTION.01\n0.0,0.1\n1.0,0.2\n2.0,0.3\n",
+    )
+    res = _impl_read_compaction(name, max_rows=2)
+    assert "error" not in res, res
+    assert res["truncated"] is True
+    assert res["n_rows"] == 3
+    assert res["subsidence"] == pytest.approx([0.1, 0.2])
+    full = (ws / "csubmdl_compaction.csv").read_text()
+    assert full.count("\n") == 4  # header + 3 rows
+
+
+def test_read_compaction_reads_strainib_file(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+
+    name = _csub_model(tmp_path, nlay=1)
+    ws = _write_csub_obs(
+        tmp_path, name, "time,COMPACTION.01\n0.0,0.1\n1.0,0.2\n"
+    )
+    (ws / "csubmdl.strainib.csv").write_text(
+        " INTERBED_NUMBER,INTERBED_TYPE,NODE,LAYER,ROW,COLUMN,"
+        "INITIAL_THICKNESS,FINAL_THICKNESS,TOTAL_COMPACTION,TOTAL_STRAIN,"
+        "PERCENT_COMPACTION\n"
+        " 1, 0, 1, 1, 1, 1, 2.0, 1.99, 0.01, 0.005, 0.5\n"
+    )
+    res = _impl_read_compaction(name)
+    assert "error" not in res, res
+    assert res["interbed_strain"] is not None
+    assert res["interbed_strain"][0]["interbed_number"] == 1
+    assert res["interbed_strain"][0]["total_compaction"] == pytest.approx(0.01)
+
+
+def test_read_compaction_no_compaction_columns_is_invalid_input(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,PRECONSTRESS.01\n0.0,1.0\n")
+    res = _impl_read_compaction(name)
+    assert res["error"] is True
+    assert res["code"] == "INVALID_INPUT"
+
+
+def test_read_compaction_rglob_fallback_when_meta_absent(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_read_compaction
+    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    ws = resolve_workspace(name)
+    (ws / "csubmdl.csub.obs.csv").write_text("time,COMPACTION.01\n0.0,0.4\n")
+    meta = model_store.read_meta(name)
+    meta.pop("csub", None)
+    model_store.write_meta(name, meta)
+    res = _impl_read_compaction(name)
+    assert "error" not in res, res
+    assert res["subsidence"] == pytest.approx([0.4])

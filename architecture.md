@@ -81,7 +81,7 @@ groundwater-mcp/
 │       │   ├── parameterise.py ← import_grid_from_shapefile, assign_top_from_raster, assign_k_from_zones, assign_k_from_raster, assign_ic_from_raster, assign_array_from_raster, import_river_from_shapefile, import_obs_from_csv
 │       │   ├── builder.py      ← create_model, adopt_model, add_*_package, summarise_model
 │       │   ├── runner.py       ← run_simulation, check_model, get_run_log
-│       │   ├── postprocess.py  ← read_heads, read_budget, plot_*, compute_*
+│       │   ├── postprocess.py  ← read_heads, read_budget, read_compaction, plot_*, compute_*
 │       │   ├── calibration.py  ← setup_pest_control, run_pestpp_*, summarise_*
 │       │   └── environment.py  ← check_environment (preflight stack check)
 │       └── utils/

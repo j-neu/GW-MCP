@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import flopy.utils as fu
@@ -152,6 +153,169 @@ def _open_budget_file(path: Path) -> fu.CellBudgetFile:
         return fu.CellBudgetFile(str(path))
     except OSError:
         return fu.CellBudgetFile(str(path), precision="double")
+
+
+def _csub_obs_csv_path(model: str) -> tuple[Path | None, str | None]:
+    """Locate a model's CSUB observation output CSV.
+
+    Prefers ``meta["csub"]["obs_output_csv"]`` (resolved against the
+    workspace), then falls back to a recursive glob for ``*csub.obs.csv``
+    (which matches ``<gwf>.csub.obs.csv``). With several undeclared candidates
+    the first is used and a warning naming them all is returned.
+    """
+    meta = read_meta(model)
+    declared = (meta.get("csub") or {}).get("obs_output_csv")
+    ws = resolve_workspace(model)
+    if declared:
+        p = Path(declared)
+        cand = p if p.is_absolute() else ws / p
+        if cand.exists():
+            return cand, None
+    matches = sorted(ws.rglob("*csub.obs.csv"))
+    if not matches:
+        return None, None
+    if len(matches) > 1:
+        return matches[0], (
+            f"Multiple CSUB observation CSVs found; using {matches[0].name}. "
+            f"Declared in meta: {declared or 'none'}. "
+            f"Candidates: {[m.name for m in matches]}"
+        )
+    return matches[0], None
+
+
+# ---------------------------------------------------------------------------
+# CSUB compaction helpers
+# ---------------------------------------------------------------------------
+
+
+def _compaction_column_layers(columns) -> list[tuple[str, int | None]]:
+    """Return ``(column_name, layer_index)`` for CSUB layer-compaction columns.
+
+    Matching is case-insensitive: a column counts when its name starts with
+    ``compaction`` and is not an elastic/inelastic compaction or an interbed
+    percentage column. The optional layer index is taken from the trailing
+    digits of the name (``COMPACTION.01``, ``compaction01``, ``compaction-cell.2``
+    all parse), so no particular number of layers or separator is assumed.
+    """
+
+    matched: list[tuple[str, int | None]] = []
+    for col in columns:
+        name = str(col).strip()
+        low = name.lower()
+        if low == "time":
+            continue
+        if "elastic" in low:  # covers ELASTIC- and INELASTIC-COMPACTION
+            continue
+        if not low.startswith("compaction"):
+            continue
+        digits = re.findall(r"\d+", low[len("compaction"):])
+        matched.append((name, int(digits[-1]) if digits else None))
+    return matched
+
+
+def _read_strainib(model: str, ws: Path) -> list[dict] | None:
+    """Read ``<gwf>.strainib.csv`` (interbed strain/percent compaction) when
+    it exists. Prefers the CSUB ``filerecords.strainib`` path from meta, then
+    a recursive glob. Returns None when no file is present."""
+    import pandas as pd
+
+    declared = ((read_meta(model).get("csub") or {}).get("filerecords") or {}).get(
+        "strainib"
+    )
+    path: Path | None = None
+    if declared:
+        p = Path(declared)
+        cand = p if p.is_absolute() else ws / p
+        if cand.exists():
+            path = cand
+    if path is None:
+        matches = sorted(ws.rglob("*strainib.csv"))
+        if matches:
+            path = matches[0]
+    if path is None:
+        return None
+    df = pd.read_csv(path, skipinitialspace=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return [
+        {str(k).strip().lower(): _scalar(v) for k, v in rec.items()}
+        for rec in df.to_dict(orient="records")
+    ]
+
+
+def _impl_read_compaction(model: str, max_rows: int = 500) -> dict:
+    """Read MF6 CSUB observation output into per-layer compaction and a
+    derived cumulative subsidence series.
+
+    The CSUB obs CSV (``<gwf>.csub.obs.csv``) carries one row per output time;
+    layer compaction lives in the ``COMPACTION.<layer>`` columns (MF6
+    upper-cases the registered observation names). ``subsidence`` is the
+    per-time sum of those compaction columns only — the
+    ``ELASTIC-``/``INELASTIC-COMPACTION`` and ``PRECONSTRESS`` columns are
+    deliberately excluded. The full table is written to
+    ``<model>_compaction.csv``; ``max_rows`` caps the inline lists. Returns an
+    ``OUTPUT_FILE_MISSING`` envelope when no CSUB obs CSV exists.
+    """
+    import pandas as pd
+
+    csv_path, warning = _csub_obs_csv_path(model)
+    if csv_path is None:
+        return _err(
+            "OUTPUT_FILE_MISSING",
+            "No CSUB observation output CSV (*csub.obs.csv) found for this model.",
+            "Run add_csub_package with observations=... then run_simulation first.",
+        )
+    ws = resolve_workspace(model)
+    df = pd.read_csv(csv_path)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    matched = _compaction_column_layers(df.columns)
+    if not matched:
+        return _err(
+            "INVALID_INPUT",
+            f"No layer compaction columns found in {csv_path.name}. "
+            f"Columns: {[str(c) for c in df.columns]}",
+            "Register compaction-cell observations with add_csub_package"
+            "(observations={'compaction.01': [('compaction.01', "
+            "'compaction-cell', (0, 0, 0))]}) then re-run.",
+        )
+
+    times = [float(v) for v in df["time"]] if "time" in df.columns else []
+    compaction: dict[str, list[float]] = {}
+    layers: list[int] = []
+    for col, layer in matched:
+        values = [float(v) for v in df[col]]
+        compaction[str(layer) if layer is not None else col] = values
+        if layer is not None and layer not in layers:
+            layers.append(layer)
+    layers.sort()
+
+    n = len(df)
+    subsidence = [
+        float(sum(float(df[col].iloc[i]) for col, _ in matched)) for i in range(n)
+    ]
+
+    full = pd.DataFrame({"time": times}) if times else pd.DataFrame(index=range(n))
+    for col, _ in matched:
+        full[col] = [float(v) for v in df[col]]
+    full["subsidence"] = subsidence
+    compaction_csv = ws / f"{model}_compaction.csv"
+    full.to_csv(compaction_csv, index=False)
+
+    result: dict = {
+        "model": model,
+        "output_csv": str(csv_path),
+        "compaction_csv": str(compaction_csv),
+        "times": times[:max_rows],
+        "layers": layers,
+        "compaction": {k: v[:max_rows] for k, v in compaction.items()},
+        "subsidence": subsidence[:max_rows],
+        "interbed_strain": _read_strainib(model, ws),
+        "n_rows": n,
+        "truncated": n > max_rows,
+    }
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1367,6 +1531,30 @@ def register(mcp: FastMCP) -> None:
             return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
         except Exception as exc:
             return _err("COMPARE_FAILED", str(exc))
+
+    @mcp.tool()
+    def read_compaction(model: str, max_rows: int = 500) -> dict:
+        """Read CSUB compaction observations into per-layer compaction and a
+        derived cumulative subsidence series.
+
+        Matches the model's ``<gwf>.csub.obs.csv`` layer compaction columns
+        case-insensitively (so MF6's upper-cased names work), sums them per
+        time into ``subsidence``, and returns them alongside
+        ``interbed_strain`` from ``<gwf>.strainib.csv`` when present.
+        ``max_rows`` caps the inline lists; the full table is always written
+        to ``<model>_compaction.csv``. Returns OUTPUT_FILE_MISSING when no
+        CSUB obs CSV exists (run add_csub_package with observations then
+        run_simulation first)."""
+        try:
+            return _impl_read_compaction(model, max_rows)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("READ_COMPACTION_FAILED", str(exc))
 
     @mcp.tool(structured_output=False)
     def plot_heads_map(

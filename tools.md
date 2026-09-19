@@ -332,6 +332,7 @@ Layer indices are validated against the model's `nlay` (7f-D3): `layer < 0` or `
 | `diagnose_water_balance` | `model: str`, `kstpkper: tuple \| None`, `tolerance_pct: float = 1.0`, `dominance_threshold: float = 0.5` | `{ percent_discrepancy, balanced, dominant_inflow_term, dominant_outflow_term, dominant_term, dominant_term_share, boundary_dominated, ... }` |
 | `read_simulated_observations` | `model: str` | Per-site simulated values from the model's obs CSV at the final output time (7f-F1.2) |
 | `compare_to_observed` | `model: str`, `output_file: str \| None` | RMSE, bias, R², MAE, per-site residual table (CSV) and a scatter plot — no PEST setup needed (7f-F1.3) |
+| `read_compaction` | `model: str`, `max_rows: int = 500` | Per-layer compaction + derived cumulative `subsidence` (sum of the layer compaction columns), `interbed_strain` from `<gwf>.strainib.csv`; full table written to `<model>_compaction.csv` |
 | `plot_heads_map` | `model: str`, `layer: int = 0`, `kstpkper: tuple \| None`, `contour_intervals: int = 10`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 | `plot_cross_section` | `model: str`, `line: dict`, `kstpkper: tuple \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 
@@ -406,6 +407,21 @@ observation names in the continuous obs CSV (`W1..W29`), while
 `compare_to_observed` and `run_simulation.observation_fit` match the registered
 site names against the obs-CSV columns case-insensitively (exact match
 preferred), so a lowercase-imported CSV works without re-importing.
+
+### CSUB subsidence (`read_compaction`)
+
+`read_compaction` turns MF6's CSUB observation output into per-layer compaction
+and a derived cumulative subsidence series. It reads `<gwf>.csub.obs.csv`
+(declared as `meta["csub"]["obs_output_csv"]`, else found by glob), matches the
+layer `compaction` columns case-insensitively — MF6 upper-cases registered
+observation names, e.g. `COMPACTION.01` — and sums them per time into
+`subsidence`. The `ELASTIC-COMPACTION`, `INELASTIC-COMPACTION`, `PRECONSTRESS`
+and `INTERBED-COMPACTION-PCT` columns are deliberately excluded from the sum.
+`interbed_strain` is read from `<gwf>.strainib.csv` when present. `max_rows`
+(default 500) caps the inline `times`/`compaction`/`subsidence` lists; the full
+table is always written to `<model>_compaction.csv`. With no CSUB obs CSV the
+tool returns `OUTPUT_FILE_MISSING`, and a CSV without any layer compaction
+columns returns `INVALID_INPUT`.
 
 ---
 
