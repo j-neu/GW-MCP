@@ -1,0 +1,79 @@
+1789824750.416 pid=42736 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824750.416 pid=42736 stage=chdir
+1789824750.451 pid=42736 stage=base_read
+1789824750.468 pid=42736 stage=zone_read
+1789824750.468 pid=42736 stage=mult_read
+1789824750.499 pid=42736 stage=k_written
+1789824750.499 pid=42736 stage=mf6_start
+1789824752.360 pid=42736 stage=mf6_done rc=0
+1789824778.852 pid=8888 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824778.852 pid=8888 stage=chdir
+1789824778.859 pid=8888 stage=base_read
+1789824778.863 pid=8888 stage=zone_read
+1789824778.864 pid=8888 stage=mult_read
+1789824778.897 pid=8888 stage=k_written
+1789824778.897 pid=8888 stage=mf6_start
+1789824780.642 pid=8888 stage=mf6_done rc=0
+1789824804.745 pid=31252 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824804.746 pid=31252 stage=chdir
+1789824804.753 pid=31252 stage=base_read
+1789824804.757 pid=31252 stage=zone_read
+1789824804.757 pid=31252 stage=mult_read
+1789824804.792 pid=31252 stage=k_written
+1789824804.792 pid=31252 stage=mf6_start
+1789824807.038 pid=31252 stage=mf6_done rc=0
+1789824831.200 pid=26292 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824831.201 pid=26292 stage=chdir
+1789824831.209 pid=26292 stage=base_read
+1789824831.213 pid=26292 stage=zone_read
+1789824831.213 pid=26292 stage=mult_read
+1789824831.265 pid=26292 stage=k_written
+1789824831.265 pid=26292 stage=mf6_start
+1789824832.776 pid=26292 stage=mf6_done rc=0
+1789824857.488 pid=47248 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824857.488 pid=47248 stage=chdir
+1789824857.495 pid=47248 stage=base_read
+1789824857.499 pid=47248 stage=zone_read
+1789824857.499 pid=47248 stage=mult_read
+1789824857.537 pid=47248 stage=k_written
+1789824857.538 pid=47248 stage=mf6_start
+1789824859.647 pid=47248 stage=mf6_done rc=0
+1789824883.184 pid=16848 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824883.184 pid=16848 stage=chdir
+1789824883.191 pid=16848 stage=base_read
+1789824883.195 pid=16848 stage=zone_read
+1789824883.195 pid=16848 stage=mult_read
+1789824883.231 pid=16848 stage=k_written
+1789824883.231 pid=16848 stage=mf6_start
+1789824884.888 pid=16848 stage=mf6_done rc=0
+1789824908.526 pid=33612 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824908.527 pid=33612 stage=chdir
+1789824908.536 pid=33612 stage=base_read
+1789824908.542 pid=33612 stage=zone_read
+1789824908.543 pid=33612 stage=mult_read
+1789824908.581 pid=33612 stage=k_written
+1789824908.581 pid=33612 stage=mf6_start
+1789824910.475 pid=33612 stage=mf6_done rc=0
+1789824934.738 pid=29712 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824934.738 pid=29712 stage=chdir
+1789824934.745 pid=29712 stage=base_read
+1789824934.749 pid=29712 stage=zone_read
+1789824934.749 pid=29712 stage=mult_read
+1789824934.783 pid=29712 stage=k_written
+1789824934.784 pid=29712 stage=mf6_start
+1789824936.267 pid=29712 stage=mf6_done rc=0
+1789824960.856 pid=26336 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824960.856 pid=26336 stage=chdir
+1789824960.863 pid=26336 stage=base_read
+1789824960.867 pid=26336 stage=zone_read
+1789824960.868 pid=26336 stage=mult_read
+1789824960.901 pid=26336 stage=k_written
+1789824960.901 pid=26336 stage=mf6_start
+1789824963.306 pid=26336 stage=mf6_done rc=0
+1789824967.149 pid=49084 stage=start TEMP=C:\Users\jakob\AppData\Local\Temp TMP=C:\Users\jakob\AppData\Local\Temp ELECTRON_RUN_AS_NODE=1 COMSPEC=C:\Windows\system32\cmd.exe stdin=fifo stdout=fifo stderr=fifo ppid=39180 cwd=E:\GW-MCP-holdout\selected\MF6_EnKF_DISU\NeckartalModel1718\NeckartalCalib_try_models\MODFLOW 6\sim
+1789824967.149 pid=49084 stage=chdir
+1789824967.157 pid=49084 stage=base_read
+1789824967.161 pid=49084 stage=zone_read
+1789824967.161 pid=49084 stage=mult_read
+1789824967.201 pid=49084 stage=k_written
+1789824967.201 pid=49084 stage=mf6_start

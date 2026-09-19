@@ -951,10 +951,15 @@ SUCCESS CRITERIA:
    id) plus the site/date/value columns. Verify the 14 gauges map to the intended
    nodes (e.g. a converged run + compare_to_observed).
 6) Set up the DA: call setup_da_control with a K parameterisation on npf:k —
-   prefer scope "multiplier" (a single dimensionless factor applied to the
-   existing K field, so the heterogeneous pattern is preserved; `scope="all"`
-   replaces the whole field with one uniform value, which is solver-hostile on
-   this 10,413-value K field), log-transformed. Pass cycles=[...], obs_cycles
+   use scope "all" for this target's gate runs. `scope="multiplier"` preserves
+   the heterogeneous K pattern and is the preferred mode in general, but the
+   helper script it requires stalls under the background DA job on this
+   31,831-node model (open defect: the multiplier/zones model-command wrapper
+   freezes before mf6 starts — see the MF6_EnKF_DISU rerun-7 backlog block in
+   tasks.md and the neversink-3 / mf6brabant-3 / zenodo-4 findings). Document
+   the resulting collapse as a deviation: the shipped 0.864–86,400 m/d /
+   10,413-unique K field becomes a single uniform value. Log-transform it.
+   Pass cycles=[...], obs_cycles
    mapping every registered site to {cycle: observed value} (the gauge values
    from step 5), par_cycles supplying the per-cycle TDIS perlen, num_reals = your
    ensemble size, noptmax=1 (v5.2.16: noptmax 0 performs NO update), and
