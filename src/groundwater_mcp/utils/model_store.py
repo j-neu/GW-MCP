@@ -365,18 +365,23 @@ def flush_model(name: str) -> bool:
 
 
 def clear_k_base_snapshot(model: str, gwf_name: str) -> bool:
-    """Delete ``setup_calibration``'s pristine NPF-k snapshot, if present.
+    """Delete ``setup_calibration``'s pristine NPF snapshot(s), if present.
 
-    Any tool that deliberately changes NPF ``k`` (``assign_k_from_raster``,
-    ``assign_k_from_zones``, ``add_npf_package``) calls this so a later
-    ``setup_calibration`` re-snapshots the new field instead of restoring the
-    previous base. Returns ``True`` when a snapshot was removed.
+    Any tool that deliberately changes NPF ``k`` or ``k33``
+    (``assign_k_from_raster``, ``assign_k_from_zones``, ``add_npf_package``)
+    calls this so a later ``setup_calibration`` re-snapshots the new field
+    instead of restoring the previous base. Both ``<gwf>_k_pristine.npy`` and
+    ``<gwf>_k33_pristine.npy`` are removed. Returns ``True`` when at least one
+    snapshot was removed.
     """
-    path = resolve_workspace(model) / f"{gwf_name}_k_pristine.npy"
-    if path.exists():
-        path.unlink()
-        return True
-    return False
+    ws = resolve_workspace(model)
+    removed = False
+    for keyword in ("k", "k33"):
+        path = ws / f"{gwf_name}_{keyword}_pristine.npy"
+        if path.exists():
+            path.unlink()
+            removed = True
+    return removed
 
 
 def is_dirty(name: str) -> bool:

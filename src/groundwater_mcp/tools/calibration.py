@@ -954,22 +954,29 @@ def _impl_calibrate(
 # ---------------------------------------------------------------------------
 
 
-def _impl_rewire_npf_k_external(
-    model: str, filename: str | None = None, flush: bool = True
-) -> dict:
-    """Rewrite the NPF package so ``k`` is read via ``OPEN/CLOSE <file>``.
+_NPF_TARGET_KEYWORDS = {"npf:k": "k", "npf:k33": "k33"}
 
-    The current ``k`` array is written to the external file (flopy handles the
-    on-disk write) so a PEST template can target it. The model runs unchanged
-    afterwards — the array values are identical, only their storage moved.
+
+def _impl_rewire_npf_array_external(
+    model: str, keyword: str, filename: str | None = None, flush: bool = True
+) -> dict:
+    """Rewrite an NPF array so it is read via ``OPEN/CLOSE <file>``.
+
+    ``keyword`` is ``"k"`` (horizontal conductivity) or ``"k33"`` (vertical
+    conductivity). The current array is written to the external file (flopy
+    handles the on-disk write) so a PEST template can target it. The model runs
+    unchanged afterwards — the array values are identical, only their storage
+    moved.
 
     Parameters
     ----------
     model:
         Registered model name.
+    keyword:
+        NPF array attribute to externalise (``"k"`` or ``"k33"``).
     filename:
         External-array filename (relative to the workspace). Defaults to
-        ``<gwf_name>_k.dat``.
+        ``<gwf_name>_<keyword>.dat``.
     flush:
         When ``True`` (default) the staged rewrite is flushed to disk. Pass
         ``False`` when a caller performs several staged rewrites and flushes
@@ -980,15 +987,27 @@ def _impl_rewire_npf_k_external(
     dict
         ``{model, package, keyword, external_file, written}``.
     """
+    if keyword not in _NPF_TARGET_KEYWORDS.values():
+        raise ValueError(
+            f"Unsupported NPF array keyword '{keyword}'. Supported: "
+            f"{sorted(_NPF_TARGET_KEYWORDS.values())}."
+        )
     gwf = get_gwf(model)
     npf = gwf.get_package("npf")
     if npf is None:
         raise ValueError(
-            "No NPF package found; run add_npf_package before rewiring k to an external array."
+            "No NPF package found; run add_npf_package before rewiring "
+            f"{keyword} to an external array."
         )
-    filename = filename or f"{gwf.name}_k.dat"
-    k_arr = np.asarray(npf.k.array)
-    npf.k.set_data({"filename": filename, "data": k_arr})
+    field = getattr(npf, keyword, None)
+    if field is None or getattr(field, "array", None) is None:
+        raise ValueError(
+            f"NPF has no '{keyword}' array; add it with "
+            f"add_npf_package(..., {keyword}=...)."
+        )
+    filename = filename or f"{gwf.name}_{keyword}.dat"
+    arr = np.asarray(field.array)
+    field.set_data({"filename": filename, "data": arr})
     sim = gwf.simulation
     save_sim(model, sim)
     if flush:
@@ -996,52 +1015,75 @@ def _impl_rewire_npf_k_external(
     return {
         "model": model,
         "package": "NPF",
-        "keyword": "k",
+        "keyword": keyword,
         "external_file": filename,
         "written": True,
     }
 
 
-_SUPPORTED_TARGETS = ("npf:k",)
+def _impl_rewire_npf_k_external(
+    model: str, filename: str | None = None, flush: bool = True
+) -> dict:
+    """Thin alias for :func:`_impl_rewire_npf_array_external` (``keyword="k"``)."""
+    return _impl_rewire_npf_array_external(model, "k", filename=filename, flush=flush)
+
+
+_SUPPORTED_TARGETS = ("npf:k", "npf:k33")
 _TPL_TOKEN_WIDTH = 15
 
 
-def _restore_or_snapshot_k_base(model: str) -> np.ndarray:
-    """Return the base NPF ``k`` array, snapshotting it on first use.
+def _restore_or_snapshot_package_array(model: str, keyword: str) -> np.ndarray:
+    """Return the base NPF array for *keyword*, snapshotting it on first use.
 
-    ``setup_calibration`` rewires NPF ``k`` to an external file that a later
+    ``setup_calibration`` rewires an NPF array to an external file that a later
     setup call may overwrite. Without a snapshot, a repeated or mixed-scope
-    setup parameterises a mutated field and can silently flatten K (the
+    setup parameterises a mutated field and can silently flatten it (the
     neversink rerun-2 finding: a layer-scope setup wrote its absolute
     ``initial`` into the shared external array, and a later zones setup then saw
     a single uniform zone).
 
-    The base array is captured once in ``<gwf>_k_pristine.npy`` and restored
-    into NPF before every setup, which makes ``setup_calibration`` safely
-    re-runnable. A tool that deliberately changes ``k`` clears the snapshot via
-    ``model_store.clear_k_base_snapshot`` so the next setup re-snapshots the new
-    field rather than reverting the edit.
+    The base array is captured once in ``<gwf>_<keyword>_pristine.npy`` and
+    restored into NPF before every setup, which makes ``setup_calibration``
+    safely re-runnable. A tool that deliberately changes the array clears the
+    snapshot via ``model_store.clear_k_base_snapshot`` so the next setup
+    re-snapshots the new field rather than reverting the edit.
     """
+    if keyword not in _NPF_TARGET_KEYWORDS.values():
+        raise ValueError(
+            f"Unsupported NPF array keyword '{keyword}'. Supported: "
+            f"{sorted(_NPF_TARGET_KEYWORDS.values())}."
+        )
     gwf = get_gwf(model)
     npf = gwf.get_package("npf")
     if npf is None:
         raise ValueError(
             "No NPF package found; run add_npf_package before setup_calibration."
         )
-    path = resolve_workspace(model) / f"{gwf.name}_k_pristine.npy"
-    current = np.asarray(npf.k.array, dtype=float)
+    field = getattr(npf, keyword, None)
+    if field is None or getattr(field, "array", None) is None:
+        raise ValueError(
+            f"NPF has no '{keyword}' array; add it with "
+            f"add_npf_package(..., {keyword}=...)."
+        )
+    path = resolve_workspace(model) / f"{gwf.name}_{keyword}_pristine.npy"
+    current = np.asarray(field.array, dtype=float)
     if path.exists():
-        k = np.load(path)
-        if current.shape != k.shape:
+        base = np.load(path)
+        if current.shape != base.shape:
             raise ValueError(
-                f"NPF k shape {current.shape} does not match the pristine "
-                f"snapshot shape {k.shape}."
+                f"NPF {keyword} shape {current.shape} does not match the "
+                f"pristine snapshot shape {base.shape}."
             )
     else:
-        k = current.copy()
-        np.save(path, k)
-    npf.k.set_data(k)
-    return k
+        base = current.copy()
+        np.save(path, base)
+    field.set_data(base)
+    return base
+
+
+def _restore_or_snapshot_k_base(model: str) -> np.ndarray:
+    """Thin alias for :func:`_restore_or_snapshot_package_array` (``keyword="k"``)."""
+    return _restore_or_snapshot_package_array(model, "k")
 
 
 def _round_sig_array(values: np.ndarray, sig: int = 6) -> np.ndarray:
@@ -1236,6 +1278,11 @@ def _normalise_multiplier_parameterisation(model: str, parameterisation: dict) -
                 "every parameter."
             )
         target = spec.get("target")
+        if target == "npf:k33":
+            raise ValueError(
+                "Multiplier parameterisation supports target 'npf:k' only; "
+                "'npf:k33' multipliers are not supported in this iteration."
+            )
         if target not in _SUPPORTED_TARGETS:
             raise ValueError(
                 f"Unsupported parameterisation target '{target}'. Supported: "
@@ -1333,6 +1380,11 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
                 f"'{scope}' (parameter '{key}'); all specs must use scope='zones'."
             )
         target = spec.get("target")
+        if target == "npf:k33":
+            raise ValueError(
+                "Zoned parameterisation supports target 'npf:k' only; "
+                "'npf:k33' zones are not supported in this iteration."
+            )
         if target not in _SUPPORTED_TARGETS:
             raise ValueError(
                 f"Unsupported parameterisation target '{target}'. Supported: "
@@ -1516,6 +1568,20 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
                 f"Unsupported parameterisation target '{target}'. Supported: "
                 f"{list(_SUPPORTED_TARGETS)}."
             )
+        if target in _NPF_TARGET_KEYWORDS:
+            keyword = _NPF_TARGET_KEYWORDS[target]
+            npf = gwf.get_package("npf")
+            if npf is None:
+                raise ValueError(
+                    "No NPF package found; run add_npf_package before "
+                    f"parameterising {keyword}."
+                )
+            field = getattr(npf, keyword, None)
+            if field is None or getattr(field, "array", None) is None:
+                raise ValueError(
+                    f"NPF has no '{keyword}' array; add it with "
+                    f"add_npf_package(..., {keyword}=...)."
+                )
         scope = spec.get("scope", "all")
         if scope not in ("all", "layer", "cells"):
             raise ValueError(f"scope must be 'all', 'layer' or 'cells', got '{scope}'.")
@@ -1561,7 +1627,7 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
             }
         )
 
-    # Assign cells to parameters; every cell must be claimed exactly once.
+    # Assign cells to parameters; a cell may be claimed exactly once.
     cell_param: dict[int, str] = {}
     for p in params:
         for idx in p["cells"]:
@@ -1571,7 +1637,24 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
                     f"'{p['name']}' — parameter scopes must not overlap."
                 )
             cell_param[idx] = p["name"]
-    if len(cell_param) != ncell:
+
+    # A parameterisation may target at most one NPF array per call (one
+    # external file / one template). ``npf:k`` keeps the whole-array coverage
+    # guard: a partial K template silently flattens the unparameterised cells
+    # (the neversink rerun-2 bug). Other arrays (``npf:k33``, and the CSUB
+    # targets added later) may be partial — the unparameterised cells keep
+    # their base value in the template.
+    npf_keywords = {
+        _NPF_TARGET_KEYWORDS[p["target"]]
+        for p in params
+        if p["target"] in _NPF_TARGET_KEYWORDS
+    }
+    if len(npf_keywords) > 1:
+        raise ValueError(
+            "A parameterisation may target only one NPF array per setup call; "
+            f"got {sorted(npf_keywords)}."
+        )
+    if npf_keywords == {"k"} and len(cell_param) != ncell:
         raise ValueError(
             f"Parameterisation covers {len(cell_param)} of {ncell} cells; "
             f"{ncell - len(cell_param)} cells are unassigned. Add a parameter "
@@ -1587,31 +1670,75 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     }
 
 
+def _npf_keyword_from_norm(norm: dict) -> str | None:
+    """The single NPF array keyword a normalised parameterisation targets.
+
+    Returns ``None`` when the parameterisation does not target exactly one NPF
+    array (no NPF target, or several). Callers that need a specific external
+    file treat ``None`` as an error.
+    """
+    keywords = {
+        _NPF_TARGET_KEYWORDS[p["target"]]
+        for p in norm["parameters"]
+        if p["target"] in _NPF_TARGET_KEYWORDS
+    }
+    if len(keywords) != 1:
+        return None
+    return next(iter(keywords))
+
+
 def _impl_generate_tpl(model: str, parameterisation: dict, target_file: str | None = None) -> dict:
     """Generate a PEST template for the parameterised cells (7e-A2.2).
 
     One wide fixed-width token per array cell in the external file's layout
     (layer-major, then row/node-major), each referencing the parameter that
-    owns the cell. The template is written as ``<target_file>.tpl`` so the
-    ``.tpl``-stripped name is the file the model actually reads.
+    owns the cell. Cells not claimed by a parameter (partial ``npf:k33``
+    parameterisations) keep their base array value as a literal. The template
+    is written as ``<target_file>.tpl`` so the ``.tpl``-stripped name is the
+    file the model actually reads; the default target is
+    ``<gwf>_<keyword>.dat`` derived from the parameterisation's NPF target.
 
     Returns ``{tpl_path, target, parameters}``.
     """
     ws = resolve_workspace(model)
     norm = _normalise_parameterisation(model, parameterisation)
     gwf = get_gwf(model)
+    keyword = _npf_keyword_from_norm(norm)
 
     if target_file is None:
-        target_file = f"{gwf.name}_k.dat"
+        if keyword is None:
+            raise ValueError(
+                "Cannot derive a default target file for a parameterisation "
+                "that does not target exactly one NPF array; pass target_file "
+                "explicitly."
+            )
+        target_file = f"{gwf.name}_{keyword}.dat"
     tpl_path = ws / f"{target_file}.tpl"
 
-    order: dict[int, str] = {}
-    for idx in range(norm["grid"]["ncell"]):
-        order[idx] = norm["cell_param"][idx]
+    ncell = int(norm["grid"]["ncell"])
+    base: np.ndarray | None = None
+    if len(norm["cell_param"]) < ncell:
+        npf = gwf.get_package("npf")
+        field = getattr(npf, keyword, None) if keyword is not None else None
+        if npf is None or field is None or getattr(field, "array", None) is None:
+            raise ValueError(
+                "A partial parameterisation needs the base NPF array to fill "
+                "the unparameterised cells, but it is unavailable."
+            )
+        base = np.asarray(field.array, dtype=float).reshape(-1)
+        if base.size != ncell:
+            raise ValueError(
+                f"Base NPF array has {base.size} values; grid has {ncell} cells."
+            )
+
     lines = ["ptf ~"]
-    for idx in range(norm["grid"]["ncell"]):
-        name = order[idx]
-        lines.append("~" + f"{name:^{_TPL_TOKEN_WIDTH}s}" + "~")
+    for idx in range(ncell):
+        name = norm["cell_param"].get(idx)
+        if name is None:
+            assert base is not None
+            lines.append(f"{base[idx]:.10g}")
+        else:
+            lines.append("~" + f"{name:^{_TPL_TOKEN_WIDTH}s}" + "~")
     tpl_path.write_text("\n".join(lines) + "\n")
 
     return {
@@ -2025,11 +2152,13 @@ def _impl_setup_calibration(
     One call generates every file the calibration chain needs, with zero
     hand-authored artifacts:
 
-    1.  NPF ``k`` is rewired to an external array (``OPEN/CLOSE <file>``) so a
-        template can target it (A2.1).
+    1.  The targeted NPF array (``k`` for target ``npf:k``, ``k33`` for target
+        ``npf:k33``) is rewired to an external array (``OPEN/CLOSE <file>``) so
+        a template can target it (A2.1).
     2.  A template with wide fixed-width tokens (>= 15 chars) is generated over
         the parameterised cells — scope ``all``, ``layer`` or ``cells`` (zones)
-        (A2.2).
+        (A2.2). ``npf:k`` requires every cell to be claimed; ``npf:k33`` may be
+        partial, with unparameterised cells keeping their base value.
     3.  The instruction file is generated from the model's OBS CSV header
         (A2.3).
     4.  When the MF6 binary path contains spaces (the one case pestpp on Windows
@@ -2046,7 +2175,10 @@ def _impl_setup_calibration(
     (scope may be ``"all"``, ``"layer"`` with ``layer``, or ``"cells"`` with
     ``cells`` as a list of ``[layer, row, col]`` — DIS — or ``[layer, node]``
     — DISV. ``lower_factor``/``upper_factor`` default 0.1/10.0 and set the
-    bounds from ``initial``; ``partrans`` defaults to ``"log"``.)
+    bounds from ``initial``; ``partrans`` defaults to ``"log"``.) The target
+    may also be ``npf:k33`` (vertical conductivity), which supports the same
+    scopes and externalises ``<gwf>_k33.dat``; zones/multiplier scopes remain
+    ``npf:k``-only.
 
     ``obs_source`` must be ``"model"`` (the default): observation targets
     registered by ``import_obs_from_csv`` provide the observed values and the
@@ -2075,12 +2207,17 @@ def _impl_setup_calibration(
         return _impl_setup_calibration_zoned(model, parameterisation, obs_source, noptmax)
     ws = resolve_workspace(model)
     norm = _normalise_parameterisation(model, parameterisation)
-    _restore_or_snapshot_k_base(model)
+    keyword = _npf_keyword_from_norm(norm)
+    if keyword is None:
+        raise ValueError(
+            "setup_calibration requires the parameterisation to target exactly "
+            "one NPF array (npf:k or npf:k33) in this iteration."
+        )
+    _restore_or_snapshot_package_array(model, keyword)
 
-    # 1. Rewire NPF k to an external array so the template can target it.
-    ext_file = None
-    if any(p["target"] == "npf:k" for p in norm["parameters"]):
-        ext_file = _impl_rewire_npf_k_external(model)["external_file"]
+    # 1. Rewire the targeted NPF array to an external array so the template
+    #    can target it.
+    ext_file = _impl_rewire_npf_array_external(model, keyword)["external_file"]
 
     # 2. Generate the wide-token template over the external array.
     tpl = _impl_generate_tpl(model, parameterisation, target_file=ext_file)
@@ -2144,9 +2281,9 @@ def _impl_setup_calibration(
         "model": model,
         "pst_file": setup["pst_file"],
         "template_file": str(tpl_path),
-        "target_file": tpl["target"],
+        "target_file": ext_file,
         "instruction_file": ins_paths[0],
-        "external_array": str(ws / ext_file) if ext_file else None,
+        "external_array": str(ws / ext_file),
         "forward_wrapper": wrapper,
         "n_observations": setup["n_observations"],
         "n_adjustable_parameters": setup["n_adjustable_parameters"],
@@ -3920,7 +4057,9 @@ def register(mcp: FastMCP) -> None:
         (with "cells": [[layer,row,col], ...] — DIS — or [[layer,node], ...]
         — DISV). Optional keys: lower_factor/upper_factor (default 0.1/10.0)
         set the bounds from initial; partrans defaults to "log". Parameter
-        names are capped at 12 characters (PEST).
+        names are capped at 12 characters (PEST). The target may also be
+        "npf:k33" (vertical conductivity), externalised to <gwf>_k33.dat with
+        the same scopes.
 
         scope may also be "zones" (with "layer": N): zones are derived from
         equal positive K values in that layer and each zone becomes a
