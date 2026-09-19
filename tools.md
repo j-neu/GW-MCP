@@ -460,7 +460,10 @@ cap) to a spec dict:
 }
 ```
 
-- `target`: the model array to parameterise — currently `"npf:k"` only.
+- `target`: the model array/property to parameterise. Supported: `"npf:k"`
+  (default), `"npf:k33"`, and the CSUB targets `"csub:packagedata"`,
+  `"csub:cg_theta"` and `"csub:cg_ske_cr"`. The CSUB targets require a CSUB
+  package (`PACKAGE_MISSING` otherwise); see the CSUB calibration note below.
 - `scope`: `"all"` (whole array), `"layer"` (with `"layer": N`), `"cells"`
   (with `"cells": [[layer, row, col], ...]` on DIS — `[[layer, node], ...]`
   on DISV or `[[node], ...]` / a scalar node on DISU; these `cells` node ids are
@@ -549,6 +552,22 @@ steady-state models this targets) and each site's observed value is the mean
 of its registered records. With `obs_source="model"` you still supply
 `par_data` and `template_files` but may omit `instruction_files` and
 `obs_data`.
+
+**CSUB calibration (v0.3.0, 2026-09-19):** `setup_calibration` parameterises
+CSUB through a target resolver alongside `npf:k` / `npf:k33`:
+`csub:packagedata` (scope `"columns"`, optionally restricted by `layer` /
+`interbeds` — the interbed table is externalised and a wide-token template is
+written over the selected numeric columns; bounds default to value × 0.05 / × 20,
+with `partrans` `none` for `rnb`/`thick_frac` and `log` where positive-only),
+`csub:cg_theta` and `csub:cg_ske_cr` (scope `"layer"`, per-layer external arrays,
+one template per layer). Multi-target specs (e.g. `csub:packagedata` +
+`csub:cg_ske_cr` + `npf:k33`) assemble into one `.pst` with `derinclb > 0` on
+every group. The observation interface for CSUB is `obs_source="derived"`:
+`import_subsidence_observations` registers a measured subsidence CSV with the
+recipe for the simulated series, and the calibration forward wrapper materialises
+`<gwf>_subsidence.csv` before PEST++ reads it (CSUB compaction has no native MF6
+observation time series the head-OBS reader can consume). A CSUB target with no
+CSUB package returns `PACKAGE_MISSING`.
 
 `obs_data` keys must match the instruction-file tokens exactly (case-insensitive); unmatched names raise an error rather than being silently dropped. Special `pestpp_options` keys: `model_command_line` (str) / `model_command` (str\|list) sets the forward-model command (Windows default: the located MF6 binary); `output_files` (list, parallel to `instruction_files`) sets explicit model output filenames; `input_files` (list, parallel to `template_files`) sets explicit model input filenames (override the `.tpl`-stripped target — e.g. `hk.dat.tpl` → `hk.dat`, matching what the NPF `OPEN/CLOSE` reads); `noptmax` is native PEST control data.
 

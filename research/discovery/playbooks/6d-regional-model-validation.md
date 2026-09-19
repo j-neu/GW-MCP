@@ -1000,6 +1000,190 @@ Work step by step and explain what you are doing at each step.
 
 ---
 
+## Target 9 — 1DSubsidenceModeling-MF6CSUB (California Central Valley 1D CSUB benchmark sites)
+
+**What it validates:** the MODFLOW 6 **CSUB** capability path added for v0.3.0 —
+building a CSUB package (delay + no-delay interbeds), CSUB observation records,
+compaction/subsidence post-processing, derived time-series observations, and CSUB
+interbed-property calibration through `setup_calibration(obs_source="derived")` →
+`run_pestpp_ies` → `summarise_calibration`. It is the Tier-1 half of the v0.3.0
+CSUB gate (the Tier-2 example rows are listed in `tasks.md` § 7d).
+
+**Provenance:** `https://github.com/leila-saberi/1DSubsidenceModeling-MF6CSUB`,
+branch **`Multi-IB`**, pinned commit
+**`ff5ef1deafd9aaa228440bee9736f776233f8d74`** (catalogued in
+`research/discovery/catalog.md`, GitHub-topic round 1). **License verification
+task:** the catalog records license `none` and the staged checkout ships **no
+LICENSE file** — treat as unlicensed/academic, local validation use only, and
+confirm the upstream license before any redistribution. Local holdout:
+`D:\Claude Projects\GW-MCP-holdout\selected\1DSubsidenceModeling-MF6CSUB\`
+(~103 MB; relocated to the D: sibling folder for closed-book runs — copy a site
+into the session worktree and run there, never inside the holdout).
+
+**Data / chosen site (read-only inspection 2026-09-19):** the repo is a 1D CSUB
+framework for 50 CA Central Valley benchmark sites; the `Multi-IB` branch carries
+the 48 multi-interbed sites (the two single-interbed sites live on `Single-IB`).
+**Chosen site: `H201`** — the repo's own `__main__` example
+(`model_functions.py:558` calls `build_model(..., use_delay=True)` /
+`prep_data(True)`). Verified facts:
+
+- `H201/source_data/H201_lithology.csv`: two aquifer units (`Upper` 131 ft,
+  `Middle` 1040 ft) with many sand/clay beds.
+- `H201/prep_data.py` sets `nlay = 2` (line 43) and, with `use_delay=True`,
+  writes `cdelay = ["nodelay", "delay"]` (lines 106–111) — so the site exercises
+  **both no-delay and delay interbeds** and yields **2 layers** (inside the 2–5
+  band, at the low end).
+- Scratch run (copy of `H201` + `dependencies/` under
+  `%TEMP%\kilo\csub-site-check\`, `prep_data.prep_data(True)`) produced
+  `processed_data/H201.model_property_data.csv` with 2 columns, `cdelay` =
+  `nodelay` (layer 0) / `delay` (layer 1), `clay_thickness_0` = 44 ft (upper) /
+  551 ft (middle), plus `H201.ts_data.csv` (dated groundwater levels per aquifer).
+- Per-site layout: `source_data/{site}_{lithology,obs_data,sub_data}.csv` +
+  `{site}_{par_data,scenario_data,scenario_data_2015,CH_forecast}.xlsx`;
+  `output/SimulatedSubsidence_{site}.csv` + `{site}_MeanCH.csv`;
+  `ib_results_{site}_*.xlsx` (calibrated interbed parameters); `README.md`;
+  `prep_data.py`. Repo root: `workflow.py`, `model_functions.py` (builds the MF6
+  1×1-column DIS/NPF/STO/GHB/CSUB6 + head/CSUB OBS), `ies_functions.py`
+  (PEST-PyEMU IES), `DWR.py`, a vendored `dependencies/` tree
+  (flopy/pyemu/pastas/project_functions) and `bin/{linux,mac,win}/` (MF6 +
+  pestpp-ies binaries).
+
+**Pre-registered criteria (Target 9):**
+
+- **check_environment** called first; stack verified before any build.
+- **Data prep (allowed):** the agent MAY run the repo's `prep_data.py` to produce
+  `processed_data/*.csv` (data preparation, explicitly allowed by the MCP-only
+  rule) and MAY transform the source CSVs / processed outputs in ordinary Python.
+  The **MF6 model itself** must be built, run, post-processed and calibrated
+  **only** through groundwater-mcp tools.
+- **Build via MCP:** `create_model` → `set_simulation` → `add_dis_package` (the
+  1×1 column with the site's tops/bottoms) → `add_npf_package` →
+  `add_ic_package` → `add_sto_package` → `add_boundary_package` (GHB head
+  series) → **`add_csub_package`** (11-field `packagedata` with
+  `cdelay="nodelay"`/`"delay"`, `ndelaycells`, `cg_theta`/`cg_ske_cr`, CSUB
+  observation records and filerecords) → `add_oc_package` → `check_model` →
+  `run_simulation` (Newton; converges).
+- **Post-process:** `read_compaction` (per-layer compaction + derived cumulative
+  subsidence) and `plot_subsidence` (PNG) through the MCP; compare the simulated
+  series against the shipped `{site}_sub_data.csv`.
+- **Observation interface:** `import_subsidence_observations` registers the
+  measured `{site}_sub_data.csv` as a **derived** target with the simulated-series
+  recipe.
+- **Calibrate:** `setup_calibration` with **`obs_source="derived"`** and at least
+  one **`csub:packagedata`** target (`csub:cg_theta` / `csub:cg_ske_cr` /
+  `npf:k33` may be added) → `run_pestpp_ies` → `summarise_calibration`.
+  Convergence or a documented, actionable error.
+- **Reprompts ≤ 1**; every deviation from the source model recorded.
+  **Closed-book** and **MCP-only** as in the pre-registered criteria above.
+- **Run log required:** `run-log.md` in the session folder with the tool-call
+  sequence, reprompts, deviations, convergence evidence and calibration evidence.
+- **PASS bar:** **≥2 consecutive green closed-book reruns**, the **last rerun =
+  set-and-forget** (0 permission prompts, **0 reprompts**, 0 MCP-only
+  violations). A target passes only when the agent uses the MCP chain as-is with
+  no workarounds.
+
+**Honest scope notes (target-expressibility):**
+
+- The repo's native build is flopy-script (`model_functions.py` builds
+  `ModflowGwfcsub` directly) and its native calibration is a bespoke pyEMU IES
+  loop (`ies_functions.py`). **Neither is run.** The target re-expresses the same
+  physics through the MCP: the CSUB model is built with `add_csub_package` and
+  calibrated with `setup_calibration` + `run_pestpp_ies`. Numerical equivalence
+  with the repo's IES posterior is **not** the bar — capability expression (a real
+  CSUB model built, run and calibrated through the MCP) is.
+- `prep_data.py` is **allowed** as data preparation (it only reads/reshapes CSVs
+  and writes `processed_data/*.csv`); the MF6 build must not use the repo's
+  `model_functions.py` / `workflow.py` / raw flopy.
+- `H201` is 1×1×2 — small enough for a fast calibration, and it contains both
+  delay and no-delay interbeds so the CSUB delay path is exercised (the reason
+  H201 was selected over the other 2-layer sites `D289`/`J859`/`K852`/`N128`/
+  `N200`/`T200`/`W85_RESET`/`X692` and the 3-layer sites).
+- The derived-observation path (`obs_source="derived"`) is the only CSUB
+  observation interface: CSUB compaction is a model output, not a native MF6
+  observation time series the head-OBS reader can consume, so the calibration
+  forward wrapper materialises the simulated subsidence series for PEST++ to
+  read.
+
+### Prompt (paste verbatim into the Agent Manager session)
+
+```
+CLOSED-BOOK VALIDATION RUN — Phase 6d target 9 (1DSubsidenceModeling-MF6CSUB; MODFLOW 6 CSUB).
+
+You are a groundwater modelling assistant validating an MCP toolchain on a real
+1D CSUB subsidence benchmark. Do NOT read the groundwater-mcp repository source
+code, its tests, .kilo plans, or prior research session logs. You MAY read the
+target repository's own data, model files, and scripts — they are the model
+specification.
+
+DATA: D:\Claude Projects\GW-MCP-holdout\selected\1DSubsidenceModeling-MF6CSUB\
+(github.com/leila-saberi/1DSubsidenceModeling-MF6CSUB, branch Multi-IB, commit
+ff5ef1deafd9aaa228440bee9736f776233f8d74; license not shipped — local validation
+use only). The repo holds 1D MODFLOW 6-CSUB models for 50 CA Central Valley
+benchmark sites; this run uses site H201 (the repo's own __main__ example). Each
+site folder (e.g. H201\) contains source_data\{site}_lithology.csv,
+{site}_obs_data.csv, {site}_sub_data.csv, {site}_par_data.xlsx,
+{site}_scenario_data*.xlsx, {site}_CH_forecast.xlsx, output\
+SimulatedSubsidence_{site}.csv + {site}_MeanCH.csv, ib_results_{site}_*.xlsx,
+README.md, and prep_data.py. The repo root has model_functions.py (builds the MF6
+model), workflow.py, ies_functions.py and a vendored dependencies\ tree.
+
+H201 facts (verified read-only): two aquifers (Upper 131 ft, Middle 1040 ft) and
+two model layers; with delay enabled, prep_data.py yields cdelay = [nodelay,
+delay] — both a no-delay and a delay interbed. Model dimensions are 1 row x 1
+column x 2 layers (units FEET/DAYS, Newton solver). obs_data.csv holds dated
+groundwater-level observations for each aquifer and sub_data.csv holds the
+measured subsidence time series.
+
+SUCCESS CRITERIA:
+1) check_environment first; report the stack.
+2) Copy the H201 site folder (and the repo's dependencies\ folder) into THIS
+   session folder; do NOT run anything inside the holdout and do NOT modify the
+   holdout tree. Run the repo's prep_data.py THERE as DATA PREPARATION (or
+   reproduce its outputs in ordinary Python) to produce the processed property
+   table and the dated groundwater-level series. Transforming the source CSVs in
+   ordinary Python is allowed.
+3) Build the CSUB model through the MCP tools only. Pick a model name <= 16 chars
+   and an explicit workspace inside THIS session folder. create_model ->
+   set_simulation -> add_dis_package (1 x 1 x 2 column with the site's layer
+   tops/bottoms) -> add_npf_package -> add_ic_package -> add_sto_package ->
+   add_boundary_package (GHB head series from the processed groundwater levels)
+   -> add_csub_package (11-field packagedata records with cdelay nodelay/delay,
+   ndelaycells, cg_theta/cg_ske_cr, and CSUB observation records; use the
+   interbed thicknesses/parameters from the processed property table) ->
+   add_oc_package -> check_model -> run_simulation. Document any deviation from
+   the repo's model_functions.py build.
+4) Post-process through the MCP tools: read_compaction (per-layer compaction and
+   cumulative subsidence) and plot_subsidence (return the PNG). Compare the
+   simulated subsidence series against the site's own sub_data.csv.
+5) Register the measured subsidence as a derived observation with
+   import_subsidence_observations (from H201's sub_data.csv), then calibrate
+   through the MCP chain: setup_calibration with obs_source="derived" and at
+   least one csub:packagedata parameter target (add csub:cg_theta /
+   csub:cg_ske_cr / npf:k33 as appropriate) -> run_pestpp_ies ->
+   summarise_calibration. Report phi progress, parameter estimates vs priors and
+   the residual statistics, or a documented, actionable error.
+6) Write run-log.md in the session folder: tool-call sequence, reprompts,
+   decisions, deviations from the source model, run convergence evidence, and
+   calibration evidence.
+
+MCP-ONLY CONSTRAINT: every action that builds, runs, post-processes or
+calibrates the MF6 MODEL ITSELF must go through a groundwater-mcp tool call — do
+NOT call flopy/pyemu MODFLOW or PEST classes directly, and do NOT hand-edit
+MODFLOW or PEST files with a text editor or shell command. Running the repo's
+prep_data.py as data preparation and transforming the source CSVs in ordinary
+Python are explicitly allowed (they produce inputs, not the model). Do NOT run
+the repo's model_functions.py / workflow.py / ies_functions.py — they build and
+calibrate the model with raw flopy/pyemu and bypass the MCP. If a groundwater-mcp
+tool cannot do something you need, STOP and report exactly what capability is
+missing and why — do not work around the gap by building/running/calibrating the
+model with raw flopy/pyemu instead. A workaround invalidates this run: it is
+testing whether the MCP tools are sufficient on their own.
+
+Work step by step and explain what you are doing at each step.
+```
+
+---
+
 ## Session log template
 
 `research/discovery/sessions/YYYY-MM-DD-6d-<target>.md`:

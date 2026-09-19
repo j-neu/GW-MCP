@@ -40,6 +40,8 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 `setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. `setup_da_control` builds a DA-ready PEST++ **version-2** control file (cycle tables + `da_*` options, IC state parameterisation) for sequential ensemble data assimilation with `run_pestpp_da`; `summarise_da` reads pestpp-da's per-cycle outputs back (per-cycle phi, posterior parameter statistics, per-cycle residuals). These capabilities add no extra tools beyond `setup_da_control` and `summarise_da`, and the total above reflects the current registration.
 
+**CSUB (subsidence)** is covered end-to-end: `add_csub_package` builds the MODFLOW 6 CSUB package (delay and no-delay interbeds, `cg_theta`/`cg_ske_cr`, compaction observation records, filerecords), `read_compaction` and `plot_subsidence` post-process the CSUB observation output into per-layer compaction and cumulative subsidence (with an optional observed overlay), and `import_subsidence_observations` registers a measured subsidence series as a **derived** time-series target. `setup_calibration(obs_source="derived")` then calibrates `csub:packagedata` (plus `csub:cg_theta`, `csub:cg_ske_cr` and `npf:k33`) targets through `run_pestpp_ies` → `summarise_calibration`.
+
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 
 ### Safety guarantees

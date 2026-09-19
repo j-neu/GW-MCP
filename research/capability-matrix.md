@@ -182,6 +182,21 @@ row), and per-cycle residuals from the latest `<case>.<cycle>.<iter>.base.rei`.
 → 70 tools. `setup_da_control` / `run_pestpp_da` / `summarise_da` now cover the
 whole loop.
 
+**CSUB (v0.3.0 scope) landed 2026-09-19.** Four new tools close the MODFLOW 6
+subsidence path: `add_csub_package` (11-field interbed `packagedata` with
+delay/no-delay `cdelay`, `ndelaycells`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr`,
+cell/interbed observation records and filerecords), `read_compaction` (per-layer
+compaction + derived cumulative subsidence from the CSUB obs CSV, plus
+`interbed_strain`), `plot_subsidence` (native PNG, optional observed overlay) and
+`import_subsidence_observations` (registers a measured subsidence series as a
+derived time-series target); `setup_calibration` gains a target resolver with
+`csub:packagedata`, `csub:cg_theta`, `csub:cg_ske_cr` and `npf:k33`, and
+`obs_source="derived"` builds the instruction file from the derived series rather
+than the head-obs first row. → 74 tools. CSUB therefore moves from "extra scope"
+to a real covered row (below); the v0.3.0 release gate remains the Tier-1
+`1DSubsidenceModeling-MF6CSUB` target through the 6d rerun loop (playbook
+Target 9).
+
 ## GWF — flow (discretisation + stress packages)
 
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
@@ -196,6 +211,7 @@ whole loop.
 | OC (output control) | covered | `add_oc_package` | all testmodels/examples | head/budget filerecords + saverecord |
 | CHD / WEL / RIV / DRN / RCH / EVT / GHB / SFR | covered | `add_boundary_package` | test005_advgw_tidal, test051_uzfp2, ex-gwf-advtidal, mf6-training | SFR via dispatch; RIV/DRN/GHB also via `import_river_from_shapefile` |
 | RCHA / EVTA (array-based recharge/ET) | covered | `add_boundary_package` | mf6brabant (RP1.tif recharge), test051_uzfp2 | Full-grid array per stress period (7e-B8) |
+| CSUB (subsidence / interbed compaction) | covered | `add_csub_package`, `read_compaction`, `plot_subsidence`, `import_subsidence_observations` | 1DSubsidenceModeling-MF6CSUB | v0.3.0 scope (landed 2026-09-19, 74 tools): delay + no-delay interbeds (11-field packagedata, `ndelaycells`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr`, filerecords, cell- and interbed-based obs); the CSUB obs CSV reads back as per-layer compaction + cumulative subsidence and a native PNG plot; measured subsidence registers as a **derived** time-series target; calibration targets `csub:packagedata` (+ `csub:cg_theta` / `csub:cg_ske_cr` / `npf:k33`) via `setup_calibration(obs_source="derived")` → `run_pestpp_ies` → `summarise_calibration`. Validation: playbook Target 9, staged awaiting rerun-1 |
 | MAW (multi-aquifer well) | **gap** | — | test020_NevilleTonkinTransient, test001g_MVR, ex-gwf-maw-p01, ex-gwt-mt3dsupp82, mf6-training, ModelMuse MAW-solute tutorial | Not in supported boundary list |
 | UZF (unsaturated zone flow) | **gap** | — | test051_uzfp2, ex-gwf-sagehen, ex-gwt-uzt-2d, ex-gwf-drn-p01, mf6-training, Modflow-API-Ag-Package | Not in supported boundary list |
 | LAK (lakes) | **gap** | — | test045_lake1ss, ex-gwf-lak-p02, ex-gwf-sfr-p01b, modflow-setup (Pleasant Lake), mf6-training | Not in supported boundary list |
@@ -277,10 +293,12 @@ No capability-coverage rows changed except OBS (partial → covered).
 
 ## Coverage summary
 
-- covered: 16 rows · partial: 0 · gap: 10 (MAW, UZF, LAK, GNC, MVR,
+- covered: 17 rows · partial: 0 · gap: 10 (MAW, UZF, LAK, GNC, MVR,
   GWT, SWT, GWF-GWT coupling, pestpp-sen, pestpp-pareto/swp) · legacy-out-of-scope: 4
   (UCODE SVD estimation and UCODE linear/MCMC uncertainty rows removed
   2026-08-17 — UCODE is no longer part of the project's calibration scope)
+  · CSUB moved from catalog "extra scope" to the covered GWF row on 2026-09-19
+  (v0.3.0 capability; validation via 6d playbook Target 9 still pending)
 - Round-1 red flags (see `discovery/catalog.md` "Round-1 red flags"): SWT has
   no MF6 SWT6 package (variable density via GWT hydraulic-head formulation);
   GNC coverage is thin (2 testmodels + 1 flopy notebook). Every GAP row now has
