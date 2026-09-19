@@ -786,6 +786,12 @@ def _per_layer_values(value, nlay: int, field: str) -> list:
     return vals
 
 
+def _resolve_external_path(ws, filename) -> Path:
+    """Resolve a possibly-relative external filename against a workspace."""
+    path = Path(str(filename))
+    return path if path.is_absolute() else Path(ws) / path
+
+
 def _normalise_csub_observations(
     observations: dict, gwf_name: str
 ) -> tuple[dict, str, list]:
@@ -870,9 +876,12 @@ def _impl_add_csub_package(
 ) -> dict:
     """Add or replace the CSUB (subsidence) package on a GWF model.
 
-    ``packagedata`` is a list of interbed records or ``{"filename": ...}`` (a
-    pre-externalised file, in which case ``ninterbeds`` is required); a dict
-    may also carry ``"data"`` to write the external file on flush. Per-layer
+    ``packagedata`` is a list of interbed records, a ``{"filename": ...}``
+    dict referencing a pre-externalised file that must already exist (then
+    ``ninterbeds`` is required), or ``{"filename": ..., "data": [...]}`` to
+    externalise the records to that file (written immediately; ``ninterbeds``
+    defaults to ``len(data)``). ``packagedata_filename`` is recorded in the
+    meta/result only when the referenced file exists on disk. Per-layer
     arrays (``sgm``/``sgs``/``cg_theta``/``cg_ske_cr``) accept a scalar or one
     value per layer. ``ndelaycells`` is required when any interbed has
     ``cdelay="delay"`` — it is never defaulted silently.
@@ -880,6 +889,7 @@ def _impl_add_csub_package(
     gwf = get_gwf(model)
     sim = get_sim(model)
     nlay, _ = grid_size(gwf)
+    ws = resolve_workspace(model)
 
     pkg_filename: str | None = None
     recs: list | None = None
@@ -910,6 +920,18 @@ def _impl_add_csub_package(
                 "{'filename': ...} without 'data'."
             )
         ninterbeds = int(ninterbeds)
+
+        if pkg_filename is not None and recs is None:
+            # A filename-only dict is a pre-externalised reference. flopy
+            # writes OPEN/CLOSE but never creates the file, so a missing file
+            # would leave the model unrunnable and the recorded provenance
+            # false.
+            if not _resolve_external_path(ws, pkg_filename).exists():
+                raise ValueError(
+                    f"packagedata {{'filename': '{pkg_filename}'}} does not "
+                    "exist. Provide 'data' so the external file can be "
+                    "written, or create the pre-externalised file first."
+                )
 
         if ndelaycells is not None:
             ndelaycells = int(ndelaycells)
@@ -989,15 +1011,25 @@ def _impl_add_csub_package(
         gwf.remove_package(pkg)
     replaced = bool(targets)
 
-    if recs is not None:
+    if pkg_filename is not None:
+        pkg = mf6.ModflowGwfcsub(gwf, ninterbeds=ninterbeds, **kw)
+        if recs is not None:
+            # Externalise: flopy writes the packagedata file immediately and
+            # rewrites the block to OPEN/CLOSE. Existence is verified below
+            # before the filename is recorded.
+            pkg.packagedata.set_data(
+                {"filename": pkg_filename, "data": recs}
+            )
+        else:
+            # Pre-externalised file (existence checked above): reference it
+            # without reading or rewriting it.
+            pkg.packagedata.set_data(
+                {"filename": pkg_filename}, check_data=False
+            )
+    else:
         pkg = mf6.ModflowGwfcsub(
             gwf, ninterbeds=ninterbeds, packagedata=recs, **kw
         )
-    else:
-        pkg = mf6.ModflowGwfcsub(gwf, ninterbeds=ninterbeds, **kw)
-        # Pre-externalised packagedata: reference the caller's file without
-        # reading or rewriting it.
-        pkg.packagedata.set_data({"filename": pkg_filename}, check_data=False)
 
     if obs_continuous is not None:
         pkg.obs.initialize(
@@ -1040,7 +1072,12 @@ def _impl_add_csub_package(
         "interbeds": interbeds,
         "filerecords": dict(filerecords or {}),
     }
-    if pkg_filename is not None:
+    # Only record provenance once the referenced file actually exists on disk.
+    ext_exists = (
+        pkg_filename is not None
+        and _resolve_external_path(ws, pkg_filename).exists()
+    )
+    if ext_exists:
         csub_meta["packagedata_filename"] = str(pkg_filename)
     if obs_output_csv is not None:
         csub_meta["obs_output_csv"] = obs_output_csv
@@ -1058,7 +1095,7 @@ def _impl_add_csub_package(
         "filerecords": dict(filerecords or {}),
         "written": written,
     }
-    if pkg_filename is not None:
+    if ext_exists:
         result["packagedata_filename"] = str(pkg_filename)
     if obs_output_csv is not None:
         result["obs_output_csv"] = obs_output_csv
@@ -1892,8 +1929,10 @@ def register(mcp) -> None:
         ``packagedata`` is a list of 11-field interbed records
         ``[icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc, sse_cr,
         theta, kv, h0]`` with 0-based ``icsubno`` (contiguous from 0) and
-        0-based cellids, or ``{"filename": ...}`` to reference a
-        pre-externalised file (then ``ninterbeds`` is required).
+        0-based cellids, ``{"filename": ...}`` to reference a pre-externalised
+        file that must already exist (then ``ninterbeds`` is required), or
+        ``{"filename": ..., "data": [...]}`` to externalise the records to
+        that file (written immediately).
         ``sgm``/``sgs``/``cg_theta``/``cg_ske_cr`` take a scalar or one value
         per layer. ``ndelaycells`` is required — never defaulted — when any
         interbed has ``cdelay="delay"``.

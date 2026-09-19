@@ -314,6 +314,12 @@ def test_add_csub_package_external_packagedata_filename_only(tmp_path):
     from groundwater_mcp.utils.workspace import resolve_workspace
 
     name = _csub_model(tmp_path, nlay=1)
+    ws = resolve_workspace(name)
+    ext = ws / "ext" / "csubmdl.csub_packagedata.dat"
+    ext.parent.mkdir(parents=True, exist_ok=True)
+    ext.write_text(
+        "1  1 1 1  nodelay  0.0  0.5  2.0  0.05  0.02  0.35  1e-6  0.0\n"
+    )
     res = _impl_add_csub_package(
         name,
         packagedata={"filename": "ext/csubmdl.csub_packagedata.dat"},
@@ -321,13 +327,29 @@ def test_add_csub_package_external_packagedata_filename_only(tmp_path):
     )
     assert "error" not in res, res
     assert res["ninterbeds"] == 1
+    assert res["packagedata_filename"] == "ext/csubmdl.csub_packagedata.dat"
+    assert ext.exists()
     model_store.flush_model(name)
-    ws = resolve_workspace(name)
     text = (ws / "csubmdl.csub").read_text()
     assert "OPEN/CLOSE" in text
     assert "ext/csubmdl.csub_packagedata.dat" in text
     meta = model_store.read_meta(name)
     assert meta["csub"]["packagedata_filename"] == "ext/csubmdl.csub_packagedata.dat"
+
+
+def test_add_csub_package_external_filename_missing_rejected(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+    from groundwater_mcp.utils import model_store
+
+    name = _csub_model(tmp_path, nlay=1)
+    res = _impl_add_csub_package(
+        name,
+        packagedata={"filename": "ext/missing.csub_packagedata.dat"},
+        ninterbeds=1,
+    )
+    assert res["code"] == "INVALID_INPUT"
+    assert "data" in res["message"]
+    assert "csub" not in model_store.read_meta(name)
 
 
 def test_add_csub_package_external_filename_requires_ninterbeds(tmp_path):
@@ -342,12 +364,27 @@ def test_add_csub_package_external_filename_requires_ninterbeds(tmp_path):
 def test_add_csub_package_external_filename_with_data(tmp_path):
     from groundwater_mcp.tools.builder import _impl_add_csub_package
     from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
 
     name = _csub_model(tmp_path, nlay=1)
     res = _impl_add_csub_package(
         name,
-        packagedata={"filename": "ext.dat", "data": [_rec(layer=0)]},
+        packagedata={
+            "filename": "ext/csubmdl.csub_packagedata.dat",
+            "data": [_rec(layer=0)],
+        },
     )
     assert "error" not in res, res
     assert res["ninterbeds"] == 1
-    assert model_store.read_meta(name)["csub"]["ninterbeds"] == 1
+    assert res["packagedata_filename"] == "ext/csubmdl.csub_packagedata.dat"
+    ws = resolve_workspace(name)
+    ext = ws / "ext" / "csubmdl.csub_packagedata.dat"
+    assert ext.exists()
+    assert "nodelay" in ext.read_text()
+    model_store.flush_model(name)
+    text = (ws / "csubmdl.csub").read_text()
+    assert "OPEN/CLOSE" in text
+    assert "ext/csubmdl.csub_packagedata.dat" in text
+    assert "nodelay" not in text.lower()  # records externalised, not inline
+    meta = model_store.read_meta(name)
+    assert meta["csub"]["packagedata_filename"] == "ext/csubmdl.csub_packagedata.dat"
