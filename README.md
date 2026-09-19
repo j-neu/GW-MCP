@@ -25,7 +25,7 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (72 total, plus 2 MCP prompts and 3 MCP resource templates)
+## Tools (73 total, plus 2 MCP prompts and 3 MCP resource templates)
 
 | Module | Tools |
 |---|---|
@@ -34,7 +34,7 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 | **parameterise** | `import_grid_from_shapefile`, `assign_top_from_raster`, `assign_k_from_zones`, `assign_k_from_raster`, `assign_ic_from_raster`, `assign_array_from_raster`, `import_river_from_shapefile`, `import_obs_from_csv` |
 | **model builder** | `create_model`, `adopt_model`, `set_simulation`, `set_model_crs`, `add_dis_package`, `add_disv_package`, `add_disu_package`, `add_npf_package`, `add_ic_package`, `add_sto_package`, `add_csub_package`, `add_boundary_package`, `add_oc_package`, `flush_model`, `summarise_model`, `model_status`, `list_model_files`, `list_models`, `delete_model` |
 | **runner** | `check_model`, `run_simulation`, `get_run_log`, `diagnose_convergence`, `validate_model`, `start_run`, `get_job_status`, `cancel_job` |
-| **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `diagnose_water_balance`, `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `read_simulated_observations`, `compare_to_observed`, `read_compaction`, `plot_heads_map`, `plot_cross_section` |
+| **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `diagnose_water_balance`, `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `read_simulated_observations`, `compare_to_observed`, `read_compaction`, `plot_subsidence`, `plot_heads_map`, `plot_cross_section` |
 | **calibration (PEST++)** | `setup_calibration`, `setup_da_control`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `run_pestpp_da`, `summarise_calibration`, `summarise_da`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
 | **spec / provenance** | `apply_model_spec`, `export_model_spec`, `export_reproducible_script`, `describe_model`, `export_model_report`, `clone_model`, `compare_scenarios` |
 

@@ -511,3 +511,99 @@ def test_read_compaction_rglob_fallback_when_meta_absent(tmp_path):
     res = _impl_read_compaction(name)
     assert "error" not in res, res
     assert res["subsidence"] == pytest.approx([0.4])
+
+
+# ---------------------------------------------------------------------------
+# plot_subsidence
+# ---------------------------------------------------------------------------
+
+
+def test_plot_subsidence_writes_png(tmp_path):
+    from pathlib import Path
+
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n1.0,0.5\n")
+    res = _impl_plot_subsidence(name)
+    assert "error" not in res, res
+    assert Path(res["output_file"]).exists()
+    assert res["n_times"] == 2
+    assert res["has_observed"] is False
+    assert res["observed_csv"] is None
+
+
+def test_plot_subsidence_overlays_observed_subsidence_ft(tmp_path):
+    from pathlib import Path
+
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n1.0,0.5\n")
+    obs = resolve_workspace(name) / "observed.csv"
+    obs.write_text("time,Subsidence_ft\n0.0,0.0\n1.0,0.6\n")
+    res = _impl_plot_subsidence(name, observed_csv=str(obs))
+    assert "error" not in res, res
+    assert res["has_observed"] is True
+    assert Path(res["observed_csv"]).exists()
+    assert Path(res["output_file"]).exists()
+
+
+def test_plot_subsidence_observed_first_numeric_column_fallback(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n1.0,0.5\n")
+    obs = resolve_workspace(name) / "observed.csv"
+    obs.write_text("time,measured_settlement\n0.0,0.0\n1.0,0.7\n")
+    res = _impl_plot_subsidence(name, observed_csv=str(obs))
+    assert "error" not in res, res
+    assert res["has_observed"] is True
+
+
+def test_plot_subsidence_propagates_read_compaction_error(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+
+    name = _csub_model(tmp_path, nlay=1)
+    res = _impl_plot_subsidence(name)
+    assert res["error"] is True
+    assert res["code"] == "OUTPUT_FILE_MISSING"
+
+
+def test_plot_subsidence_missing_observed_csv(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n1.0,0.5\n")
+    res = _impl_plot_subsidence(name, observed_csv="absent_observed.csv")
+    assert res["error"] is True
+    assert res["code"] == "OUTPUT_FILE_MISSING"
+
+
+def test_plot_subsidence_non_numeric_observed_is_invalid_input(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n1.0,0.5\n")
+    obs = resolve_workspace(name) / "observed.csv"
+    obs.write_text("time,note\n0.0,a\n1.0,b\n")
+    res = _impl_plot_subsidence(name, observed_csv=str(obs))
+    assert res["error"] is True
+    assert res["code"] == "INVALID_INPUT"
+
+
+def test_plot_subsidence_respects_output_file_name(tmp_path):
+    from pathlib import Path
+
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n1.0,0.5\n")
+    res = _impl_plot_subsidence(name, output_file="custom_subsidence.png")
+    assert "error" not in res, res
+    out = Path(res["output_file"])
+    assert out.name == "custom_subsidence.png"
+    assert out.exists()

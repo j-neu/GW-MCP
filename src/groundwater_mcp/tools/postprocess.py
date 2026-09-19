@@ -318,6 +318,126 @@ def _impl_read_compaction(model: str, max_rows: int = 500) -> dict:
     return result
 
 
+def _observed_subsidence_series(csv_path: Path) -> tuple[list[float], list[float]]:
+    """Return ``(x, y)`` from an observed subsidence CSV.
+
+    The value column is ``Subsidence_ft`` case-insensitively when present,
+    else the first numeric column that is not the time column. The time column
+    is ``time``/``datetime``/``date`` case-insensitively; with no time column
+    the row index is used as x. Raises ``ValueError`` when no numeric value
+    column can be identified or the chosen column holds non-numeric values.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {str(c).lower(): str(c) for c in df.columns}
+
+    time_col = next(
+        (lower[k] for k in ("time", "datetime", "date") if k in lower), None
+    )
+    value_col = lower.get("subsidence_ft")
+    if value_col is None:
+        for col in df.columns:
+            if col == time_col:
+                continue
+            if pd.to_numeric(df[col], errors="coerce").notna().any():
+                value_col = str(col)
+                break
+    if value_col is None:
+        raise ValueError(
+            f"No numeric subsidence column found in {csv_path.name}. "
+            f"Columns: {[str(c) for c in df.columns]}"
+        )
+
+    values = pd.to_numeric(df[value_col], errors="coerce")
+    if values.isna().any():
+        raise ValueError(
+            f"Observed subsidence column {value_col!r} contains non-numeric "
+            f"values in {csv_path.name}."
+        )
+
+    if time_col is not None:
+        x_numeric = pd.to_numeric(df[time_col], errors="coerce")
+        if x_numeric.isna().any():
+            x = [float(i) for i in range(len(df))]
+        else:
+            x = [float(v) for v in x_numeric]
+    else:
+        x = [float(i) for i in range(len(df))]
+    return x, [float(v) for v in values]
+
+
+def _impl_plot_subsidence(
+    model: str,
+    observed_csv: str | None = None,
+    output_file: str | None = None,
+) -> dict:
+    """Plot simulated cumulative subsidence against time and save as PNG.
+
+    Consumes ``_impl_read_compaction`` and propagates its error envelope
+    unchanged (e.g. ``OUTPUT_FILE_MISSING`` when no CSUB obs CSV exists).
+    ``observed_csv`` optionally overlays a measured series, auto-detecting its
+    value column (``Subsidence_ft`` case-insensitively preferred, else the
+    first numeric non-time column).
+    """
+    from groundwater_mcp.utils.plotting import figure, save_figure
+
+    result = _impl_read_compaction(model)
+    if result.get("error"):
+        return result
+
+    ws = resolve_workspace(model)
+    times = [float(v) for v in result.get("times", [])]
+    subsidence = [float(v) for v in result.get("subsidence", [])]
+    x_sim = times if times else [float(i) for i in range(len(subsidence))]
+
+    observed_x: list[float] | None = None
+    observed_y: list[float] | None = None
+    obs_path: str | None = None
+    if observed_csv:
+        p = Path(observed_csv)
+        cand = p if p.is_absolute() else ws / p
+        if not cand.exists():
+            return _err(
+                "OUTPUT_FILE_MISSING",
+                f"Observed subsidence CSV not found: {cand}",
+                "Pass observed_csv as a two-column time,subsidence CSV.",
+            )
+        try:
+            observed_x, observed_y = _observed_subsidence_series(cand)
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        obs_path = str(cand)
+
+    with figure(figsize=(9, 5)) as fig:
+        ax = fig.add_subplot(1, 1, 1)
+        ax.plot(x_sim, subsidence, marker="o", color="tab:blue", label="Simulated")
+        if observed_x is not None and observed_y is not None:
+            ax.plot(
+                observed_x,
+                observed_y,
+                marker="s",
+                linestyle="--",
+                color="tab:red",
+                label="Observed",
+            )
+            ax.legend()
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Cumulative subsidence")
+        ax.set_title(f"{model} — cumulative subsidence")
+        target = _resolve_output_path(ws, output_file, "") if output_file else None
+        out_path = save_figure(fig, target, ws)
+
+    return {
+        "model": model,
+        "output_file": out_path,
+        "n_times": len(subsidence),
+        "has_observed": observed_x is not None,
+        "observed_csv": obs_path,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Array stats helper
 # ---------------------------------------------------------------------------
@@ -1555,6 +1675,33 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("READ_COMPACTION_FAILED", str(exc))
+
+    @mcp.tool(structured_output=False)
+    def plot_subsidence(
+        model: str,
+        observed_csv: str | None = None,
+        output_file: str | None = None,
+    ) -> dict | list:
+        """Plot simulated cumulative subsidence against time and save as PNG.
+
+        Uses read_compaction's derived subsidence series and, when
+        ``observed_csv`` is given, overlays a measured series auto-detected
+        from its ``Subsidence_ft`` column (else its first numeric non-time
+        column). Returns the PNG natively (ImageContent) together with the
+        file path — no separate view_image call is needed (7f-I1)."""
+        try:
+            result = _impl_plot_subsidence(model, observed_csv, output_file)
+            if result.get("error"):
+                return result
+            return [Image(path=result["output_file"]), result]
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PLOT_FAILED", str(exc))
 
     @mcp.tool(structured_output=False)
     def plot_heads_map(

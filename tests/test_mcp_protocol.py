@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 72
+_EXPECTED_TOOL_COUNT = 73
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -121,6 +121,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "read_simulated_observations",
         "compare_to_observed",
         "read_compaction",
+        "plot_subsidence",
     ],
     "calibration": [
         "setup_calibration",
@@ -531,6 +532,16 @@ def test_plot_heads_map_layer_out_of_range_invalid_input(three_layer_model):
     })))
     assert r.get("error") is True
     assert r.get("code") == "INVALID_INPUT"
+
+
+def test_plot_subsidence_propagates_output_file_missing(three_layer_model):
+    """The wrapper returns read_compaction's envelope instead of indexing
+    output_file on an error dict."""
+    r = _parse(_run(mcp.call_tool("plot_subsidence", {
+        "model": three_layer_model,
+    })))
+    assert r.get("error") is True
+    assert r.get("code") == "OUTPUT_FILE_MISSING"
 
 
 # ---------------------------------------------------------------------------

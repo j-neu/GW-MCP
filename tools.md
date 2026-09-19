@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-72 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+73 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -333,12 +333,13 @@ Layer indices are validated against the model's `nlay` (7f-D3): `layer < 0` or `
 | `read_simulated_observations` | `model: str` | Per-site simulated values from the model's obs CSV at the final output time (7f-F1.2) |
 | `compare_to_observed` | `model: str`, `output_file: str \| None` | RMSE, bias, R², MAE, per-site residual table (CSV) and a scatter plot — no PEST setup needed (7f-F1.3) |
 | `read_compaction` | `model: str`, `max_rows: int = 500` | Per-layer compaction + derived cumulative `subsidence` (sum of the layer compaction columns), `interbed_strain` from `<gwf>.strainib.csv`; full table written to `<model>_compaction.csv` |
+| `plot_subsidence` | `model: str`, `observed_csv: str \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + `{ model, output_file, n_times, has_observed, observed_csv }` — cumulative subsidence vs time, with an optional observed overlay |
 | `plot_heads_map` | `model: str`, `layer: int = 0`, `kstpkper: tuple \| None`, `contour_intervals: int = 10`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 | `plot_cross_section` | `model: str`, `line: dict`, `kstpkper: tuple \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 
-`plot_heads_map` / `plot_cross_section` return the PNG natively as an MCP
-image content block together with the saved file path (7f-I1) — the separate
-`view_image` round-trip has been removed.
+`plot_heads_map` / `plot_cross_section` / `plot_subsidence` return the PNG natively
+as an MCP image content block together with the saved file path (7f-I1) — the
+separate `view_image` round-trip has been removed.
 
 ### GIS/table export tools (7e-C5)
 
@@ -408,7 +409,7 @@ observation names in the continuous obs CSV (`W1..W29`), while
 site names against the obs-CSV columns case-insensitively (exact match
 preferred), so a lowercase-imported CSV works without re-importing.
 
-### CSUB subsidence (`read_compaction`)
+### CSUB subsidence (`read_compaction`, `plot_subsidence`)
 
 `read_compaction` turns MF6's CSUB observation output into per-layer compaction
 and a derived cumulative subsidence series. It reads `<gwf>.csub.obs.csv`
@@ -422,6 +423,15 @@ and `INTERBED-COMPACTION-PCT` columns are deliberately excluded from the sum.
 table is always written to `<model>_compaction.csv`. With no CSUB obs CSV the
 tool returns `OUTPUT_FILE_MISSING`, and a CSV without any layer compaction
 columns returns `INVALID_INPUT`.
+
+`plot_subsidence` consumes that series and plots cumulative subsidence against
+time, returning the PNG natively. Pass `observed_csv` (a two-column
+`time,subsidence` CSV) to overlay a measured series: the value column is
+`Subsidence_ft` case-insensitively when present, else the first numeric
+non-time column, and the time column is `time`/`datetime`/`date`. A missing
+observed file returns `OUTPUT_FILE_MISSING`; when no numeric value column can
+be identified it returns `INVALID_INPUT`. `read_compaction`'s error envelope is
+propagated unchanged.
 
 ---
 
