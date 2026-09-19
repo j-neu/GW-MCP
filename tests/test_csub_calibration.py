@@ -656,3 +656,61 @@ def test_setup_calibration_csub_packagedata_pst_substitutes_correct_file(tmp_pat
     assert values == pytest.approx([0.012, 0.013])
 
 
+def test_setup_calibration_csub_packagedata_reexternalises_after_inline_readd(
+    tmp_path,
+):
+    """Regression: an existing target file must not mask an inline package.
+
+    Trigger (Task 7 review): ``setup_calibration`` externalises packagedata,
+    then ``add_csub_package`` re-adds the package *inline* while the stale
+    external file survives and meta loses ``packagedata_filename``. A second
+    ``setup_calibration`` must re-externalise from the package rather than
+    short-circuit on ``Path.exists()``, otherwise MF6 reads inline records and
+    the .pst substitutes the stale file with zero effect (spike §6.1).
+    """
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    spec = {
+        "ssv": {
+            "target": "csub:packagedata",
+            "columns": ["ssv_cc"],
+            "lower_factor": 0.05,
+            "upper_factor": 20.0,
+            "partrans": "none",
+        }
+    }
+    first = _impl_setup_calibration(name, spec)
+    assert "error" not in first, first
+    ws = resolve_workspace(name)
+    external = ws / "model.csub_packagedata.dat"
+    assert "OPEN/CLOSE" in (ws / "model.csub").read_text()
+
+    # Re-add the package inline; the stale external file is left in place and
+    # meta["csub"] is rewritten without packagedata_filename.
+    _install_csub(tmp_path, name)
+    assert "packagedata_filename" not in (read_meta(name).get("csub") or {})
+
+    second = _impl_setup_calibration(name, spec)
+    assert "error" not in second, second
+    csub_text = (ws / "model.csub").read_text()
+    assert "OPEN/CLOSE" in csub_text
+    assert "model.csub_packagedata.dat" in csub_text
+    assert Path(second["template_file"]).name == "model.csub_packagedata.dat.tpl"
+
+    # And the substituted value reaches the exact file the .csub opens.
+    pst = pyemu.Pst(second["pst_file"])
+    pst.parameter_data.loc["ssv_ssv_cc_1", "parval1"] = 0.019
+    pst.parameter_data.loc["ssv_ssv_cc_2", "parval1"] = 0.021
+    pst.write_input_files(pst_path=str(ws))
+    values = [
+        float(line.split()[-5])
+        for line in external.read_text().splitlines()
+        if line.strip()
+    ]
+    assert values == pytest.approx([0.019, 0.021])
+
+
+

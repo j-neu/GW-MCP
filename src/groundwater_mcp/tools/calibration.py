@@ -2092,18 +2092,46 @@ def _get_csub_package(gwf):
     return None
 
 
+def _csub_packagedata_open_file(pkg) -> str | None:
+    """The filename the CSUB ``packagedata`` block opens, or ``None`` inline.
+
+    flopy renders the block through ``get_file_entry``: an external block is a
+    single ``OPEN/CLOSE '<file>'`` line, an inline block is the records
+    themselves. Inspecting package state (rather than the file system) means an
+    inline package is always re-externalised even when a stale file bearing the
+    target name exists (Task 7 review finding; spike §6.1).
+    """
+    try:
+        entry = pkg.packagedata.get_file_entry()
+    except Exception:  # pragma: no cover - flopy rendering failure
+        return None
+    if not entry:
+        return None
+    match = re.search(r"OPEN/CLOSE\s+'([^']*)'", str(entry), re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1) or None
+
+
 def _impl_externalise_csub_packagedata(
     model: str, filename: str | None = None
 ) -> dict:
     """Write the CSUB ``packagedata`` as an external ``OPEN/CLOSE`` file.
 
-    When the model still carries inline records (or a caller supplies a new
-    ``filename`` that does not exist yet) the records are written with
-    ``pkg.packagedata.set_data({"filename": ..., "data": ...})`` — the exact
-    mechanic the Task 1 spike proved, and the one Task 2's builder uses. The
-    file lives at the workspace root because the generated ``.pst`` maps model
-    input files by basename, so a sub-directory would be silently stripped and
-    run un-substituted (spike pitfall 1).
+    When the package is inline, or opens a different file, the records are
+    written with ``pkg.packagedata.set_data({"filename": ..., "data": ...})``
+    — the exact mechanic the Task 1 spike proved, and the one Task 2's builder
+    uses. The file lives at the workspace root because the generated ``.pst``
+    maps model input files by basename, so a sub-directory would be silently
+    stripped and run un-substituted (spike pitfall 1).
+
+    Whether the package is already external is read from the package itself
+    (the written ``OPEN/CLOSE`` reference), **not** from ``Path.exists()``. A
+    stale file with the target name can survive a re-added *inline* package;
+    keying on the file would leave the model reading inline records while the
+    ``.pst`` substitutes the stale file — the spike's silent-zero-substitution
+    failure. Only when the package already opens the intended file does this
+    short-circuit.
 
     Returns ``{external_file, path, ninterbeds}``.
     """
@@ -2129,7 +2157,8 @@ def _impl_externalise_csub_packagedata(
             "at the wrong path (spike pitfall 1)."
         )
     path = ws / filename
-    if not path.exists():
+    current = _csub_packagedata_open_file(pkg)
+    if current is None or os.path.normcase(current) != os.path.normcase(filename):
         try:
             records = pkg.packagedata.get_data()
         except Exception as exc:  # pragma: no cover - flopy read failure
@@ -2138,8 +2167,8 @@ def _impl_externalise_csub_packagedata(
             ) from exc
         if records is None or len(records) == 0:
             raise ValueError(
-                f"CSUB packagedata external file '{filename}' does not exist "
-                "and the model has no inline packagedata to externalise."
+                f"Cannot externalise the CSUB packagedata to '{filename}': the "
+                "package has no inline records to write."
             )
         rows = (
             records.tolist()
@@ -2149,6 +2178,11 @@ def _impl_externalise_csub_packagedata(
         pkg.packagedata.set_data({"filename": filename, "data": rows})
         save_sim(model, gwf.simulation)
         flush_model(model)
+    elif not path.exists():
+        raise ValueError(
+            f"The CSUB package opens '{filename}' for its packagedata, but "
+            f"that file does not exist at {path}."
+        )
     if recorded != filename:
         csub_meta["packagedata_filename"] = filename
         meta["csub"] = csub_meta
