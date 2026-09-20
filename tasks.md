@@ -223,6 +223,17 @@ rerun loop **before that release ships**:
 - [x] (rerun-3, env) The `pestpp-*` forward-run launch wedge recurred on the loaded host; `mf6` never started. Root-caused on rerun-5 as the wrapper's missing MF6 stdio redirection (see the rerun-2 findings above) and fixed; no watchdog is needed now that the deadlock is removed.
 - [ ] (rerun-3) `assign_array_from_raster` unit handling is coherent with the k/rate fix above; re-check `assign_k_from_raster`/`assign_k_from_zones` if a `k_units`-style declaration is later added to those tools.
 
+**Target 9 rerun-6 findings (2026-09-20, filed from `6d-target9-csub-rerun6\csub_h201\run-log.md`):**
+
+- [x] **The MF6 stdio-detach fix works** (commit `f1e7015`): the wrapper no longer deadlocks — rerun-6's wrapper reaches `mf6_start`, MF6 runs and writes `Normal termination`, and the run log confirms the generated wrapper passes `stdin/stdout/stderr=subprocess.DEVNULL` to MF6. The deterministic pipe-buffer deadlock is gone.
+- [ ] **A second, MCP-tree-specific launch-latency pathology remains** (the actual 6d Target 9 calibration blocker). Under the MCP server, the PEST++-driven forward wrapper's `subprocess.run([MF6], ...)` takes **51/81/144/245/267 s wall** per run (once ~12 min) although MF6 reports `Elapsed run time 0.095–0.158 s`, and pestpp spins at 100 % CPU with the wrapper parked at `mf6_start` and no `mf6.exe` in the process table. Consequences: IES/GLM never complete an iteration, derivatives silently "fail to compute", `h201csub.sen` keeps only `k33`, and no `.phi.actual.csv` is produced (GLM did report a base phi of 285.023 before stalling). Evidence it is the MCP tree, not MF6 or the model:
+  - `mf6.exe -v` = 0.05 s; `start_run()`/`run_simulation()` through the MCP server = 0.14–0.16 s (same binary/workspace).
+  - Running the **same** `pestpp-ies h201csub.pst` (4 reals) directly from a shell completes in **9.6 s** with **40** `mf6_done` events — no latency at all.
+  - An A/B harness that mimicked the MCP server (outer process with an undrained stdin pipe and `CREATE_NO_WINDOW`, spawning pestpp the way `runner._run_process` does) did **not** reproduce it: inherit-pipe-stdin **11.3 s** vs `stdin=DEVNULL` **10.6 s**. So the trigger is neither stdin inheritance nor console allocation; it is specific to the VS Code/Electron-spawned MCP server process tree (most likely a Windows Job Object / process-creation limit on the extension's children, or endpoint protection on that tree).
+  - Note: `_run_process` spawns pestpp with `stdout=PIPE`, `stderr=STDOUT` and `CREATE_NEW_PROCESS_GROUP`, but **no `stdin` redirection** and no `CREATE_NO_WINDOW`.
+  - Suggested next experiment (repo-level, guarded): launch pestpp with `CREATE_BREAKAWAY_FROM_JOB` (arguably plus `CREATE_NO_WINDOW`) and fall back to the current flags on `OSError`, so the PEST++ tree can escape the extension's job object; if that is unavailable, run the MCP server outside VS Code's job. Not yet implemented.
+- Note: a diagnostic 4-real IES (and its output files) was run directly in `6d-target9-csub-rerun6\csub_h201\model_ws` while root-causing; the PST was restored afterwards.
+
 **Rule of thumb for new catalogue picks:** a candidate earns "highest value"
 by being real + calibration-ready (Tier 1) or by being the cleanest example of
 a capability we ship in the next release (Tier 2). ER (22.6 GB, no obs) stays
