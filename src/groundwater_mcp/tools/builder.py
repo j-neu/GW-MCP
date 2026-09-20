@@ -12,6 +12,7 @@ from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv, grid_size
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_sim,
+    clear_csub_base_snapshot,
     clear_k_base_snapshot,
     consume_reload_flag,
     flush_model,
@@ -235,9 +236,22 @@ def _impl_set_simulation(
     perlen: list[float],
     nstp: list[int],
     ims_complexity: str,
+    start_date_time: str | None = None,
+    newton: bool | None = None,
+    linear_acceleration: str | None = None,
+    outer_maximum: int | None = None,
+    under_relaxation: str | None = None,
 ) -> dict:
     if len(perlen) != nper or len(nstp) != nper:
         raise ValueError(f"len(perlen) and len(nstp) must equal nper={nper}.")
+    if start_date_time is not None:
+        start_date_time = str(start_date_time).strip()
+        if not start_date_time:
+            raise ValueError("start_date_time must be a non-empty ISO-8601 string.")
+    if outer_maximum is not None:
+        outer_maximum = int(outer_maximum)
+        if outer_maximum <= 0:
+            raise ValueError("outer_maximum must be a positive integer.")
 
     sim = get_sim(model)
     ws = resolve_workspace(model)
@@ -251,15 +265,44 @@ def _impl_set_simulation(
             sim.remove_package(pkg)
 
     perioddata = [(float(perlen[i]), int(nstp[i]), 1.0) for i in range(nper)]
-    mf6.ModflowTdis(
-        sim,
-        pname="tdis",
-        time_units=time_units,
-        nper=nper,
-        perioddata=perioddata,
-    )
-    ims = mf6.ModflowIms(sim, pname="ims", complexity=ims_complexity.upper())
+    tdis_kwargs: dict = {
+        "pname": "tdis",
+        "time_units": time_units,
+        "nper": nper,
+        "perioddata": perioddata,
+    }
+    # A start date makes the model's elapsed times convertible to calendar
+    # dates — required for the CSUB derived-observation time axis (Critical 1).
+    if start_date_time is not None:
+        tdis_kwargs["start_date_time"] = start_date_time
+    mf6.ModflowTdis(sim, **tdis_kwargs)
+
+    ims_kwargs: dict = {"pname": "ims", "complexity": ims_complexity.upper()}
+    if linear_acceleration is not None:
+        ims_kwargs["linear_acceleration"] = str(linear_acceleration)
+    if outer_maximum is not None:
+        ims_kwargs["outer_maximum"] = outer_maximum
+    if under_relaxation is not None:
+        # MF6 IMS UNDER_RELAXATION is a keyword string ("simple"/"complex"),
+        # not a boolean flag.
+        ims_kwargs["under_relaxation"] = str(under_relaxation)
+    ims = mf6.ModflowIms(sim, **ims_kwargs)
     sim.register_ims_package(ims, list(sim.model_names))
+
+    # Newton-Raphson option on the GWF model. The CSUB delay solve needs it
+    # (Critical 2); setting it after construction matches how the property is
+    # serialised and keeps ``newtonoptions`` absent when not requested.
+    if newton is not None:
+        gwf = get_gwf(model)
+        gwf.newtonoptions.set_data(["NEWTON"] if newton else None)
+
+    # Keep meta consistent with the TDIS actually written: a reconfiguration
+    # without a start date clears the stale value.
+    if start_date_time is not None:
+        meta["start_date_time"] = start_date_time
+    else:
+        meta.pop("start_date_time", None)
+    _write_meta(ws, meta)
 
     written = save_sim(model, sim)
     return {
@@ -267,6 +310,11 @@ def _impl_set_simulation(
         "nper": nper,
         "time_units": time_units,
         "ims_complexity": ims_complexity.upper(),
+        "start_date_time": start_date_time,
+        "newton": newton,
+        "linear_acceleration": ims_kwargs.get("linear_acceleration"),
+        "outer_maximum": ims_kwargs.get("outer_maximum"),
+        "under_relaxation": ims_kwargs.get("under_relaxation"),
         "total_time": sum(perlen),
         "written": written,
     }
@@ -1041,6 +1089,11 @@ def _impl_add_csub_package(
 
     written = save_sim(model, sim)
 
+    # A deliberately re-added CSUB package invalidates every pristine snapshot
+    # setup_calibration would otherwise restore (Important 3/4): the packagedata
+    # external file and the per-layer cg_theta/cg_ske_cr arrays.
+    clear_csub_base_snapshot(model, gwf.name)
+
     if recs is not None:
         layers: list = [
             int(r[1][0]) if isinstance(r[1], (list, tuple)) else None
@@ -1681,10 +1734,36 @@ def register(mcp) -> None:
         perlen: list[float],
         nstp: list[int],
         ims_complexity: str = "moderate",
+        start_date_time: str | None = None,
+        newton: bool | None = None,
+        linear_acceleration: str | None = None,
+        outer_maximum: int | None = None,
+        under_relaxation: str | None = None,
     ) -> dict:
-        """Configure simulation time discretisation (TDIS) and solver (IMS)."""
+        """Configure simulation time discretisation (TDIS) and solver (IMS).
+
+        ``start_date_time`` is an optional ISO-8601 date/datetime (e.g.
+        "1935-01-25") that anchors the elapsed model time axis to calendar
+        dates, so derived CSUB observations can match calendar dates.
+        ``newton`` toggles the GWF Newton-Raphson formulation (mandatory for
+        CSUB delay interbeds); ``linear_acceleration``, ``outer_maximum`` and
+        ``under_relaxation`` (an IMS keyword such as "simple") map onto the IMS
+        package. All new arguments are optional and default to the previous
+        behaviour.
+        """
         try:
-            return _impl_set_simulation(model, nper, perlen, nstp, ims_complexity)
+            return _impl_set_simulation(
+                model,
+                nper,
+                perlen,
+                nstp,
+                ims_complexity,
+                start_date_time,
+                newton,
+                linear_acceleration,
+                outer_maximum,
+                under_relaxation,
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:

@@ -16,6 +16,7 @@ Covers the generalised package-array machinery added by Task 6:
 from __future__ import annotations
 
 import csv
+import datetime
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +48,11 @@ from groundwater_mcp.utils.workspace import resolve_workspace
 # ---------------------------------------------------------------------------
 
 
+# The elapsed-day axis of the calibration test models: ``start_date_time`` is
+# fixed so an elapsed time (0.0, 366.0, ...) maps to a calendar date.
+_MODEL_START_DATE = "1904-01-01"
+
+
 def _csub_model(tmp_path, name="model", nlay=2, k33=True):
     """A small DIS model carrying NPF ``k``/``k33`` (the Task 2 helper shape).
 
@@ -55,7 +61,9 @@ def _csub_model(tmp_path, name="model", nlay=2, k33=True):
     """
     ws = str(tmp_path / name)
     _impl_create_model(name, ws, "FEET", "DAYS")
-    _impl_set_simulation(name, 1, [1.0], [1], "moderate")
+    _impl_set_simulation(
+        name, 1, [1.0], [1], "moderate", start_date_time=_MODEL_START_DATE
+    )
     _impl_add_dis_package(name, nlay, 3, 3, 100.0, 100.0, 50.0, [-30.0] * nlay)
     _impl_add_npf_package(
         name,
@@ -98,12 +106,13 @@ def _register_head_obs(tmp_path, name, sites=None):
     )
 
 
-def _install_csub(tmp_path, name, nlay=None, ninterbeds=None):
+def _install_csub(tmp_path, name, nlay=None, ninterbeds=None, cg_theta=None):
     """Add a CSUB package with one no-delay interbed per layer (test helper).
 
     ``ssv_cc``/``sse_cr`` base values are ``0.05``/``0.02`` (the ``_rec``
     defaults in ``test_csub.py``) so selected-column bounds are predictable.
-    ``nlay`` defaults to the model's own layer count.
+    ``nlay`` defaults to the model's own layer count; ``cg_theta`` defaults to
+    ``0.2`` per layer.
     """
     if nlay is None:
         nlay = int(get_gwf(name).dis.nlay.array)
@@ -128,7 +137,7 @@ def _install_csub(tmp_path, name, nlay=None, ninterbeds=None):
     res = _impl_add_csub_package(
         name,
         packagedata=records,
-        cg_theta=[0.2] * nlay,
+        cg_theta=list(cg_theta) if cg_theta is not None else [0.2] * nlay,
         cg_ske_cr=[1e-5] * nlay,
     )
     assert "error" not in res, res
@@ -147,8 +156,9 @@ def _register_subsidence_obs(
 
     The model is not run in these tests, so the CSUB obs CSV the wrapper will
     consume at run time is written by hand. Simulated times default to the
-    decimal year of each date (``1904-01-01`` <-> ``1904.0``), exercising the
-    date/decimal-year alignment rule. Returns ``(dates, values)``.
+    elapsed days from the model ``start_date_time`` (``1904-01-01``) to each
+    observed date, exercising the elapsed-time -> calendar-date conversion
+    (Critical 1). Returns ``(dates, values)``.
     """
     from groundwater_mcp.tools.parameterise import (
         _impl_import_subsidence_observations,
@@ -171,7 +181,13 @@ def _register_subsidence_obs(
     assert "error" not in res, res
 
     sim_times = list(sim_times) if sim_times is not None else [
-        float(date[:4]) for date in dates
+        float(
+            (
+                datetime.date.fromisoformat(date)
+                - datetime.date.fromisoformat(_MODEL_START_DATE)
+            ).days
+        )
+        for date in dates
     ]
     ws = resolve_workspace(name)
     target = str(sim_csv) if sim_csv else f"{name}.csub.obs.csv"
@@ -780,20 +796,173 @@ def test_setup_calibration_csub_packagedata_reexternalises_after_inline_readd(
     assert values == pytest.approx([0.019, 0.021])
 
 
+def test_setup_calibration_csub_packagedata_restores_pristine_baseline(tmp_path):
+    """A repeated setup must rebase on the pristine, not the substituted file.
+
+    Trigger (Important 3): a second ``setup_calibration`` after a PEST run read
+    the *substituted* external packagedata, so initial values and bounds drifted
+    with every rerun.
+    """
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)
+    _register_head_obs(tmp_path, name)
+    spec = {
+        "ssv": {
+            "target": "csub:packagedata",
+            "columns": ["ssv_cc"],
+            "lower_factor": 0.05,
+            "upper_factor": 20.0,
+            "partrans": "none",
+        }
+    }
+    first = _impl_setup_calibration(name, spec)
+    assert "error" not in first, first
+    ws = resolve_workspace(name)
+    external = ws / "model.csub_packagedata.dat"
+    pristine = ws / "model.csub_packagedata_pristine.dat"
+    assert pristine.exists()
+    base = [
+        float(line.split()[-5])
+        for line in pristine.read_text().splitlines()
+        if line.strip()
+    ]
+    assert base == pytest.approx([0.05, 0.05])
+    current = [
+        float(line.split()[-5])
+        for line in external.read_text().splitlines()
+        if line.strip()
+    ]
+    assert current == pytest.approx(base)
+
+    # Simulate a PEST run substituting the parameter values into the file.
+    pst = pyemu.Pst(first["pst_file"])
+    pst.parameter_data.loc["ssv_ssv_cc_1", "parval1"] = 0.5
+    pst.parameter_data.loc["ssv_ssv_cc_2", "parval1"] = 0.6
+    pst.write_input_files(pst_path=str(ws))
+    substituted = [
+        float(line.split()[-5])
+        for line in external.read_text().splitlines()
+        if line.strip()
+    ]
+    assert substituted == pytest.approx([0.5, 0.6])
+
+    second = _impl_setup_calibration(name, spec)
+    assert "error" not in second, second
+    restored = [
+        float(line.split()[-5])
+        for line in external.read_text().splitlines()
+        if line.strip()
+    ]
+    assert restored == pytest.approx(base)
+    pst2 = pyemu.Pst(second["pst_file"])
+    assert float(pst2.parameter_data.loc["ssv_ssv_cc_1", "parval1"]) == pytest.approx(
+        base[0]
+    )
+
+
+def test_add_csub_package_clears_cg_theta_pristine_snapshot(tmp_path):
+    """A deliberate cg_theta edit must not be reverted at the next setup.
+
+    Trigger (Important 4): ``_restore_or_snapshot_csub_array`` restored a stale
+    ``<gwf>_csub_cg_theta_pristine.npy`` even after ``add_csub_package`` changed
+    the array.
+    """
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _csub_model(tmp_path, nlay=2)
+    _install_csub(tmp_path, name)  # cg_theta 0.2
+    _register_head_obs(tmp_path, name)
+    spec = {
+        "cgtheta": {
+            "target": "csub:cg_theta",
+            "scope": "layer",
+            "layer": 0,
+            "initial": 0.2,
+        }
+    }
+    first = _impl_setup_calibration(name, spec)
+    assert "error" not in first, first
+    ws = resolve_workspace(name)
+    snapshot = ws / "model_csub_cg_theta_pristine.npy"
+    assert snapshot.exists()
+    assert np.load(snapshot) == pytest.approx([0.2, 0.2])
+
+    # Deliberate edit: re-add the package with a new cg_theta. The stale
+    # snapshot must be invalidated, or the next setup silently reverts it.
+    _install_csub(tmp_path, name, cg_theta=[0.4, 0.4])
+    assert not snapshot.exists()
+
+    spec["cgtheta"]["initial"] = 0.4
+    second = _impl_setup_calibration(name, spec)
+    assert "error" not in second, second
+    by_layer = np.loadtxt(ws / "model.csub_cg_theta.dat").reshape(-1).reshape(2, -1)
+    # Layer 1 is not parameterised, so its base value is the real regression
+    # signal: only an invalidated snapshot yields 0.4 rather than the stale 0.2.
+    assert np.all(by_layer[0] == pytest.approx(0.4))
+    assert np.all(by_layer[1] == pytest.approx(0.4))
+    pst2 = pyemu.Pst(second["pst_file"])
+    assert float(pst2.parameter_data.loc["cgtheta", "parval1"]) == pytest.approx(0.4)
+
+
 # ---------------------------------------------------------------------------
 # Task 8 — derived time-series observations (obs_source="derived")
 # ---------------------------------------------------------------------------
 
-
-def test_derived_time_key_matches_dates_and_decimal_years():
+def test_derived_time_key_matches_calendar_dates_not_numeric_years():
     from groundwater_mcp.tools.calibration import _derived_time_key
 
-    assert _derived_time_key("1904-01-01") == _derived_time_key(1904.0)
+    # Slash and ISO forms fold to the same calendar date.
     assert _derived_time_key("1/25/1935") == _derived_time_key("1935-01-25")
+    assert _derived_time_key("1935-01-25") == "1935-01-25"
+    # Critical 1 regression: an elapsed day count must never be read as a year.
+    assert _derived_time_key(11347.0) == "num:11347.0"
+    assert _derived_time_key(11347.0) != "1134-01-01"
+    # With the model start date, an elapsed day count converts to a date.
+    assert (
+        _derived_time_key(5.0, start_date_time="1935-01-25")
+        == "1935-01-30"
+    )
+    # A setup-time time_map literal wins over the start-date arithmetic.
+    assert _derived_time_key(10.0, time_map={"10.0": "2001-03-04"}) == "2001-03-04"
     assert _derived_time_key(0.0) == "num:0.0"
     assert _derived_time_key("nodelay") == "str:nodelay"
     assert _derived_time_key("") is None
     assert _derived_time_key(None) is None
+
+
+def test_derived_time_axis_matches_elapsed_days_to_non_january_dates(tmp_path):
+    """An elapsed-day axis with non-January-1 observations matches every date.
+
+    Mirrors the holdout shape: ``TIME_UNITS DAYS`` with a real start date, so
+    the CSUB obs CSV ``time`` column is elapsed days while the observations are
+    calendar dates (Critical 1).
+    """
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+    from groundwater_mcp.tools.builder import _impl_set_simulation
+
+    name = _csub_model(tmp_path, nlay=1)
+    # Re-anchor the model to a non-January-1 start date.
+    _impl_set_simulation(
+        name, 1, [1.0], [1], "moderate", start_date_time="1935-01-25"
+    )
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(
+        tmp_path,
+        name,
+        dates=["1935-01-25", "1935-05-05"],
+        values=[0.1, 0.3],
+        sim_times=[0.0, 100.0],
+    )
+
+    group = _derived_observation_plan(name)[0]
+    assert group["start_date_time"] == "1935-01-25"
+    assert group["n_total"] == 2
+    assert group["dates"] == ["1935-01-25", "1935-05-05"]
+    assert group["skipped"] == []
+    assert group["deferred"] is False
+    assert group["time_map"]["100.0"] == "1935-05-05"
 
 
 def test_derived_sum_columns_prefix_and_elastic_exclusion():
@@ -849,8 +1018,9 @@ def test_derived_observation_plan_skips_unmatched_dates(tmp_path):
 
     name = _csub_model(tmp_path, nlay=1)
     _install_csub(tmp_path, name)
-    # Only the 1904 simulated row exists, so the 1905 observation must skip.
-    _register_subsidence_obs(tmp_path, name, sim_times=[1904.0])
+    # Only the 1904-01-01 simulated row exists (elapsed day 0), so the
+    # 1905-01-01 observation must skip.
+    _register_subsidence_obs(tmp_path, name, sim_times=[0.0])
 
     plan = _derived_observation_plan(name)
     assert len(plan) == 1
@@ -906,7 +1076,7 @@ def test_setup_calibration_derived_reports_skips_and_pst(tmp_path):
 
     name = _csub_model(tmp_path, nlay=1)
     _install_csub(tmp_path, name)
-    _register_subsidence_obs(tmp_path, name, sim_times=[1904.0])
+    _register_subsidence_obs(tmp_path, name, sim_times=[0.0])
 
     res = _impl_setup_calibration(
         name,

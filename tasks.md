@@ -497,9 +497,10 @@ rows and the Tier-2 gate list above.
 - [x] **Ensemble / EnKF data-assimilation capability (2026-09-13 EnKF recon; blocks Tier-1 `MF6_EnKF_DISU`)** — the MCP exposed GLM and IES only; there was no DA/ensemble capability. **Built 2026-09-13/14 (route (a), `pestpp-da`-backed sequential ensemble-Kalman DA):** `setup_da_control` (DA-ready v2 `.pst`, NPF-K rewire + K template, state-augmented IC template, obs/param/weight cycle tables, optional prior ensemble, NPER=1/NSTP=1 guard), `run_pestpp_da` (PST-aware ensemble size; `da_*` cycle options), `summarise_da` (per-cycle post-update phi, final phi mean/std, posterior parameter stats, residuals; loud `OUTPUT_FILE_MISSING` when there is nothing to summarise). Tests: `tests/test_pestpp_da.py`, `tests/test_da_end_to_end.py`; spike `sessions/2026-09-13-da-spike-pestpp-da-sequential.md`; e2e proof `sessions/2026-09-13-da-e2e-tiny-model.md`; tool count unchanged at 70. Residual (not a blocker): no pilot-point/kriging ensemble generator — `prior_ensemble`/`prior_std` are the available ensemble inputs, so the repo's bespoke 15-member EnKF is not reproduced (playbook Target 8 documents the deviation).
 
 **v0.3.0 release gate (from Tier-1/Tier-2 list, added 2026-08-16):** before a
-v0.3.0 release ships, the Tier-1 targets not yet passed at v0.2.0 (neversink_workflow,
-1DSubsidenceModeling-MF6CSUB, MF6_EnKF_DISU) AND the v0.3.0-scope Tier-2
+v0.3.0 release ships, the last Tier-1 target not yet passed at v0.2.0
+(1DSubsidenceModeling-MF6CSUB) AND the v0.3.0-scope Tier-2
 targets (CSUB / GWE / PRT / MT3D-USGS examples) must pass the rerun loop.
+(neversink_workflow PASSED 2026-09-12; MF6_EnKF_DISU PASSED 2026-09-19.)
 
 **Other v0.2.0 candidates (pre-existing):**
 - [ ] MT3D-USGS solute transport post-processing (read transport output, plot plumes)

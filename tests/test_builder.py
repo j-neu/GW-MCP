@@ -177,6 +177,58 @@ def test_set_simulation_mismatched_arrays_raises(bare_model):
         _impl_set_simulation(bare_model, nper=2, perlen=[1.0], nstp=[1, 2], ims_complexity="simple")
 
 
+def test_set_simulation_start_date_time_applied_and_persisted(bare_model):
+    from groundwater_mcp.utils.model_store import get_sim, read_meta
+
+    result = _impl_set_simulation(
+        bare_model, 1, [10.0], [1], "simple", start_date_time="1935-01-25"
+    )
+    assert result["start_date_time"] == "1935-01-25"
+    assert get_sim(bare_model).tdis.start_date_time.get_data() == "1935-01-25"
+    assert read_meta(bare_model)["start_date_time"] == "1935-01-25"
+
+
+def test_set_simulation_without_start_date_clears_stale_meta(bare_model):
+    from groundwater_mcp.utils.model_store import get_sim, read_meta
+
+    _impl_set_simulation(
+        bare_model, 1, [1.0], [1], "simple", start_date_time="1935-01-25"
+    )
+    _impl_set_simulation(bare_model, 1, [1.0], [1], "simple")
+    assert "start_date_time" not in read_meta(bare_model)
+    assert get_sim(bare_model).tdis.start_date_time.get_data() is None
+
+
+def test_set_simulation_solver_options_applied(bare_model):
+    from groundwater_mcp.utils.model_store import get_gwf, get_sim
+
+    result = _impl_set_simulation(
+        bare_model,
+        1,
+        [1.0],
+        [1],
+        "simple",
+        newton=True,
+        linear_acceleration="bicgstab",
+        outer_maximum=300,
+        under_relaxation="simple",
+    )
+    sim = get_sim(bare_model)
+    ims = sim.get_package("ims")
+    assert ims.linear_acceleration.get_data().upper() == "BICGSTAB"
+    assert int(ims.outer_maximum.get_data()) == 300
+    assert str(ims.under_relaxation.get_data()).lower() == "simple"
+    assert get_gwf(bare_model).newtonoptions.get_data()
+    assert result["newton"] is True
+
+
+def test_set_simulation_rejects_nonpositive_outer_maximum(bare_model):
+    with pytest.raises(ValueError, match="outer_maximum"):
+        _impl_set_simulation(
+            bare_model, 1, [1.0], [1], "simple", outer_maximum=0
+        )
+
+
 # ---------------------------------------------------------------------------
 # add_dis_package
 # ---------------------------------------------------------------------------

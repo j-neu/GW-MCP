@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import platform
 import re
@@ -1857,44 +1858,122 @@ def _space_free_interpreter() -> str | None:
 # Task 8 — derived time-series observations
 # ---------------------------------------------------------------------------
 
-# Tolerant normaliser for matching an observed date to a simulated time. Both
-# sides are folded the same way, so an ISO observed date matches an ISO
-# simulated time and a decimal-year simulated time (e.g. ``1904.0``) matches
-# ``1904-01-01``. A value that parses as neither a date nor a calendar year
-# keeps a numeric/string key; an unparseable pair never matches (it is skipped
-# and reported, never silently mis-aligned).
+# Tolerant parsing for matching an observed date to a simulated time. With a
+# model ``start_date_time`` the simulated elapsed time is converted to a
+# calendar date (``start + elapsed``) and compared to the parsed observed date.
+# A numeric elapsed value is NEVER interpreted as a calendar year: the old
+# ``%Y`` numeric shortcut turned an elapsed day count such as ``11347.0`` into
+# ``"1134-01-01"`` and could silently match a wrong observed date (Critical 1).
 _DERIVED_DATE_FORMATS = (
-    ("%Y-%m-%d", 10),
-    ("%Y/%m/%d", 10),
-    ("%m/%d/%Y", 10),
-    ("%d/%m/%Y", 10),
-    ("%Y-%m", 7),
-    ("%Y", 4),
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%m/%d/%Y",
+    "%d/%m/%Y",
+    "%Y-%m",
 )
 
+# Elapsed-time-unit name -> days. Mirrors ``builder._SECONDS_PER_TIME_UNIT``
+# (YEARS = 31536000 s = 365 d) without importing across tool modules.
+_TIME_UNIT_DAYS = {
+    "SECONDS": 1.0 / 86400.0,
+    "MINUTES": 1.0 / 1440.0,
+    "HOURS": 1.0 / 24.0,
+    "DAYS": 1.0,
+    "YEARS": 365.0,
+}
 
-def _derived_time_key(value) -> str | None:
-    """Return a canonical match key for an observed date / simulated time."""
-    import datetime as _dt
 
+def _parse_observed_date(value) -> str | None:
+    """Return an ISO date string when *value* is a whole calendar date.
+
+    The whole (stripped) string must match one of :data:`_DERIVED_DATE_FORMATS`
+    — prefix-truncated parsing is deliberately not done, so a numeric elapsed
+    value can never be read as a bare year.
+    """
     if value is None:
         return None
     text = str(value).strip()
     if not text:
         return None
-    for fmt, width in _DERIVED_DATE_FORMATS:
+    for fmt in _DERIVED_DATE_FORMATS:
         try:
-            parsed = _dt.datetime.strptime(text[:width], fmt)
+            return datetime.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
-        return parsed.strftime("%Y-%m-%d")
+    return None
+
+
+def _parse_start_datetime(start_date_time) -> datetime.datetime | None:
+    """Parse an ISO-8601 model start date/datetime into a ``datetime``."""
+    if start_date_time is None:
+        return None
+    text = str(start_date_time).strip()
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    for fmt in _DERIVED_DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _elapsed_to_iso(
+    value: float, start_date_time, time_units: str = "DAYS"
+) -> str | None:
+    """Convert an elapsed model time to an ISO date via the start date."""
+    base = _parse_start_datetime(start_date_time)
+    if base is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    days = number * _TIME_UNIT_DAYS.get(str(time_units).upper(), 1.0)
+    return (base + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _derived_time_key(
+    value,
+    *,
+    start_date_time=None,
+    time_units: str = "DAYS",
+    time_map: dict | None = None,
+) -> str | None:
+    """Return a canonical match key for an observed date / simulated time.
+
+    Observed calendar dates fold to ``%Y-%m-%d``. A simulated elapsed time is
+    converted to a date using the setup-time ``time_map`` (elapsed -> ISO) or,
+    failing that, the model ``start_date_time``. Without either anchor a
+    numeric value keeps a ``num:`` key and can never match a calendar date.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    iso = _parse_observed_date(text)
+    if iso is not None:
+        return iso
     try:
         number = float(text)
     except (TypeError, ValueError):
         return "str:" + text.lower()
-    if 1000.0 <= number <= 3000.0:
-        return f"{int(round(number)):04d}-01-01"
-    return "num:" + repr(round(number, 9))
+    canonical = repr(round(number, 9))
+    if time_map:
+        mapped = time_map.get(canonical)
+        if mapped is not None:
+            return mapped
+    if start_date_time:
+        mapped = _elapsed_to_iso(number, start_date_time, time_units)
+        if mapped is not None:
+            return mapped
+    return "num:" + canonical
+
 
 
 def _derived_sum_columns(columns, sum_cols) -> list:
@@ -1931,12 +2010,21 @@ def _resolve_derived_time_col(columns, time_col) -> str | None:
 
 
 def _derived_sim_series(
-    ws: Path, sim_csv: str, time_col: str, sum_cols
-) -> dict[str, float] | None:
+    ws: Path,
+    sim_csv: str,
+    time_col: str,
+    sum_cols,
+    start_date_time=None,
+    time_units: str = "DAYS",
+) -> tuple[dict[str, float], dict[str, str]] | None:
     """Sum the compaction columns of the CSUB obs CSV by normalised time key.
 
-    Returns ``None`` when the CSUB obs CSV does not exist yet (the model has not
-    run), so the caller can mark the match as deferred rather than mis-align.
+    Returns ``(series, time_map)`` where ``series`` is keyed by ISO date and
+    ``time_map`` maps each simulated elapsed value (canonical ``repr``) to its
+    ISO date, so the stdlib wrapper can reproduce the match without a
+    date library beyond ``datetime``. Returns ``None`` when the CSUB obs CSV
+    does not exist yet (the model has not run), so the caller can mark the match
+    as deferred rather than mis-align.
     """
     path = Path(sim_csv)
     if not path.is_absolute():
@@ -1948,11 +2036,23 @@ def _derived_sim_series(
     df.columns = cols
     resolved = _resolve_derived_time_col(cols, time_col)
     if resolved is None:
-        return {}
+        return {}, {}
     sum_columns = _derived_sum_columns(cols, sum_cols)
     series: dict[str, float] = {}
+    time_map: dict[str, str] = {}
     for _, row in df.iterrows():
-        key = _derived_time_key(row[resolved])
+        raw_time = row[resolved]
+        key = _derived_time_key(
+            raw_time, start_date_time=start_date_time, time_units=time_units
+        )
+        try:
+            canonical = repr(round(float(raw_time), 9))
+        except (TypeError, ValueError):
+            canonical = None
+        if canonical is not None and key is not None and not key.startswith(
+            ("num:", "str:")
+        ):
+            time_map[canonical] = key
         if key is None or key in series:
             continue
         total = 0.0
@@ -1968,7 +2068,7 @@ def _derived_sim_series(
             seen = True
         if seen:
             series[key] = total
-    return series
+    return series, time_map
 
 
 def _derived_obs_tokens(name: str, count: int) -> list[str]:
@@ -2003,6 +2103,9 @@ def _derived_observation_plan(model: str) -> list[dict]:
     ws = resolve_workspace(model)
     gwf = get_gwf(model)
     meta = read_meta(model)
+    start_date_time = meta.get("start_date_time")
+    time_units = str(meta.get("time_units") or "DAYS").upper()
+    days_per_unit = _TIME_UNIT_DAYS.get(time_units, 1.0)
     groups = meta.get("derived_observations") or {}
     plan: list[dict] = []
     for raw_name, raw_block in groups.items():
@@ -2016,14 +2119,22 @@ def _derived_observation_plan(model: str) -> list[dict]:
             sum_cols = [sum_cols]
         dates = [str(d) for d in (block.get("dates") or [])]
         values = [float(v) for v in (block.get("values") or [])]
-        series = _derived_sim_series(ws, sim_csv, time_col, sum_cols)
-        deferred = series is None
+        built = _derived_sim_series(
+            ws,
+            sim_csv,
+            time_col,
+            sum_cols,
+            start_date_time=start_date_time,
+            time_units=time_units,
+        )
+        deferred = built is None
+        series, time_map = ({}, {}) if built is None else built
         kept_dates: list[str] = []
         kept_values: list[float] = []
         skipped: list[str] = []
         for date, value in zip(dates, values):
             key = _derived_time_key(date)
-            if series is None or (key is not None and key in series):
+            if deferred or (key is not None and key in series):
                 kept_dates.append(date)
                 kept_values.append(value)
             else:
@@ -2042,6 +2153,10 @@ def _derived_observation_plan(model: str) -> list[dict]:
                 "skipped": skipped,
                 "deferred": deferred,
                 "n_total": len(dates),
+                "start_date_time": start_date_time,
+                "time_units": time_units,
+                "days_per_unit": days_per_unit,
+                "time_map": time_map,
             }
         )
     return plan
@@ -2071,6 +2186,13 @@ def _build_derived_obs_interface(
     output_files: list[str] = []
     obs_data: dict = {}
     for group in plan:
+        if not group["start_date_time"]:
+            raise ValueError(
+                "Derived observations match the model's elapsed times against "
+                "calendar dates, which needs the model start date. Call "
+                "set_simulation(start_date_time='YYYY-MM-DD', ...) first, then "
+                "re-run setup_calibration(obs_source='derived')."
+            )
         tokens = group["tokens"]
         if not tokens:
             raise ValueError(
@@ -2097,29 +2219,47 @@ def _build_derived_obs_interface(
 # Stdlib-only derived step injected into the generated forward wrapper. It runs
 # after MODFLOW 6 and materialises ``<gwf>_<name>.csv`` with a header row and
 # one data row per planned observation, in observed-date order. The key
-# function mirrors ``_derived_time_key``; the sum-column selection mirrors
-# ``_derived_sum_columns`` (prefix selectors, elastic columns excluded).
+# functions mirror ``_derived_time_key`` (elapsed time -> calendar date via the
+# setup-time ``time_map`` or the model start date); the sum-column selection
+# mirrors ``_derived_sum_columns`` (prefix selectors, elastic columns excluded).
 _DERIVED_WRAPPER_BODY = (
     "\n"
-    "def _ts_key(value):\n"
+    "def _obs_key(value):\n"
     "    s = str(value).strip()\n"
     "    if not s:\n"
     "        return None\n"
-    "    for fmt, width in (('%Y-%m-%d', 10), ('%Y/%m/%d', 10),\n"
-    "                       ('%m/%d/%Y', 10), ('%d/%m/%Y', 10),\n"
-    "                       ('%Y-%m', 7), ('%Y', 4)):\n"
+    "    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%d/%m/%Y', '%Y-%m'):\n"
     "        try:\n"
-    "            parsed = datetime.datetime.strptime(s[:width], fmt)\n"
+    "            return datetime.datetime.strptime(s, fmt).strftime('%Y-%m-%d')\n"
     "        except ValueError:\n"
     "            continue\n"
-    "        return parsed.strftime('%Y-%m-%d')\n"
+    "    return None\n"
+    "\n"
+    "def _sim_key(value, spec):\n"
+    "    s = str(value).strip()\n"
+    "    if not s:\n"
+    "        return None\n"
+    "    iso = _obs_key(s)\n"
+    "    if iso is not None:\n"
+    "        return iso\n"
     "    try:\n"
     "        number = float(s)\n"
     "    except ValueError:\n"
     "        return 'str:' + s.lower()\n"
-    "    if 1000.0 <= number <= 3000.0:\n"
-    "        return '%04d-01-01' % int(round(number))\n"
-    "    return 'num:' + repr(round(number, 9))\n"
+    "    canonical = repr(round(number, 9))\n"
+    "    mapped = (spec.get('time_map') or {}).get(canonical)\n"
+    "    if mapped is not None:\n"
+    "        return mapped\n"
+    "    start = spec.get('start_date')\n"
+    "    if start:\n"
+    "        try:\n"
+    "            base = datetime.datetime.fromisoformat(str(start).strip())\n"
+    "        except ValueError:\n"
+    "            base = None\n"
+    "        if base is not None:\n"
+    "            days = number * float(spec.get('days_per_unit', 1.0))\n"
+    "            return (base + datetime.timedelta(days=days)).strftime('%Y-%m-%d')\n"
+    "    return 'num:' + canonical\n"
     "\n"
     "def _derive_subsidence():\n"
     "    for spec in DERIVED:\n"
@@ -2150,7 +2290,10 @@ _DERIVED_WRAPPER_BODY = (
     "                    and any(c.lower().startswith(s) for s in selects)\n"
     "                ]\n"
     "                for row in reader:\n"
-    "                    key = _ts_key(row.get(time_col, '')) if time_col is not None else None\n"
+    "                    if time_col is None:\n"
+    "                        key = None\n"
+    "                    else:\n"
+    "                        key = _sim_key(row.get(time_col, ''), spec)\n"
     "                    if key is None or key in matched:\n"
     "                        continue\n"
     "                    total = 0.0\n"
@@ -2175,7 +2318,7 @@ _DERIVED_WRAPPER_BODY = (
     "            writer = csv.writer(fh)\n"
     "            writer.writerow(['time', 'sim-subsidence-ft'])\n"
     "            for date in spec['obs_dates']:\n"
-    "                key = _ts_key(date)\n"
+    "                key = _obs_key(date)\n"
     "                if key is not None and key in matched:\n"
     "                    sim_time, value = matched[key]\n"
     "                    writer.writerow([sim_time, '%.10g' % value])\n"
@@ -2202,6 +2345,9 @@ def _derived_wrapper_source(model: str) -> tuple[str, str]:
             "sum_cols": list(group["sum_cols"]),
             "out": group["output_csv"],
             "obs_dates": list(group["dates"]),
+            "start_date": group["start_date_time"],
+            "days_per_unit": group["days_per_unit"],
+            "time_map": dict(group["time_map"]),
         }
         for group in plan
     ]
@@ -2512,8 +2658,13 @@ def _impl_externalise_csub_packagedata(
     stale file with the target name can survive a re-added *inline* package;
     keying on the file would leave the model reading inline records while the
     ``.pst`` substitutes the stale file — the spike's silent-zero-substitution
-    failure. Only when the package already opens the intended file does this
-    short-circuit.
+    failure.
+
+    The original records are snapshotted to
+    ``<gwf>.csub_packagedata_pristine.dat`` on first externalisation and
+    restored before every setup, so a repeated ``setup_calibration`` after a
+    PEST run rebases on the base values rather than the substituted ones
+    (Important 3).
 
     Returns ``{external_file, path, ninterbeds}``.
     """
@@ -2539,6 +2690,10 @@ def _impl_externalise_csub_packagedata(
             "at the wrong path (spike pitfall 1)."
         )
     path = ws / filename
+    # Pristine baseline of the external packagedata. Without it, a second
+    # setup_calibration after a PEST run rebases initial values and bounds on
+    # the *substituted* on-disk values (Important 3).
+    pristine = ws / f"{gwf.name}.csub_packagedata_pristine.dat"
     current = _csub_packagedata_open_file(pkg)
     if current is None or os.path.normcase(current) != os.path.normcase(filename):
         try:
@@ -2560,11 +2715,23 @@ def _impl_externalise_csub_packagedata(
         pkg.packagedata.set_data({"filename": filename, "data": rows})
         save_sim(model, gwf.simulation)
         flush_model(model)
+        # Snapshot on first externalisation, from the file flopy just wrote so
+        # the baseline is byte-for-byte what the model reads.
+        if path.exists():
+            shutil.copyfile(path, pristine)
+    elif pristine.exists():
+        # Already external: restore the pristine baseline before templating, so
+        # a repeated setup never parameterises a previously substituted file.
+        shutil.copyfile(pristine, path)
     elif not path.exists():
         raise ValueError(
             f"The CSUB package opens '{filename}' for its packagedata, but "
             f"that file does not exist at {path}."
         )
+    else:
+        # First setup of a package externalised elsewhere (e.g. add_csub_package
+        # with a filename): snapshot the current file as the baseline.
+        shutil.copyfile(path, pristine)
     if recorded != filename:
         csub_meta["packagedata_filename"] = filename
         meta["csub"] = csub_meta
@@ -4795,11 +4962,19 @@ def _impl_run_pestpp_ies(
     iterations = 0
 
     if phi_csv.exists():
-        phi_progress, _ = _read_phi_csv(phi_csv)
+        # The IES phi file holds one row per iteration with mean/std/min/max
+        # plus per-realisation columns. The reported phi is the final
+        # iteration's ensemble-mean (the `mean` column), read with the IES
+        # reader; summing every numeric column (the old _read_phi_csv path)
+        # inflated it by the ensemble size and produced a meaningless value
+        # (Important 5).
+        phi_progress, _ = _read_ies_phi(ws, base_name)
         iterations = len(phi_progress)
-        if phi_progress:
-            phi_vals = [row["phi"] for row in phi_progress]
-            final_phi_mean = float(np.mean(phi_vals))
+        phi_vals = [
+            float(row["phi"]) for row in phi_progress if row["phi"] is not None
+        ]
+        if phi_vals:
+            final_phi_mean = phi_vals[-1]
             final_phi_std = float(np.std(phi_vals))
 
     converged = result.returncode == 0

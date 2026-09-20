@@ -17,9 +17,12 @@ every test carries ``@requires_mf6``; the IES test additionally carries
 from __future__ import annotations
 
 import csv
+import datetime
+import math
 import subprocess
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from groundwater_mcp.tools.builder import (
@@ -75,20 +78,33 @@ requires_pestpp_ies = pytest.mark.skipif(
 # Tiny model
 # ---------------------------------------------------------------------------
 
-# The model time axis is expressed in decimal calendar years so its CSUB
-# simulated times (1901.0, 1902.0, 1903.0) fold onto the same key as ISO
-# observed dates ("1902-01-01") under ``_derived_time_key``. Period 0 is
-# steady at head -1; the GHB then steps the head down each period, driving
-# compaction in the two no-delay interbeds (one per layer).
-_PERLEN = [1901.0, 1.0, 1.0]
+# The model runs on an elapsed-day axis anchored to a non-January-1 start date,
+# mirroring the holdout: the CSUB obs CSV ``time`` column is elapsed days while
+# the observations are calendar dates (Critical 1). Period 0 is steady at head
+# -1; the GHB then steps the head down each period, driving compaction in the
+# two no-delay interbeds (one per layer).
+_START_DATE = "1901-02-15"
+_PERLEN = [1.0, 365.0, 365.0]
 _GHB_HEADS = [-1.0, -2.0, -3.0]
+
+
+def _elapsed_to_date(elapsed_days: float) -> str:
+    start = datetime.date.fromisoformat(_START_DATE)
+    return (start + datetime.timedelta(days=float(elapsed_days))).isoformat()
 
 
 def _build_tiny_csub(tmp_path: Path, name: str) -> str:
     """Build a 1x1, 2-layer column with one no-delay interbed per layer."""
     ws = str(tmp_path / name)
     _impl_create_model(name, ws, "FEET", "DAYS")
-    _impl_set_simulation(name, 3, list(_PERLEN), [1, 1, 1], "moderate")
+    _impl_set_simulation(
+        name,
+        3,
+        list(_PERLEN),
+        [1, 1, 1],
+        "moderate",
+        start_date_time=_START_DATE,
+    )
     _impl_add_dis_package(name, 2, 1, 1, 1.0, 1.0, 0.0, [-10.0, -20.0])
     _impl_add_npf_package(
         name, icelltype=1, k=[1.0, 1.0], k33=[1.0, 1.0], save_flows=True
@@ -164,7 +180,7 @@ def _run_base_and_register_observed(tmp_path: Path, name: str) -> list[float]:
             if float(time) <= _PERLEN[0]:
                 continue  # period 0 is steady; zero compaction carries no signal
             observed = float(subsidence) * 1.05
-            writer.writerow([f"{int(round(float(time))):04d}-01-01", observed])
+            writer.writerow([_elapsed_to_date(time), observed])
             values.append(observed)
 
     assert len(values) >= 2, base
@@ -245,5 +261,113 @@ def test_tiny_csub_calibration_end_to_end(tmp_path):
     )
     assert "error" not in out, out
     assert out["converged"] is True, out
-    assert out["final_phi_mean"] is not None, out
     assert out["iterations"] >= 1, out
+    # Meaningful phi: the final iteration's ensemble-mean (the .phi.actual.csv
+    # `mean` column), not the inflated all-column sum. The synthetic residual is
+    # a few percent of a sub-millimetre signal, so phi is small but positive.
+    assert math.isfinite(out["final_phi_mean"])
+    assert 0.0 < out["final_phi_mean"] < 1.0, out
+    phi_csv = resolve_workspace(name) / (
+        Path(setup["pst_file"]).stem + ".phi.actual.csv"
+    )
+    reported = float(pd.read_csv(phi_csv)["mean"].iloc[-1])
+    assert out["final_phi_mean"] == pytest.approx(reported)
+
+
+# ---------------------------------------------------------------------------
+# Critical 2 — delay interbeds need Newton (H201 shape)
+# ---------------------------------------------------------------------------
+
+_DELAY_PERLEN = [1.0, 1.0, 1.0]
+_DELAY_GHB_HEADS = [-1.0, -2.0, -3.0]
+
+
+def _build_delay_csub(tmp_path: Path, name: str) -> str:
+    """A 1x1, 2-layer column with delay AND no-delay interbeds (H201 shape).
+
+    Newton is enabled with the holdout IMS options (``set_simulation(..., 
+    newton=True, linear_acceleration="bicgstab", outer_maximum=300,
+    under_relaxation="simple")``); without it the coupled CSUB delay solve does
+    not converge (Task 1 spike §6.3).
+    """
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "FEET", "DAYS")
+    _impl_set_simulation(
+        name,
+        3,
+        list(_DELAY_PERLEN),
+        [1, 1, 1],
+        "simple",
+        newton=True,
+        linear_acceleration="bicgstab",
+        outer_maximum=300,
+        under_relaxation="simple",
+    )
+    _impl_add_dis_package(name, 2, 1, 1, 1.0, 1.0, 0.0, [-10.0, -20.0])
+    _impl_add_npf_package(
+        name, icelltype=1, k=[1.0, 1.0], k33=[1.0, 1.0], save_flows=True
+    )
+    _impl_add_ic_package(name, strt=[-1.0, -1.0])
+    _impl_add_sto_package(
+        name, iconvert=0, ss=0.0, sy=0.0, steady_state=[0], save_flows=True
+    )
+    ghb = {
+        per: [
+            [(0, 0, 0), _DELAY_GHB_HEADS[per], 1.0],
+            [(1, 0, 0), _DELAY_GHB_HEADS[per], 1.0],
+        ]
+        for per in range(3)
+    }
+    _impl_add_boundary_package(name, "GHB", ghb, None)
+
+    records = [
+        [0, [0, 0, 0], "nodelay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+        [1, [1, 0, 0], "nodelay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+        [2, [0, 0, 0], "delay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+    ]
+    added = _impl_add_csub_package(
+        name,
+        packagedata=records,
+        ndelaycells=19,
+        sgm=[1.7, 1.7],
+        sgs=[2.0, 2.0],
+        cg_theta=[0.2, 0.2],
+        cg_ske_cr=[1e-5, 1e-5],
+        head_based=False,
+        initial_preconsolidation_head=True,
+        specified_initial_interbed_state=True,
+        beta=2.2270e-8,
+        gammaw=62.48,
+        filerecords={"strainib": f"{name}.strainib.csv"},
+        observations={
+            f"{name}.csub.obs.csv": [
+                ("COMPACTION.01", "compaction-cell", (0, 0, 0)),
+                ("COMPACTION.02", "compaction-cell", (1, 0, 0)),
+                ("PRECONSTRESS.01", "preconstress-cell", (0, 0, 0)),
+            ]
+        },
+    )
+    assert "error" not in added, added
+    assert added["n_delay_interbeds"] == 1
+    _impl_add_oc_package(name, None, None, None, None)
+    assert model_store.flush_model(name) is True
+    return name
+
+
+@requires_mf6
+def test_delay_interbed_newton_converges(tmp_path):
+    """Delay + no-delay interbeds with Newton run to normal termination."""
+    from groundwater_mcp.tools.runner import _find_mf6_binary
+
+    name = _build_delay_csub(tmp_path, "delaycsub")
+    exe = _find_mf6_binary()
+    proc = subprocess.run(
+        [exe], cwd=str(resolve_workspace(name)), capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert "Normal termination" in proc.stdout, proc.stdout[-3000:]
+
+    compaction = _impl_read_compaction(name)
+    assert "error" not in compaction, compaction
+    assert len(compaction["times"]) >= 2
+    assert any(abs(v) > 0.0 for v in compaction["subsidence"]), compaction

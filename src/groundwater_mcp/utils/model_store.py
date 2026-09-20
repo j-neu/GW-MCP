@@ -384,6 +384,31 @@ def clear_k_base_snapshot(model: str, gwf_name: str) -> bool:
     return removed
 
 
+def clear_csub_base_snapshot(model: str, gwf_name: str) -> bool:
+    """Delete ``setup_calibration``'s pristine CSUB snapshot(s), if present.
+
+    ``setup_calibration`` snapshots the CSUB per-layer ``cg_theta`` /
+    ``cg_ske_cr`` arrays to ``<gwf>_csub_<keyword>_pristine.npy`` and the
+    external ``packagedata`` to ``<gwf>.csub_packagedata_pristine.dat``,
+    restoring them before every setup. ``add_csub_package`` calls this so a
+    deliberately changed CSUB package is re-snapshotted instead of silently
+    reverted at the next setup (Important 3/4). Returns ``True`` when at least
+    one snapshot was removed.
+    """
+    ws = resolve_workspace(model)
+    removed = False
+    for keyword in ("cg_theta", "cg_ske_cr"):
+        path = ws / f"{gwf_name}_csub_{keyword}_pristine.npy"
+        if path.exists():
+            path.unlink()
+            removed = True
+    dat = ws / f"{gwf_name}.csub_packagedata_pristine.dat"
+    if dat.exists():
+        dat.unlink()
+        removed = True
+    return removed
+
+
 def is_dirty(name: str) -> bool:
     """Return whether a model has staged in-memory changes not yet flushed."""
     return bool(_dirty.get(name))

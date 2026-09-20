@@ -240,3 +240,18 @@ Clean run: `14 passed, 0 failed`. Key lines:
 pestpp-ies prior ensemble (`spike.0.obs.csv`) shows distinct per-realisation simulated subsidence
 (`0.000240388 / 0.000239646 / 0.000239456` vs base `0.000239991`), i.e. the template was
 substituted before every forward run.
+
+## 9. Final-review notes (2026-09-19)
+
+Recorded during the whole-branch review's Task 11 fix wave.
+
+- **`add_boundary_package` has no external stress-period-data form (spec risk 3).** The mf6brabant
+  rerun-3 note claims a boundary package was given `{"filename": ...}` for its
+  `stress_period_data`, but the delivered builder
+  (`src/groundwater_mcp/tools/builder.py::_impl_add_boundary_package`) accepts only an inline
+  `{stress_period: [records]}` mapping and has **no** `{"filename": ...}` branch. For Target 9 the
+  GHB table is tiny (1 row × nlay × nper), so inline data is sufficient and no capability is
+  missing — but the mf6brabant note's provenance is unverified and an external-SPD form is not
+  implemented. CSUB `packagedata` is unaffected: it externalises through
+  `pkg.packagedata.set_data({"filename": ..., "data": ...})` (this spike, §1).
+
