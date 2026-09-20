@@ -362,6 +362,62 @@ Following the existing layers:
 
 ---
 
+## Addendum (2026-09-19) — final-review fixes
+
+The whole-branch review of the delivered capability found two Critical gaps that
+would make the closed-book Target 9 run fail, plus three Important defects. The
+owner approved extending this spec rather than dispatching with known blockers.
+
+**Critical 1 — derived-observation time axis.** `set_simulation` exposes no
+`start_date_time`, so `time_units="DAYS"` produces a TDIS with no start date and
+the CSUB obs CSV `time` column is *elapsed* model time while the holdout
+observations are calendar dates (the holdout itself converts elapsed days with
+`start_date_time + Timedelta(days=i)`). The matcher must therefore convert
+elapsed times to dates before comparing, and must never interpret an elapsed
+number as a year.
+
+- `set_simulation` gains an optional `start_date_time` (ISO-8601 date or
+  datetime string), applied to `ModflowTdis` and persisted in metadata.
+- `setup_calibration(obs_source="derived")` computes the elapsed-time → ISO-date
+  map at setup time (pandas is available) and emits it into the stdlib-only
+  forward wrapper as literals, so the wrapper needs no date library beyond
+  `datetime`.
+- The `%Y` numeric shortcut is removed or hard-restricted to a plausible year
+  range; an observation that matches no simulated date is still skipped and
+  reported, never silently mis-aligned.
+- A regression test uses an elapsed-day axis with non-January-1 observation
+  dates, mirroring the holdout shape.
+
+**Critical 2 — solver options (plan defect).** Task 1's spike recorded Newton as
+mandatory for the CSUB delay solve, but no task exposed solver configuration;
+the tiny e2e avoided delay interbeds, which H201 has. The MCP-only rule leaves
+the closed-book agent no remedy.
+
+- `set_simulation` gains optional solver fields (`newton`,
+  `linear_acceleration`, `outer_maximum`, `under_relaxation`, and the existing
+  `complexity`), applied to the GWF `newtonoptions` and the `ModflowIms`
+  package. No new tool is added; the tool count stays 74.
+- An MF6-gated delay-interbed e2e test mirrors H201 (delay + no-delay interbeds,
+  Newton enabled, holdout IMS settings), so the delay path is proven end to end.
+
+**Important fixes**
+
+- `csub:packagedata` gets a pristine snapshot (e.g.
+  `<gwf>.csub_packagedata_pristine.dat`) taken on first externalisation and
+  restored before each setup, matching the NPF pattern.
+- CSUB per-layer snapshots are invalidated when the CSUB arrays change:
+  `clear_k_base_snapshot` (or a sibling) also removes `*_csub_*_pristine.npy`,
+  called from `add_csub_package`.
+- The IES path uses `_read_ies_phi` (the `mean` column), not `_read_phi_csv`'s
+  all-column sum, and the e2e asserts a meaningful phi rather than a non-null
+  value.
+
+**Documentation**
+
+- `tasks.md` v0.3.0 gate sentence and `catalog.md`'s stale CSUB row are
+  corrected, and spec risk 3 (the `add_boundary_package` external-SPD
+  discrepancy) is recorded in the spike findings doc.
+
 ## Deliverables
 
 - Source: `builder.py` (`add_csub_package`), `postprocess.py`

@@ -639,6 +639,59 @@ git commit -m "docs(6d): add Target 9 (CSUB) prompt, registry row and rerun logs
 
 ---
 
+### Task 11: Final-review fix wave (Criticals 1–2, Importants 3–5, docs)
+
+**Why:** the whole-branch review of Tasks 1–10 found two Critical gaps that will make the closed-book Target 9 run fail, plus three Important defects. The owner approved extending the spec (see the spec's "Addendum (2026-09-19)").
+
+**Files:**
+- Modify: `src/groundwater_mcp/tools/builder.py` (`set_simulation` solver + start date; CSUB snapshot invalidation)
+- Modify: `src/groundwater_mcp/tools/calibration.py` (time mapping, packagedata snapshot, IES phi reader)
+- Modify: `src/groundwater_mcp/utils/model_store.py` (clear CSUB snapshots)
+- Modify: `tests/test_csub.py`, `tests/test_csub_calibration.py`, `tests/test_csub_end_to_end.py`
+- Modify: `TASKS.md`, `research/discovery/catalog.md`, `research/discovery/sessions/2026-09-19-csub-packagedata-spike.md`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–10.
+- Produces: `set_simulation(..., start_date_time=None, newton=None, linear_acceleration=None, outer_maximum=None, under_relaxation=None)`; `model_store.clear_csub_base_snapshot(model, gwf_name)`; a calibrated elapsed-time→date map in `setup_calibration(obs_source="derived")`; `run_pestpp_ies` returning a true IES `mean` phi.
+
+- [ ] **Step 1: Failing tests for Critical 1 (time axis)**
+
+Add a test that builds a model with `start_date_time="1935-01-25"`, `time_units="DAYS"`, a CSUB obs CSV whose `time` column is elapsed days, and observations on non-January-1 calendar dates; assert `setup_calibration(obs_source="derived")` matches every date and never reports a skip. Add a test asserting an elapsed number is not interpreted as a year.
+
+- [ ] **Step 2: Implement the start date and the date map**
+
+Extend `_impl_set_simulation` / `set_simulation` with `start_date_time`, applied to `ModflowTdis` and written to meta. In `calibration.py`, replace the `%Y` numeric shortcut in `_derived_time_key` with conversion via the model start date, and emit the resolved `{sim_time: iso_date}` map as literals into the stdlib-only wrapper. Run the Step 1 tests to green.
+
+- [ ] **Step 3: Failing delay-interbed convergence test for Critical 2**
+
+Add an MF6-gated e2e that mirrors H201: 1×1 column, delay + no-delay interbeds, `ndelaycells=19`, Newton enabled with holdout IMS settings, then `run_simulation` and `read_compaction`. It must fail before Step 4 because Newton cannot be expressed.
+
+- [ ] **Step 4: Implement the solver options**
+
+Extend `_impl_set_simulation` / `set_simulation` with `newton`, `linear_acceleration`, `outer_maximum`, `under_relaxation`; apply to the GWF `newtonoptions` and `ModflowIms`. Do not add a tool; keep the count at 74. Run the Step 3 test to green.
+
+- [ ] **Step 5: Importants 3–5**
+
+- Snapshot the external packagedata on first externalisation and restore it before each setup (`<gwf>.csub_packagedata_pristine.dat`); add a repeatability test.
+- Extend the snapshot clearer to remove `*_csub_*_pristine.npy` and call it from `_impl_add_csub_package`; add a test that a deliberate `cg_theta` edit is not reverted.
+- Switch the IES phi path to `_read_ies_phi` and tighten the e2e assertion to a meaningful phi.
+
+- [ ] **Step 6: Docs**
+
+Correct the `TASKS.md` v0.3.0 gate sentence (only `1DSubsidenceModeling-MF6CSUB` remains not-passed) and `research/discovery/catalog.md`'s stale CSUB row; record the `add_boundary_package` external-SPD discrepancy (spec risk 3) in the spike findings doc.
+
+- [ ] **Step 7: Full verification and commit**
+
+Run: `pytest -q` && `ruff check src` && `mypy src`
+Expected: all green, tool count still 74.
+
+```bash
+git add -A
+git commit -m "fix(csub): calendar time axis, solver options, snapshots and IES phi reader"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage:** Component 1 → Tasks 2–3; Component 2 (`read_compaction`, `plot_subsidence`, `import_subsidence_observations`) → Tasks 3–5; Component 3 (`npf:k33`, `csub:packagedata`, `csub:cg_theta`/`csub:cg_ske_cr`, derived obs) → Tasks 6–8; Component 4 → Task 10. Risks 1–2 → Task 1 spike; risk 3 is an explicit playbook/Task 10 verification item; risks 4–5 → Tasks 3 and 8. Tool count 70 → 74 is asserted in Tasks 2, 3, 4, 5.
