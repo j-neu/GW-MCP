@@ -135,10 +135,14 @@ Fully unstructured (DISU) grids are defined by explicit node connectivity: `node
 
 **Units (7f-H1.1):** `add_npf_package` accepts `k_units` (default "m/d";
 accepted m/d, m/s, m/yr, cm/s, ft/d, ft/s) and converts `k`/`k33` into the
-model's length/time convention on entry; `add_boundary_package` accepts
-`rate_units` (m/d, m/yr, mm/d, mm/yr) for RCH/EVT rates, converting them into
-m/d. Declared units are recorded in `.gwmcp_meta.json` and reported by
-`summarise_model.units` (`{length, time, k, recharge}`).
+model's own length unit per its `time_units` on entry (so `k_units="ft/d", k=10`
+stays 10 in a FEET model, while `k_units="m/d", k=10` becomes 32.808 ft/d);
+`add_boundary_package` accepts `rate_units` (m/d, m/yr, mm/d, mm/yr) for
+RCH/EVT/RCHA/EVTA rates, converting them into the model's length unit per its
+time unit. Declared units are recorded in `.gwmcp_meta.json` and reported by
+`summarise_model.units` (`{length, time, k, recharge}`). `add_csub_package`'s
+`gammaw`/`beta` default to the model's unit system (METERS 9806.65 / 4.6512e-10;
+FEET 62.48 / 2.227e-8) rather than FloPy's SI defaults.
 
 `stress_period_data` maps a **0-based** stress-period index to records with **0-based** cell indices (layer, row, col for DIS; layer, node for DISV); indices are converted to 1-based when written to the package file. `save_flows` (default on) writes the SAVE FLOWS option so the package's fluxes appear in the budget file for `compute_water_balance`.
 

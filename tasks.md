@@ -215,6 +215,14 @@ rerun loop **before that release ships**:
 - [ ] `check_parameter_sensitivity` rejects derived observations ("No observation targets are registered for this model. Run import_obs_from_csv first."), so the n+1 sensitivity screen is unusable on the `obs_source="derived"` workflow.
 - Note: Agent Manager worktrees branch from `08103b5 phase 6 complete`, not `main`; the MCP server still runs `main`'s `src` via the editable install, so the worktree's own `src` tree is not what the run exercises.
 
+**Target 9 rerun-3 findings (2026-09-20, filed from `6d-target9-csub-rerun3\run-log.md`; unit defects fixed 2026-09-20):**
+
+- [x] **`add_npf_package` (and recharge/ET rates) ignored the model's length unit** (Critical for non-METRE models). `_convert_k_to_model` always converted into **metres**, so a FEET model silently received a 0.3048x `k`/`k33`; the rerun-3 agent had to compensate (`k_units="ft/d", k=32.808`) to write 10 ft/d. Fixed: k/k33 and RCH/EVT/RCHA/EVTA rates now convert into the model's own length unit per its `time_units` (using `meta["units"]`). Tests: `test_npf_k_units_respect_model_length_unit`, `test_npf_k_units_convert_metres_into_feet`, `test_rch_rate_units_respect_model_units`.
+- [x] **`add_csub_package` defaulted `gammaw`/`beta` to FloPy's SI values** in a FEET model, silently mis-scaling the effective-stress terms. Fixed: defaults follow the model's length unit (METERS 9806.65 / 4.6512e-10; FEET 62.48 / 2.227e-8 — the CSUB benchmark values); explicit values still win. Tests added in `test_csub.py`.
+- [ ] **`plot_subsidence` vs `import_subsidence_observations` time-axis convention clash**: `plot_subsidence(observed_csv=...)` expects the observed time column in **model-time** units (days since `start_date_time`), while `import_subsidence_observations` expects **calendar dates** — the same site file mis-anchors one of the two (rerun-3's first overlay was compressed into x≈1904–2024 on a 0–57346-day axis). Make `plot_subsidence` accept either (detect date-like values) or document the required units loudly.
+- [ ] (rerun-3, env) The `pestpp-*` forward-run launch wedge recurred on the loaded host; `mf6` never started. Not an MCP defect, but consider a per-forward-run watchdog so a wedged child fails fast instead of blocking the serial run manager.
+- [ ] (rerun-3) `assign_array_from_raster` unit handling is coherent with the k/rate fix above; re-check `assign_k_from_raster`/`assign_k_from_zones` if a `k_units`-style declaration is later added to those tools.
+
 **Rule of thumb for new catalogue picks:** a candidate earns "highest value"
 by being real + calibration-ready (Tier 1) or by being the cleanest example of
 a capability we ship in the next release (Tier 2). ER (22.6 GB, no obs) stays

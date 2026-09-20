@@ -303,6 +303,60 @@ def test_add_csub_package_rejects_unknown_obs_type(tmp_path):
     assert res["code"] == "INVALID_INPUT"
 
 
+def test_add_csub_package_beta_gammaw_default_is_unit_aware(tmp_path):
+    """gammaw/beta must default to the model's unit system, not SI.
+
+    The SI defaults (9806.65 / 4.6512e-10) silently mis-scale a FEET model's
+    effective-stress terms; the FEET defaults are 62.48 lb/ft3 and 2.227e-8
+    ft2/lb (6d Target 9 rerun-3).
+    """
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)  # FEET model
+    res = _impl_add_csub_package(name, packagedata=[_rec(layer=0)])
+    assert "error" not in res, res
+    model_store.flush_model(name)
+    text = (resolve_workspace(name) / "csubmdl.csub").read_text()
+    assert "GAMMAW" in text and "62.48" in text
+    assert "BETA" in text and "2.227" in text
+
+
+def test_add_csub_package_beta_gammaw_explicit_values_win(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    res = _impl_add_csub_package(
+        name, packagedata=[_rec(layer=0)], beta=1.0e-9, gammaw=1000.0
+    )
+    assert "error" not in res, res
+    model_store.flush_model(name)
+    text = (resolve_workspace(name) / "csubmdl.csub").read_text()
+    assert "1.00000000E-09" in text or "1e-09" in text.lower()
+    assert "1000.0" in text
+
+
+def test_add_csub_package_beta_gammaw_default_si_for_metres_model(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    ws = resolve_workspace(name)
+    meta = model_store.read_meta(name)
+    meta["units"] = "METERS"
+    model_store.write_meta(name, meta)
+    res = _impl_add_csub_package(name, packagedata=[_rec(layer=0)])
+    assert "error" not in res, res
+    model_store.flush_model(name)
+    text = (ws / "csubmdl.csub").read_text()
+    assert "9806.65" in text
+    assert "4.6512" in text
+
+
 def test_add_csub_package_tuple_interbed_index_maps_once(tmp_path):
     """Tuple interbed indices must map 0-based -> 1-based icsubno exactly once.
 

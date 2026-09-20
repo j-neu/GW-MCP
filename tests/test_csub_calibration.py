@@ -71,6 +71,7 @@ def _csub_model(tmp_path, name="model", nlay=2, k33=True):
         k=1.0,
         k33=(0.1 if k33 else None),
         save_flows=True,
+        k_units="ft/d",  # FEET model: declare k in its own units (1.0 / 0.1)
     )
     _impl_add_ic_package(name, strt=25.0)
     chd = [[[0, r, 0], 40.0] for r in range(3)] + [

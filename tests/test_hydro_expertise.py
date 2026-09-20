@@ -106,6 +106,59 @@ def test_unknown_k_units_rejected(tmp_path):
         _impl_add_npf_package(name, 1, 10.0, None, True, k_units="parsecs/week")
 
 
+def _small_feet_model(tmp_path, name: str = "feet_units") -> str:
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "FEET", "DAYS")
+    _impl_set_simulation(name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package(name, 1, 5, 5, 100.0, 100.0, 10.0, [0.0])
+    return name
+
+
+def test_npf_k_units_respect_model_length_unit(tmp_path):
+    """In a FEET model, k_units="ft/d", k=10 must write 10 (not 3.048).
+
+    7f-H1.1 converted k into **metres** regardless of the model's length unit,
+    so a FEET model silently received a 0.3048x K and callers had to compensate
+    with 32.808 (6d Target 9 rerun-3).
+    """
+    from groundwater_mcp.utils.model_store import flush_model
+
+    name = _small_feet_model(tmp_path)
+    _impl_add_npf_package(name, 1, 10.0, 0.01, True, k_units="ft/d")
+    flush_model(name)
+    k = float(np.asarray(get_gwf(name).npf.k.array).ravel()[0])
+    k33 = float(np.asarray(get_gwf(name).npf.k33.array).ravel()[0])
+    assert k == pytest.approx(10.0, rel=1e-9)
+    assert k33 == pytest.approx(0.01, rel=1e-9)
+
+
+def test_npf_k_units_convert_metres_into_feet(tmp_path):
+    """k_units="m/d", k=10 in a FEET model must write 32.808 ft/d."""
+    from groundwater_mcp.utils.model_store import flush_model
+
+    name = _small_feet_model(tmp_path, "feet_units2")
+    _impl_add_npf_package(name, 1, 10.0, None, True, k_units="m/d")
+    flush_model(name)
+    k = float(np.asarray(get_gwf(name).npf.k.array).ravel()[0])
+    assert k == pytest.approx(32.80839895, rel=1e-8)
+
+
+def test_rch_rate_units_respect_model_units(tmp_path):
+    """rate_units="mm/yr" in a FEET model must convert to ft/d, not m/d."""
+    from groundwater_mcp.utils.model_store import flush_model, invalidate
+
+    name = _small_feet_model(tmp_path, "feet_rch")
+    _impl_add_boundary_package(
+        name, "RCH", {"0": [[[0, 0, 0], 300.0]]}, None, True, rate_units="mm/yr"
+    )
+    flush_model(name)
+    invalidate(name)
+    rec = np.asarray(get_gwf(name).rch.stress_period_data.array).ravel()[0]
+    rate = float(rec["recharge"])
+    # 300 mm/yr -> 0.3 m/yr -> ft/d in a FEET model (RCH stores float32).
+    assert rate == pytest.approx(0.3 / 365.0 / 0.3048, rel=1e-6)
+
+
 def test_unknown_rate_units_rejected(tmp_path):
     name = _small_base_model(tmp_path)
     with pytest.raises(ValueError, match="rate_units"):

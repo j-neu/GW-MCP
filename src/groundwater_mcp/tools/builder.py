@@ -50,7 +50,14 @@ _BOUNDARY_PKG_CLASSES: dict[str, type] = {
 # Array-based packages (RCHA/EVTA) take a full-grid array per stress period.
 _ARRAY_BOUNDARY_PKGS = {"RCHA", "EVTA"}
 
-# Conductivity unit → metres per model-time-unit (default time unit = DAYS).
+# Model length unit → metres.
+_LENGTH_TO_METRES: dict[str, float] = {
+    "METERS": 1.0,
+    "FEET": 0.3048,
+    "CENTIMETERS": 0.01,
+}
+
+# Conductivity unit → metres per day.
 _K_UNITS_TO_PER_DAY: dict[str, float] = {
     "m/d": 1.0,
     "m/s": 86400.0,
@@ -76,29 +83,73 @@ _SECONDS_PER_TIME_UNIT: dict[str, float] = {
     "YEARS": 31536000.0,
 }
 
+# CSUB water specific weight (gammaw) and water compressibility (beta) defaults
+# per model length unit. The SI pair is 9806.65 N/m3 and 4.6512e-10 1/Pa; the
+# US-customary pair is 62.48 lb/ft3 and 2.227e-8 ft2/lb — the values the CSUB
+# benchmark models use. Defaulting to SI in a FEET model silently mis-scales the
+# effective-stress terms (6d Target 9 rerun-3).
+_GAMMAW_BY_UNIT: dict[str, float] = {"METERS": 9806.65, "FEET": 62.48}
+_BETA_BY_UNIT: dict[str, float] = {"METERS": 4.6512e-10, "FEET": 2.227e-8}
 
-def _convert_k_to_model(value, k_units: str, time_units: str):
-    """Convert a conductivity value from *k_units* into the model's length/time
-    convention (length is metres; time comes from the model's time_units)."""
+
+def _length_metres_per_unit(length_units: str) -> float:
+    """Metres in one model length unit (unknown units fall back to metres)."""
+    return _LENGTH_TO_METRES.get(str(length_units).upper(), 1.0)
+
+
+def _time_factor(time_units: str) -> float:
+    """Seconds per model time unit (unknown units fall back to days)."""
+    return _SECONDS_PER_TIME_UNIT.get(str(time_units).upper(), 86400.0)
+
+
+def _unit_factor(per_day: float, time_units: str, length_units: str) -> float:
+    """Scale a metres-per-day base into the model's length unit per its time
+    unit. Multiplies the per-day base (rather than round-tripping through
+    metres/second) so exact inputs stay exact — e.g. 1 mm/d → 0.001."""
+    return (
+        per_day
+        * (_time_factor(time_units) / 86400.0)
+        / _length_metres_per_unit(length_units)
+    )
+
+
+def _convert_k_to_model(
+    value, k_units: str, time_units: str, length_units: str = "METERS"
+):
+    """Convert a conductivity value from *k_units* into the model's convention:
+    the model's length unit per its time unit.
+
+    The length unit matters — MODFLOW expects k in the model's own length unit,
+    so ``k_units="ft/d", k=10`` in a FEET model stays 10, while ``k_units="m/d",
+    k=10`` becomes 32.808. Converting to metres in every model silently scaled
+    FEET models by 0.3048 (6d Target 9 rerun-3).
+    """
     if k_units not in _K_UNITS_TO_PER_DAY:
         raise ValueError(
             f"Unrecognised k_units '{k_units}'. Accepted: {sorted(_K_UNITS_TO_PER_DAY)}."
         )
-    per_second = _K_UNITS_TO_PER_DAY[k_units] / 86400.0
-    target_per_second = _SECONDS_PER_TIME_UNIT.get(time_units, 86400.0)
-    factor = per_second * target_per_second
+    factor = _unit_factor(_K_UNITS_TO_PER_DAY[k_units], time_units, length_units)
     if isinstance(value, (int, float)):
         return float(value) * factor
     return np.asarray(value, dtype=float) * factor
 
 
-def _convert_rate_to_md(value, rate_units: str) -> float:
-    """Convert a recharge/ET rate from *rate_units* into m/d."""
+def _rate_factor(rate_units: str, time_units: str, length_units: str) -> float:
+    """Multiplier turning a rate in *rate_units* into the model's length unit
+    per its time unit."""
     if rate_units not in _RATE_UNITS_TO_MD:
         raise ValueError(
             f"Unrecognised rate_units '{rate_units}'. Accepted: {sorted(_RATE_UNITS_TO_MD)}."
         )
-    return float(value) * _RATE_UNITS_TO_MD[rate_units]
+    return _unit_factor(_RATE_UNITS_TO_MD[rate_units], time_units, length_units)
+
+
+def _convert_rate(
+    value, rate_units: str, time_units: str = "DAYS", length_units: str = "METERS"
+) -> float:
+    """Convert a recharge/ET rate from *rate_units* into the model's length unit
+    per its time unit."""
+    return float(value) * _rate_factor(rate_units, time_units, length_units)
 
 # ---------------------------------------------------------------------------
 # Shared error helper
@@ -620,10 +671,11 @@ def _impl_add_npf_package(
     ws = resolve_workspace(model)
     meta = _read_meta(ws)
     time_units = meta.get("time_units", "DAYS")
-    k_converted = _convert_k_to_model(k, k_units, time_units)
+    length_units = meta.get("units", "METERS")
+    k_converted = _convert_k_to_model(k, k_units, time_units, length_units)
     kwargs: dict = {"icelltype": icelltype, "k": k_converted, "save_flows": save_flows}
     if k33 is not None:
-        kwargs["k33"] = _convert_k_to_model(k33, k_units, time_units)
+        kwargs["k33"] = _convert_k_to_model(k33, k_units, time_units, length_units)
     meta.setdefault("declared_units", {})["k"] = k_units
     _write_meta(ws, meta)
 
@@ -1017,10 +1069,20 @@ def _impl_add_csub_package(
             kw["update_material_properties"] = True
         if ndelaycells is not None:
             kw["ndelaycells"] = ndelaycells
-        if beta is not None:
-            kw["beta"] = float(beta)
-        if gammaw is not None:
-            kw["gammaw"] = float(gammaw)
+        # gammaw/beta are unit-system dependent. FloPy's defaults are SI, which
+        # silently mis-scales the effective-stress terms of a FEET model, so
+        # the default follows the model's length unit (6d Target 9 rerun-3).
+        length_units = str(_read_meta(ws).get("units", "METERS")).upper()
+        kw["beta"] = (
+            float(beta)
+            if beta is not None
+            else _BETA_BY_UNIT.get(length_units, _BETA_BY_UNIT["METERS"])
+        )
+        kw["gammaw"] = (
+            float(gammaw)
+            if gammaw is not None
+            else _GAMMAW_BY_UNIT.get(length_units, _GAMMAW_BY_UNIT["METERS"])
+        )
         for field, value in (
             ("sgm", sgm),
             ("sgs", sgs),
@@ -1223,24 +1285,29 @@ def _impl_add_boundary_package(
     # Convert JSON string keys to int keys
     spd = {int(k): v for k, v in stress_period_data.items()}
 
-    # Dimensional arguments carry units (7f-H1.1): RCH/EVT rates are converted
-    # from rate_units into m/d, and the declared units are recorded. RCHA/EVTA
-    # (array-based, 7e-B8) apply the same conversion to their full-grid arrays.
-    if rate_units is not None and pkg_name in ("RCH", "EVT"):
-        spd = {
-            sp: [_convert_rate_record(r, rate_units, pkg_name) for r in records]
-            for sp, records in spd.items()
-        }
+    # Dimensional arguments carry units (7f-H1.1): RCH/EVT rates and the
+    # array-based RCHA/EVTA grids are converted from rate_units into the model's
+    # length unit per its time unit, and the declared units are recorded.
+    if rate_units is not None and (
+        pkg_name in ("RCH", "EVT") or pkg_name in _ARRAY_BOUNDARY_PKGS
+    ):
         ws = resolve_workspace(model)
         meta = _read_meta(ws)
-        meta.setdefault("declared_units", {})["recharge"] = rate_units
-        _write_meta(ws, meta)
-    elif rate_units is not None and pkg_name in _ARRAY_BOUNDARY_PKGS:
-        spd = {
-            sp: _convert_rate_array(arr, rate_units) for sp, arr in spd.items()
-        }
-        ws = resolve_workspace(model)
-        meta = _read_meta(ws)
+        time_units = meta.get("time_units", "DAYS")
+        length_units = meta.get("units", "METERS")
+        if pkg_name in _ARRAY_BOUNDARY_PKGS:
+            spd = {
+                sp: _convert_rate_array(arr, rate_units, time_units, length_units)
+                for sp, arr in spd.items()
+            }
+        else:
+            spd = {
+                sp: [
+                    _convert_rate_record(r, rate_units, time_units, length_units)
+                    for r in records
+                ]
+                for sp, records in spd.items()
+            }
         meta.setdefault("declared_units", {})["recharge"] = rate_units
         _write_meta(ws, meta)
 
@@ -1340,22 +1407,22 @@ def _validate_disu_boundary_cellids(spd: dict) -> None:
                 )
 
 
-def _convert_rate_record(record, rate_units: str, pkg_name: str) -> list:
+def _convert_rate_record(
+    record, rate_units: str, time_units: str, length_units: str
+) -> list:
     """Convert the rate element of an RCH (`[cellid, rate]`) or EVT
-    (`[cellid, evtrate, surf_dep, extdp]`) record into m/d."""
+    (`[cellid, evtrate, surf_dep, extdp]`) record into the model's units."""
     record = list(record)
     if len(record) >= 2:
-        record[1] = _convert_rate_to_md(record[1], rate_units)
+        record[1] = _convert_rate(record[1], rate_units, time_units, length_units)
     return record
 
 
-def _convert_rate_array(arr, rate_units: str) -> np.ndarray:
-    """Convert a full-grid RCHA/EVTA rate array into m/d (7e-B8)."""
-    if rate_units not in _RATE_UNITS_TO_MD:
-        raise ValueError(
-            f"Unrecognised rate_units '{rate_units}'. Accepted: {sorted(_RATE_UNITS_TO_MD)}."
-        )
-    return np.asarray(arr, dtype=float) * _RATE_UNITS_TO_MD[rate_units]
+def _convert_rate_array(arr, rate_units: str, time_units: str, length_units: str) -> np.ndarray:
+    """Convert a full-grid RCHA/EVTA rate array into the model's units (7e-B8)."""
+    return np.asarray(arr, dtype=float) * _rate_factor(
+        rate_units, time_units, length_units
+    )
 
 
 def _pkg_nam_name(pkg) -> str:
@@ -1932,8 +1999,9 @@ def register(mcp) -> None:
         """Add a Node Property Flow (NPF) package defining hydraulic conductivity.
 
         ``k_units`` declares the units of ``k``/``k33`` (default "m/d"); values
-        are converted into the model's length/time convention (length metres,
-        time from the model's time_units) on entry. Accepted k_units:
+        are converted into the model's own length unit per its time unit (so
+        ``k_units="ft/d", k=10`` stays 10 in a FEET model, while ``k_units="m/d",
+        k=10`` becomes 32.808 ft/d). Accepted k_units:
         m/d, m/s, m/yr, cm/s, ft/d, ft/s."""
         try:
             return _impl_add_npf_package(model, icelltype, k, k33, save_flows, k_units)
@@ -2093,8 +2161,9 @@ def register(mcp) -> None:
         package's fluxes appear in the budget file for compute_water_balance.
 
         rate_units declares the units of RCH/EVT/RCHA/EVTA rates (default None
-        = rates are already m/d); accepted: m/d, m/yr, mm/d, mm/yr. Rates are
-        converted into m/d on entry.
+        = rates are already in the model's units); accepted: m/d, m/yr, mm/d,
+        mm/yr. Rates are converted into the model's own length unit per its time
+        unit on entry.
 
         pname names the package in the model name file. Re-adding a package
         with the same pname (or with no pname) replaces the existing one(s) of

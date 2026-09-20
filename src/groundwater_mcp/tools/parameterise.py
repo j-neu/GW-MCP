@@ -820,16 +820,18 @@ def _impl_assign_period_array_from_raster(
 
     declared_units: str | None = None
     if spec["units"] == "rate" and rate_units is not None:
-        from groundwater_mcp.tools.builder import _RATE_UNITS_TO_MD
+        from groundwater_mcp.tools.builder import _convert_rate_array
 
-        if rate_units not in _RATE_UNITS_TO_MD:
-            raise ValueError(
-                f"Unrecognised rate_units '{rate_units}'. Accepted: "
-                f"{sorted(_RATE_UNITS_TO_MD)}."
-            )
-        values = values * _RATE_UNITS_TO_MD[rate_units]
-        declared_units = rate_units
         meta = read_meta(model)
+        # Convert into the model's length/time convention (not just m/d), so a
+        # FEET model is not silently scaled by 0.3048 (6d Target 9 rerun-3).
+        values = _convert_rate_array(
+            values,
+            rate_units,
+            meta.get("time_units", "DAYS"),
+            meta.get("units", "METERS"),
+        )
+        declared_units = rate_units
         meta.setdefault("declared_units", {})["recharge"] = rate_units
         write_meta(model, meta)
 
@@ -2213,7 +2215,8 @@ def register(mcp) -> None:
 
         Raster values must already be in the model's units, except the rate
         targets ``RCHA.recharge`` and ``EVTA.rate`` which honour ``rate_units``
-        (e.g. "mm/yr", "m/d") and convert to m/d, recording the declared units.
+        (e.g. "mm/yr", "m/d") and convert into the model's own length unit per
+        its time unit, recording the declared units.
         For per-layer targets pass one raster per layer (or a single path
         reused across layers); per-period targets take exactly one raster.
         RCHA/EVTA packages are created on first use; NPF/IC/STO targets need
