@@ -457,6 +457,25 @@ def test_generate_forward_wrapper_space_free_and_runs(tmp_path):
     assert str(wrapper) in result["model_command"][0]
 
 
+def test_generate_forward_wrapper_detaches_mf6_stdio(tmp_path, monkeypatch):
+    """The MF6 child must not inherit PEST++'s FIFO stdio.
+
+    PEST++ launches the model command with FIFO stdin/stdout/stderr. MF6 writes
+    its console listing to stdout; for the 158-period H201 model that listing is
+    ~657 KB, which fills the 64 KB Windows pipe buffer and wedges the forward run
+    at ``mf6_start`` (6d Target 9 reruns 2-5). The wrapper must detach all three
+    streams: MF6 already writes its full listing to ``<gwf>.lst``.
+    """
+    import groundwater_mcp.tools.calibration as cal
+
+    name = _build_base_model(tmp_path, "wrap_detach")
+    monkeypatch.setattr(cal, "_find_mf6_binary", lambda: "/fake/mf6")
+    source = Path(cal._generate_forward_wrapper(name)["wrapper_path"]).read_text()
+    assert "stdin=subprocess.DEVNULL" in source
+    assert "stdout=subprocess.DEVNULL" in source
+    assert "stderr=subprocess.DEVNULL" in source
+
+
 @requires_mf6
 def test_generate_forward_wrapper_command_executes_with_spaced_mf6(tmp_path, monkeypatch):
     """The generated wrapper *command* itself runs the model.

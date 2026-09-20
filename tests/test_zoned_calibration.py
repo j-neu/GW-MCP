@@ -474,6 +474,9 @@ def test_generate_forward_wrapper_multiplier_applies_k(tmp_path):
     # importable, nor on a private helper).
     body = open(out["wrapper_path"]).read()
     assert "groundwater_mcp" not in body
+    # The multiplier branch must detach MF6's stdio from PEST++'s FIFO pipes too
+    # (6d Target 9 reruns 2-5 deadlocked at mf6_start on a full pipe).
+    assert "stdout=subprocess.DEVNULL" in body
     proc = subprocess.run(
         [sys.executable, out["wrapper_path"]], capture_output=True, text=True, timeout=120
     )

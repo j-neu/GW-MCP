@@ -2563,6 +2563,22 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             )
         return body
 
+    # PEST++ launches the model command with FIFO stdin/stdout/stderr. A child
+    # that writes its console listing without being drained blocks as soon as
+    # the Windows pipe buffer (64 KB) fills — MF6's listing for the 158-period
+    # H201 model is ~657 KB, which wedged the forward run at `mf6_start`
+    # (6d Target 9 reruns 2-5). MF6 already writes its full listing to
+    # <gwf>.lst, so its console output is discarded and its stdin detached:
+    # the wrapper must never hand PEST++'s pipes to MF6.
+    mf6_run = (
+        "proc = subprocess.run(\n"
+        "    [MF6],\n"
+        "    cwd=WS,\n"
+        "    stdin=subprocess.DEVNULL,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+    )
     if multiply_k:
         gwf_name = get_gwf(model).name
         base_name = f"{gwf_name}_k_base.dat"
@@ -2610,8 +2626,8 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "        fh.write('%.10g\\n' % (value * factor))\n"
             "_trace('k_written')\n"
             "_trace('mf6_start')\n"
-            "proc = subprocess.run([MF6], cwd=WS)\n"
-            "_trace('mf6_done rc=%d' % proc.returncode)\n"
+            + mf6_run
+            + "_trace('mf6_done rc=%d' % proc.returncode)\n"
             + _tail("proc.returncode")
         )
     else:
@@ -2629,8 +2645,8 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "os.chdir(WS)\n"
             "_trace('chdir')\n"
             "_trace('mf6_start')\n"
-            "proc = subprocess.run([MF6], cwd=WS)\n"
-            "_trace('mf6_done rc=%d' % proc.returncode)\n"
+            + mf6_run
+            + "_trace('mf6_done rc=%d' % proc.returncode)\n"
             + _tail("proc.returncode")
         )
 
