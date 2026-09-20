@@ -303,6 +303,43 @@ def test_add_csub_package_rejects_unknown_obs_type(tmp_path):
     assert res["code"] == "INVALID_INPUT"
 
 
+def test_add_csub_package_tuple_interbed_index_maps_once(tmp_path):
+    """Tuple interbed indices must map 0-based -> 1-based icsubno exactly once.
+
+    Regression for the 6d Target 9 rerun-2 finding: the tuple path added +1
+    *and* FloPy adds +1 to every tuple id element, so ``(1, kkpos)`` wrote
+    interbed **3** in a 2-interbed model. A ``delay-head`` / ``delay-preconstress``
+    record on a non-existent interbed builds and starts but crashes MF6 6.7.0
+    (access violation in ``gwf-csub.f90``) on the first transient step — silent
+    corruption, and the delay types can only be given as tuples.
+    """
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=2)
+    res = _impl_add_csub_package(
+        name,
+        packagedata=[_rec(layer=0, cdelay="delay"), _rec(layer=1, i=1)],
+        ndelaycells=19,
+        observations={
+            "csubmdl.csub.obs.csv": [
+                ("ipct01", "interbed-compaction-pct", (0,)),
+                ("ipct02", "interbed-compaction-pct", (1,)),
+                ("dhead02", "delay-head", (1, 0)),
+                ("dpre02", "delay-preconstress", (1, 9)),
+            ]
+        },
+    )
+    assert "error" not in res, res
+    model_store.flush_model(name)
+    text = (resolve_workspace(name) / "csubmdl.csub.obs").read_text()
+    assert "interbed-compaction-pct  1" in text
+    assert "interbed-compaction-pct  2" in text
+    assert "delay-head  2 1" in text
+    assert "delay-preconstress  2 10" in text
+
+
 # ---------------------------------------------------------------------------
 # External packagedata
 # ---------------------------------------------------------------------------

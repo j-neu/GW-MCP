@@ -195,7 +195,7 @@ rerun loop **before that release ships**:
 - GWT / GWF-GWT → `ex-gwt-keating`, `ex-gwt-mt3dms-p01`, `test201_gwtbuy-henryCHD`
 - pestpp-sen / pareto / sweep → `mf6_freyberg`, `neversink_workflow`
 - OBS package tool → `test005_advgw_tidal`, `ex-gwf-radial`
-- CSUB → `1DSubsidenceModeling-MF6CSUB` (capability landed 2026-09-19, 74 tools; 6d playbook Target 9; **rerun-1 GREEN-with-gaps 2026-09-20** — capability expressed MCP-only, not yet set-and-forget; awaiting rerun-2)
+- CSUB → `1DSubsidenceModeling-MF6CSUB` (capability landed 2026-09-19, 74 tools; 6d playbook Target 9; rerun-1 GREEN-with-gaps 2026-09-20; **rerun-2 NOT passed 2026-09-20** — the MCP delay-observation index bug was found and fixed, but the calibration step was blocked by an environment-level `pestpp-*` process-launch wedge; awaiting rerun-3)
 - GWE / PRT / MODPATH / MT3D-USGS → examples in catalog extra-scope rows (added when the v0.3.0 plan is written)
 
 **Target 9 findings (v0.3.0 backlog — filed from the 2026-09-20 CSUB rerun-1; timeout/robustness cluster + `describe_package` fixed 2026-09-20):**
@@ -206,6 +206,14 @@ rerun loop **before that release ships**:
 - [x] Calibration cancel: `jobs.submit`/`cancel` gained an `on_cancel` hook; `start_calibration` restores the externalised inputs (`<gwf>_k(.dat)`, `<gwf>_k33.dat`, `<gwf>.csub_<keyword>.dat`, `<gwf>.csub_packagedata.dat`) from their base snapshots after the process tree is killed, so `cancel_job` can no longer leave the model unloadable.
 - [ ] Derived observations: exact-date matching used only 17/208 measured points — add tolerance/nearest matching or an explicit observed→simulated date map
 - [ ] `add_oc_package`: expose `budgetcsv_filerecord`; `set_simulation`: expose the remaining IMS controls (`inner_maximum`, `outer_dvclose`, `inner_dvclose`, `relaxation_factor`)
+
+**Target 9 rerun-2 findings (2026-09-20, filed from `6d-target9-csub-rerun2\h201_work\run-log.md`; index bug + setup guard fixed 2026-09-20):**
+
+- [x] **`add_csub_package` interbed observation tuple indices were double-incremented** (Critical, silent corruption). The tuple path added +1 *and* FloPy adds +1 to every tuple id element, so `(1, kkpos)` wrote interbed **3** in a 2-interbed model (scalar `0/1` → `1/2` was correct, which is why the existing test passed). `delay-head` / `delay-preconstress` can only take tuples, so a record on a non-existent interbed built and started but crashed MF6 6.7.0 (access violation in `gwf-csub.f90`) on the first transient step. Fixed: the tuple path passes 0-based through; the scalar path keeps its `+1`. Regression test added (`test_add_csub_package_tuple_interbed_index_maps_once`).
+- [x] **A crashed/aborted PEST++ run left externalised targets empty** (`csub_packagedata.dat` / `csub_cg_ske_cr.dat` 0 bytes) while the model OPEN/CLOSEd them, so even a `setup_calibration` re-run could not load the model. Fixed: `_impl_setup_calibration` now heals from the base snapshots first (`_restore_calibration_inputs`, no model load). The `cancel_job` hook only covered cancels, not crashes.
+- [ ] **Environment: `pestpp-*` forward-run children wedge in the Windows loader** on a loaded host (0.03 s CPU, no `mf6` child, never reaches the first statement; ~56 `python.exe` from sibling Agent Manager sessions observed). All 4 calibration attempts stalled, so no phi/posterior was produced. Rerun-1's IES completed in the same environment, so this is likely transient host contention, not an MCP defect. Consider a lower-contention window (or a future `pestpp` launch path that avoids FIFO stdio) for the next run.
+- [ ] `check_parameter_sensitivity` rejects derived observations ("No observation targets are registered for this model. Run import_obs_from_csv first."), so the n+1 sensitivity screen is unusable on the `obs_source="derived"` workflow.
+- Note: Agent Manager worktrees branch from `08103b5 phase 6 complete`, not `main`; the MCP server still runs `main`'s `src` via the editable install, so the worktree's own `src` tree is not what the run exercises.
 
 **Rule of thumb for new catalogue picks:** a candidate earns "highest value"
 by being real + calibration-ready (Tier 1) or by being the cleanest example of

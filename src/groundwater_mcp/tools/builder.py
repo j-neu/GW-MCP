@@ -884,9 +884,18 @@ def _normalise_csub_observations(
                         raise ValueError(
                             f"observation '{obs_name}': empty interbed index."
                         )
-                    idx[0] += 1  # 0-based interbed number -> MF6 icsubno
+                    # FloPy converts every tuple id element from 0-based to
+                    # 1-based when it writes the OBS6 records (exactly as it does
+                    # for a cellid), so the interbed — and the delay-cell index —
+                    # are passed through 0-based and must NOT be pre-incremented
+                    # here. Incrementing both wrote interbed i+2: a `delay-head` /
+                    # `delay-preconstress` record then referenced a non-existent
+                    # interbed, which built and started but crashed MF6 6.7.0 on
+                    # the first transient step (6d Target 9 rerun-2).
                     entries.append((obs_name, obs_type, tuple(idx)))
                 else:
+                    # A scalar id is written verbatim by FloPy, so the 0-based ->
+                    # 1-based icsubno conversion happens here instead.
                     entries.append((obs_name, obs_type, int(index) + 1))
             else:
                 raise ValueError(

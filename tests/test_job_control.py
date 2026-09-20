@@ -638,3 +638,23 @@ def test_calibration_cancel_restores_externalised_csub_array(tmp_path, monkeypat
     np.testing.assert_allclose(np.loadtxt(target), np.ravel(base))
     model_store.invalidate(name)
     assert model_store.get_sim(name) is not None
+
+
+def test_setup_calibration_heals_empty_externalised_target(tmp_path):
+    """A crashed/aborted PEST++ run can leave an externalised target empty while
+    the model still OPEN/CLOSEs it, so even a `setup_calibration` re-run fails to
+    load (6d Target 9 rerun-2). The restore guard must heal it before any model
+    load — asserted via the guard's effect, with validation failing afterwards."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name = _build_csub_model(tmp_path, "heal")
+    ws = resolve_workspace(name)
+    cal._restore_or_snapshot_csub_array(name, "cg_theta")
+    ext = cal._impl_rewire_csub_array_external(name, "cg_theta")
+    target = ws / ext["external_file"]
+    target.write_text("")  # a killed forward run truncated the substitute file
+
+    with pytest.raises(ValueError):
+        cal._impl_setup_calibration(name, "not-a-dict", obs_source="derived")
+
+    assert target.read_text().strip(), "setup_calibration did not heal the empty target"

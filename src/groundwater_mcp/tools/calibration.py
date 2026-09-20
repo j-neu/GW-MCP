@@ -3569,6 +3569,16 @@ def _impl_setup_calibration(
     input files match the PST's initial state. Run the calibration with
     ``run_pestpp_glm``/``run_pestpp_ies`` (or ``calibrate``) afterwards.
     """
+    # A crashed/aborted PEST++ run can empty an externalised target while the
+    # model still OPEN/CLOSEs it, so the model — and therefore this setup —
+    # cannot load. Heal from the base snapshots first; this is best-effort and
+    # never loads the model, so it works even when a missing substitute file is
+    # what broke the load (6d Target 9 rerun-2; the job cancel hook only covers
+    # cancel_job, not a process crash).
+    try:
+        _restore_calibration_inputs(model)
+    except Exception:  # noqa: BLE001 — a later step fails loudly if still broken
+        pass
     if not isinstance(parameterisation, dict):
         raise ValueError(
             "parameterisation must be a dict mapping parameter name → "
