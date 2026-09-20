@@ -98,6 +98,21 @@ def test_describe_package_unknown_raises():
         _impl_describe_package("NOTAPKG")
 
 
+def test_describe_package_csub():
+    """CSUB must be a known package and its option/interbed fields discoverable.
+
+    Regression for the 6d Target 9 rerun-1 gap: the rerun-1 agent could not look
+    up CSUB and missed the existing ``beta``/``gammaw`` arguments.
+    """
+    result = _impl_describe_package("CSUB")
+    assert result["package"] == "CSUB"
+    blocks = {b["name"]: b for b in result["blocks"]}
+    assert {"options", "dimensions", "griddata", "packagedata"}.issubset(blocks)
+    assert {"beta", "gammaw"}.issubset(set(blocks["options"]["fields"]))
+    interbed = set(result["packagedata"])
+    assert {"icsubno", "cellid", "cdelay", "theta", "kv"}.issubset(interbed)
+
+
 # ---------------------------------------------------------------------------
 # I4 — DISV inline payload guard
 # ---------------------------------------------------------------------------

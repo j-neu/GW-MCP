@@ -37,6 +37,7 @@ class Job:
     target: Callable[[Job], dict] | None = None
     process: Any = None
     progress_fn: Callable[[Job], dict] | None = None
+    on_cancel: Callable[[Job], Any] | None = None
     status: str = STATUS_RUNNING
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
@@ -63,6 +64,7 @@ def submit(
     target: Callable[[Job], dict],
     process: Any = None,
     progress_fn: Callable[[Job], dict] | None = None,
+    on_cancel: Callable[[Job], Any] | None = None,
 ) -> Job:
     """Start a background job and return its handle.
 
@@ -79,6 +81,11 @@ def submit(
     progress_fn:
         ``progress_fn(job)`` returns a progress dict shown by ``get_status``
         while the job runs.
+    on_cancel:
+        ``on_cancel(job)`` runs after ``cancel`` has terminated the process
+        tree, to undo any workspace mutation a killed process left behind
+        (e.g. deleting a substitute input file). Exceptions are reported in the
+        ``cancel`` result, not raised, so cancellation always succeeds.
 
     Returns
     -------
@@ -92,6 +99,7 @@ def submit(
         target=target,
         process=process,
         progress_fn=progress_fn,
+        on_cancel=on_cancel,
     )
     _jobs[job.job_id] = job
 
@@ -195,7 +203,9 @@ def cancel(job_id: str) -> dict:
     """Cancel a running job and terminate its process tree.
 
     Returns ``{"job_id", "status"}`` — ``status`` is ``"cancelled"`` when the
-    job was running, or the terminal status when it had already finished.
+    job was running, or the terminal status when it had already finished. When
+    a running job has an ``on_cancel`` hook, it runs after the process tree is
+    terminated; a hook failure is reported as ``restore_error``.
 
     Raises
     ------
@@ -215,4 +225,10 @@ def cancel(job_id: str) -> dict:
         job.finished_at = time.monotonic()
     if job.process is not None:
         _terminate_process_tree(job.process)
-    return {"job_id": job_id, "status": STATUS_CANCELLED}
+    result: dict = {"job_id": job_id, "status": STATUS_CANCELLED}
+    if job.on_cancel is not None:
+        try:
+            job.on_cancel(job)
+        except Exception as exc:  # noqa: BLE001 — cancellation must still succeed
+            result["restore_error"] = str(exc)
+    return result

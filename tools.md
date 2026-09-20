@@ -21,7 +21,7 @@ Search and retrieve documentation from MODFLOW 6, FloPy, PEST++, and pyEMU. Inde
 | `search_docs` | `query: str`, `repos: list[str] \| None`, `method: "text" \| "semantic" \| "auto"`, `limit: int = 10` | List of matching doc snippets with source paths and relevance scores |
 | `search_tutorials` | `query: str`, `complexity: "beginner" \| "intermediate" \| "advanced" \| None`, `limit: int = 5` | List of matching notebooks/examples with descriptions and paths |
 | `get_doc_file` | `path: str`, `page: int = 1` | Full file content (paginated at 30 KB) |
-| `describe_package` | `name: str` | The MODFLOW 6 package specification — blocks (required/optional) and, for boundary packages, the `stress_period_data` record fields (7f-I3) |
+| `describe_package` | `name: str` | The MODFLOW 6 package specification — each block's dataset (keyword) names and, for boundary packages, the `stress_period_data` record fields; CSUB is included and returns its interbed `packagedata` fields (7f-I3) |
 
 Semantic search requires the optional `semantic` extra
 (`pip install groundwater-mcp[semantic]`). Without it, `method="semantic"`
@@ -291,8 +291,8 @@ transitions: `running` → `succeeded` | `failed` | `cancelled`.
   non-decreasing), and `terminated`. When finished, the job's `result` has the
   same shape as `run_simulation` (success, convergence, elapsed_s,
   listing_summary, observation_fit).
-- `start_calibration(model, pst_file, method, num_reals)` (calibration module)
-  starts pestpp-glm (`method="glm"`, default), pestpp-ies (`method="ies"`) or
+- `start_calibration(model, pst_file, method, num_reals, num_workers)` (calibration
+  module) starts pestpp-glm (`method="glm"`, default), pestpp-ies (`method="ies"`) or
   pestpp-da (`method="da"`) the same way. While running, progress reports
   `engine`, `iteration` and `latest_phi` parsed from `<case>.iobj` (GLM) or
   `<case>.phi.actual.csv` (IES), or the per-cycle post-update `cycle` /
@@ -300,13 +300,21 @@ transitions: `running` → `succeeded` | `failed` | `cancelled`.
   finished result matches `run_pestpp_glm` / `run_pestpp_ies` / `run_pestpp_da`
   (for DA, `num_reals` maps to `da_num_reals`; when `num_reals` is omitted the
   PST's own `ies_num_reals` / `da_num_reals` is preserved, so a
-  `setup_da_control` PST is not silently resized).
+  `setup_da_control` PST is not silently resized). `num_workers` is accepted for
+  parity with `run_pestpp_*` but is **advisory** — PEST++ has no local
+  worker-count option, so it is echoed back rather than applied (parallel
+  forward runs need PANTHER agents or an external run manager).
 - `cancel_job(job_id)` terminates the underlying process **and its entire
   process tree** (`taskkill /T /F` on Windows, `killpg` on POSIX) — the
   PEST++ forward chain spawns `mf6.exe` grandchildren that would otherwise
   survive as orphans, spinning and file-locking the workspace — and reports
   `"cancelled"`. An unknown `job_id` returns the `JOB_NOT_FOUND` envelope.
   Jobs are spawned in their own process group/session so the tree is killable.
+  A calibration job's cancellation then restores the externalised inputs
+  (`<gwf>_k.dat`, `<gwf>_k33.dat`, `<gwf>.csub_<keyword>.dat` and
+  `<gwf>.csub_packagedata.dat`) from their base snapshots, so a killed forward
+  run cannot leave the model unloadable (`Unable to open file
+  ...csub_cg_theta.dat`, 6d Target 9 rerun-1).
 
 ---
 
@@ -446,7 +454,7 @@ Set up and run PEST++ parameter estimation via pyEMU.
 | `setup_calibration` | `model: str`, `parameterisation: dict`, `obs_source: str = "model"`, `noptmax: int = 10` | The generated PEST interface: `.pst`, template, instruction file, external array, forward wrapper, parameter table |
 | `setup_da_control` | `model: str`, `parameterisation: dict`, `cycles: list[int]`, `obs_cycles: dict`, `obs_weights: dict \| None = None`, `par_cycles: dict \| None = None`, `num_reals: int = 50`, `noptmax: int = 1`, `use_simulated_states: bool = True`, `da_options: dict \| None = None`, `prior_ensemble: dict \| None = None`, `prior_std: float \| None = None`, `state_head_bound: float \| None = None` | The generated DA-ready v2 PEST interface: `.pst`, K template/target, IC template, cycle tables, state-parameter count, `state_bounds` (per-site bound used), model command, prior ensemble file and `prior_ensemble_n_clipped` when a prior is requested |
 | `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"` | Path to generated `.pst` control file |
-| `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" \| "da" = "glm"`, `num_reals: int \| None = None` | `{ model, job_id, kind, pst_file, status: "running" }` — starts PEST++ in a background thread with live phi progress (7e-A3). For `method="da"`, progress is the per-cycle post-update phi from `<case>.global.phi.actual.csv` and `num_reals` maps to `da_num_reals`; when `num_reals` is omitted the PST's own option is preserved for IES/DA |
+| `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" \| "da" = "glm"`, `num_reals: int \| None = None`, `num_workers: int = 1` | `{ model, job_id, kind, pst_file, status: "running", num_workers, parallelism }` — starts PEST++ in a background thread with live phi progress (7e-A3). For `method="da"`, progress is the per-cycle post-update phi from `<case>.global.phi.actual.csv` and `num_reals` maps to `da_num_reals`; when `num_reals` is omitted the PST's own option is preserved for IES/DA. `num_workers` is advisory (echoed, not applied — PEST++ has no local worker-count option) |
 
 ### Automated calibration setup — `setup_calibration` (7e-A2)
 
@@ -598,6 +606,8 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 | `run_pestpp_da` | `model: str`, `pst_file: str`, `num_reals: int \| None = None`, `num_workers: int = 1`, `da_options: dict \| None = None`, `noptmax: int \| None = None` | `{ converged: bool, final_phi_mean: float, final_phi_std: float, cycles: int, num_reals: int, noptmax: int }` |
 
 `run_pestpp_da` runs the PESTPP-DA binary against a **DA-ready `.pst`** — build one with `setup_da_control` (its cycle tables and `da_*` options are exactly what the binary expects). `num_reals` is the DA **ensemble size**, written to the `da_num_reals` `++` option; when omitted the PST's own `da_num_reals` is preserved (a `setup_da_control(num_reals=N)` PST stays at N). The PEST control `noptmax` is the number of update **iterations per assimilation cycle**, not the ensemble size — the optional `noptmax` overrides it and, when omitted, the PST's own value is preserved. Pass cycle options such as `{"da_observation_cycle_table": "obs_cycle_tbl.csv", "da_parameter_cycle_table": "par_cycle_tbl.csv"}` (or a `.pst` that already carries `da_*` options). PEST++-DA recognises `da_observation_cycle_table`, `da_parameter_cycle_table`, `da_weight_cycle_table`, `da_parameter_ensemble`, `da_hotstart_cycle`, `da_stop_cycle`, `da_use_simulated_states` and `da_noptmax_schedule`; there is **no** `da_cycle` / `da_obs_cycle_table` / `da_ensemble`, and an unrecognised `++` arg is a fatal parse error.
+
+`num_workers` on `run_pestpp_glm` / `run_pestpp_ies` / `run_pestpp_da` / `start_calibration` is **advisory**: PEST++ 5.x has no local worker-count option (parallel forward runs require a PANTHER manager/agent or an external run manager), so a value > 1 neither parallelises the run nor is written to the PST — it is echoed in the result (`num_workers`, `parallelism`) so callers are not misled. Ensemble size (`num_reals`) is what actually sets the IES/DA workload.
 
 | `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
 | `summarise_da` | `model: str`, `pst_file: str`, `max_residuals: int = 500` | Per-cycle phi table (post-update ensemble mean from `<case>.global.phi.actual.csv`), final-cycle phi mean/std, posterior parameter statistics (`mean`/`std`/`min`/`max` from the **current run's** final `<case>.global.<cycle>.pe.csv`, excluding the `base` row), and residuals from that run's per-cycle base `.rei` (`residuals` capped at `max_residuals`, full table to CSV) |

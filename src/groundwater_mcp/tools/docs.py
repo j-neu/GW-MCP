@@ -421,6 +421,7 @@ _PACKAGE_CLASSES = {
     "EVT": "ModflowGwfevt",
     "GHB": "ModflowGwfghb",
     "SFR": "ModflowGwfsfr",
+    "CSUB": "ModflowGwfcsub",
 }
 
 
@@ -433,6 +434,16 @@ _DUMMY_RECORDS = {
     "RCH": [[[0, 0, 0], 0.001]],
     "EVT": [[[0, 0, 0], 0.001, 0.0, 0.0]],
 }
+
+# Packages that need constructor arguments to materialise their blocks. CSUB
+# has no stress-period records to infer dimensions from, so a dummy interbed
+# declares ``NINTERBEDS`` and lets the packagedata block be introspected.
+_PACKAGE_KWARGS: dict[str, dict] = {"CSUB": {"ninterbeds": 1}}
+
+_DUMMY_CSUB_PACKAGEDATA = [
+    [0, (0, 0, 0), "nodelay", 0.0, 0.35, 1.0, 0.001, 0.001, 0.35, 0.01, 0.0]
+]
+
 
 
 def _impl_describe_package(name: str) -> dict:
@@ -460,6 +471,8 @@ def _impl_describe_package(name: str) -> dict:
     try:
         if is_boundary:
             pkg = cls(gwf, stress_period_data={"0": _DUMMY_RECORDS[pkg_name]})
+        elif pkg_name in _PACKAGE_KWARGS:
+            pkg = cls(gwf, **_PACKAGE_KWARGS[pkg_name])
         else:
             pkg = cls(gwf)
     except Exception:
@@ -467,15 +480,20 @@ def _impl_describe_package(name: str) -> dict:
 
     blocks: list[dict] = []
     stress_fields: list[str] = []
+    packagedata_fields: list[str] = []
     if pkg is not None:
-        try:
-            for block in getattr(pkg, "blocks", []):
-                blocks.append({"name": block.name, "required": block.required})
-        except Exception:
-            pass
+        blocks = _describe_blocks(pkg)
         if is_boundary:
             try:
                 stress_fields = list(pkg.stress_period_data.dtype.names)
+            except Exception:
+                pass
+        if pkg_name == "CSUB":
+            # The packagedata block's dataset list is just ``packagedata``; the
+            # per-interbed record fields only materialise once data is set.
+            try:
+                pkg.packagedata.set_data(_DUMMY_CSUB_PACKAGEDATA)
+                packagedata_fields = list(pkg.packagedata.dtype.names)
             except Exception:
                 pass
 
@@ -486,7 +504,35 @@ def _impl_describe_package(name: str) -> dict:
     }
     if stress_fields:
         result["stress_period_data"] = stress_fields
+    if packagedata_fields:
+        result["packagedata"] = packagedata_fields
     return result
+
+
+def _describe_blocks(pkg) -> list[dict]:
+    """Block names and their dataset (keyword) names.
+
+    ``pkg.blocks`` is a list of ``MFBlock`` objects for most packages but a
+    ``{block_name: MFBlock}`` mapping for the advanced CSUB package, so both
+    shapes are handled. The dataset names are what let a caller discover a
+    package's options — e.g. CSUB's ``beta``/``gammaw`` (the Target 9 rerun-1
+    miss), rather than only the block names.
+    """
+    blocks = getattr(pkg, "blocks", None) or {}
+    if isinstance(blocks, dict):
+        items = list(blocks.items())
+    else:
+        items = [(getattr(block, "name", None), block) for block in blocks]
+
+    described: list[dict] = []
+    for key, block in items:
+        name = key if key is not None else getattr(block, "name", None)
+        entry: dict = {"name": name, "required": getattr(block, "required", None)}
+        datasets = getattr(block, "datasets", None)
+        if isinstance(datasets, dict) and datasets:
+            entry["fields"] = list(datasets)
+        described.append(entry)
+    return described
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +546,10 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     def describe_package(name: str) -> dict:
         """Return the authoritative package specification for a MODFLOW 6
-        package (7f-I3): required/optional blocks and, for boundary packages,
-        the stress_period_data record fields (cellid + value columns)."""
+        package (7f-I3): each block with its dataset (keyword) names and, for
+        boundary packages, the ``stress_period_data`` record fields (cellid +
+        value columns). Advanced packages expose their own record fields —
+        CSUB returns the interbed ``packagedata`` fields."""
         try:
             return _impl_describe_package(name)
         except ValueError as exc:

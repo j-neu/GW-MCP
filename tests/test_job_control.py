@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 
 from groundwater_mcp.tools.builder import _impl_create_model
@@ -28,6 +29,7 @@ from groundwater_mcp.tools.runner import (
     _parse_mf6_lst_progress,
 )
 from groundwater_mcp.utils import jobs
+from groundwater_mcp.utils.workspace import resolve_workspace
 
 
 def _mf6_available() -> bool:
@@ -493,3 +495,146 @@ def test_start_calibration_rejects_unknown_method(tmp_path, monkeypatch):
     _impl_create_model(name, str(tmp_path / name), "METERS", "DAYS")
     with pytest.raises(ValueError, match="method"):
         cal._impl_start_calibration(name, "test.pst", method="sweep")
+
+
+def test_start_calibration_accepts_num_workers_and_reports_it(tmp_path, monkeypatch):
+    """`num_workers` is part of the run_pestpp_* signature; start_calibration
+    must accept it for parity and echo it (PEST++ has no local worker-count
+    option, so it must not silently imply parallel execution)."""
+    import groundwater_mcp.tools.calibration as cal
+
+    name = "cal_workers"
+    ws = tmp_path / name
+    _impl_create_model(name, str(ws), "METERS", "DAYS")
+    (ws / "test.pst").write_text("dummy pst\n")
+    (ws / "test.iobj").write_text(_BRABANT_IOBJ)
+
+    fake = _FakeProc(delay=0.4)
+    monkeypatch.setattr(cal, "_find_pestpp_binary", lambda _exe: "/fake/pestpp-glm")
+    monkeypatch.setattr(cal, "_run_process", lambda args, cwd: fake)
+
+    result = cal._impl_start_calibration(name, "test.pst", method="glm", num_workers=4)
+    assert result["num_workers"] == 4
+    assert "serial" in result["parallelism"].lower()
+
+    status = _poll(result["job_id"], timeout=10.0)
+    assert status["status"] == "succeeded"
+    assert status["result"]["num_workers"] == 4
+
+
+def test_start_calibration_rejects_num_workers_below_one(tmp_path):
+    import groundwater_mcp.tools.calibration as cal
+
+    name = "cal_workers_bad"
+    _impl_create_model(name, str(tmp_path / name), "METERS", "DAYS")
+    with pytest.raises(ValueError, match="num_workers"):
+        cal._impl_start_calibration(name, "test.pst", method="glm", num_workers=0)
+
+
+# ---------------------------------------------------------------------------
+# A3.1 — cancellation restores externalised calibration inputs
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_job_runs_on_cancel_hook():
+    calls: list[str] = []
+    proc = _FakeProc(delay=60.0)
+
+    def drain(job):
+        for _line in job.process.stdout:
+            pass
+        return {"returncode": job.process.wait()}
+
+    job = jobs.submit(
+        "test_model",
+        "unit",
+        target=drain,
+        process=proc,
+        on_cancel=lambda j: calls.append(j.job_id),
+    )
+    time.sleep(0.1)  # let the worker enter the process
+    jobs.cancel(job.job_id)
+    assert calls == [job.job_id], "on_cancel hook did not run exactly once"
+
+
+def test_on_cancel_hook_not_run_on_success():
+    calls: list[str] = []
+    job = jobs.submit(
+        "test_model",
+        "unit",
+        target=lambda _j: {"ok": True},
+        on_cancel=lambda j: calls.append(j.job_id),
+    )
+    _poll(job.job_id)
+    assert calls == [], "on_cancel must not run for a successful job"
+
+
+def _build_csub_model(tmp_path, name: str) -> str:
+    from groundwater_mcp.tools.builder import (
+        _impl_add_boundary_package,
+        _impl_add_csub_package,
+        _impl_add_dis_package,
+        _impl_add_ic_package,
+        _impl_add_npf_package,
+        _impl_add_oc_package,
+        _impl_add_sto_package,
+        _impl_set_simulation,
+    )
+
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "FEET", "DAYS")
+    _impl_set_simulation(name, 2, [365.0, 365.0], [1, 1], "simple")
+    _impl_add_dis_package(name, 2, 1, 1, 1.0, 1.0, 0.0, [-10.0, -20.0])
+    _impl_add_npf_package(name, icelltype=1, k=[1.0, 1.0], k33=[1.0, 1.0], save_flows=True)
+    _impl_add_ic_package(name, strt=[-1.0, -1.0])
+    _impl_add_sto_package(
+        name, iconvert=0, ss=1e-5, sy=0.2, steady_state=[0], save_flows=True
+    )
+    _impl_add_boundary_package(
+        name, "GHB", {0: [[(0, 0, 0), -1.0, 1.0], [(1, 0, 0), -1.0, 1.0]]}, None
+    )
+    records = [
+        [0, [0, 0, 0], "nodelay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+        [1, [1, 0, 0], "nodelay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+    ]
+    added = _impl_add_csub_package(
+        name,
+        packagedata=records,
+        sgm=[1.7, 1.7],
+        sgs=[2.0, 2.0],
+        cg_theta=[0.2, 0.2],
+        cg_ske_cr=[1e-5, 1e-5],
+    )
+    assert "error" not in added, added
+    _impl_add_oc_package(name, None, None, None, None)
+    return name
+
+
+def test_calibration_cancel_restores_externalised_csub_array(tmp_path, monkeypatch):
+    """A killed PEST++ can leave an OPEN/CLOSE substitute file missing, after
+    which the model cannot load ("Unable to open file ...csub_cg_theta.dat" —
+    6d Target 9 rerun-1). Cancelling must restore it from the base snapshot."""
+    import groundwater_mcp.tools.calibration as cal
+    from groundwater_mcp.utils import model_store
+
+    name = _build_csub_model(tmp_path, "cancel_csub")
+    ws = resolve_workspace(name)
+    base = cal._restore_or_snapshot_csub_array(name, "cg_theta")
+    ext = cal._impl_rewire_csub_array_external(name, "cg_theta")
+    target = ws / ext["external_file"]
+    assert target.exists()
+
+    (ws / "case.pst").write_text("dummy pst\n")
+    fake = _FakeProc(delay=60.0)
+    monkeypatch.setattr(cal, "_find_pestpp_binary", lambda _exe: "/fake/pestpp-glm")
+    monkeypatch.setattr(cal, "_run_process", lambda args, cwd: fake)
+
+    started = cal._impl_start_calibration(name, "case.pst", method="glm")
+    target.unlink()  # the killed forward run left the substitute file missing
+    time.sleep(0.1)
+    _impl_cancel_job(started["job_id"])
+
+    assert target.exists(), "cancel left the CSUB external array missing"
+    np.testing.assert_allclose(np.loadtxt(target), np.ravel(base))
+    model_store.invalidate(name)
+    assert model_store.get_sim(name) is not None

@@ -198,12 +198,12 @@ rerun loop **before that release ships**:
 - CSUB → `1DSubsidenceModeling-MF6CSUB` (capability landed 2026-09-19, 74 tools; 6d playbook Target 9; **rerun-1 GREEN-with-gaps 2026-09-20** — capability expressed MCP-only, not yet set-and-forget; awaiting rerun-2)
 - GWE / PRT / MODPATH / MT3D-USGS → examples in catalog extra-scope rows (added when the v0.3.0 plan is written)
 
-**Target 9 findings (v0.3.0 backlog — filed from the 2026-09-20 CSUB rerun-1):**
+**Target 9 findings (v0.3.0 backlog — filed from the 2026-09-20 CSUB rerun-1; timeout/robustness cluster + `describe_package` fixed 2026-09-20):**
 
-- [ ] `describe_package`: add CSUB to the known-package map (`tools/docs.py:416-423` lists CHD/WEL/RIV/…/SFR only), so CSUB options can be looked up (the rerun-1 agent could not, and consequently missed the existing `beta`/`gammaw` arguments)
-- [ ] Client timeouts: `check_model` (3/3 on a 2-cell model) and blocking `run_simulation`/`run_pestpp_ies` exceed the MCP client timeout even though MF6 runs in 0.16 s — raise the timeout, make these background-first, or give `check_model` a job-based path
-- [ ] `start_calibration`: expose `num_workers` (serial IES was ~100 s/realisation and stalled at 50 reals; only the blocking `run_pestpp_ies` reaches the fast path)
-- [ ] Calibration cancel: restore the pre-`setup_calibration` package state (or keep the rewired bare arrays alive) — `cancel_job` leaves the model unloadable with `Unable to open file ... csub_cg_theta.dat`
+- [x] `describe_package`: CSUB added to the known-package map; each block now reports its dataset (keyword) names (so `beta`/`gammaw` are discoverable) and CSUB returns its interbed `packagedata` fields. CSUB's `blocks` is a dict (not a list) and needs `ninterbeds=1` to materialise its packagedata.
+- [x] Client timeouts: root-caused as FloPy's `_check_oc` — it re-materialises `stress_period_data.data` twice per stress period (O(nper²): 158 GHB periods ≈ 62 s) and calls `.data.keys()` on CSUB, which reports `has_stress_period_data` but has no records (`AttributeError`). Both fixed in `_impl_check_model` by memoising the list `.data` property (None→`{}`) for the duration of `sim.check()`. The real `h201csub` model went from 65.4 s + crash to **1.4 s, `check_passed: true`**. The blocking `run_simulation`/`run_pestpp_*` tools already have background equivalents (`start_run`/`start_calibration`); guidance updated.
+- [x] `start_calibration`: `num_workers` added for parity. Note PEST++ 5.x has **no** local worker-count option (users manual §5.3.5 — parallelism needs PANTHER agents or an external run manager), and the blocking `run_pestpp_*` tools never applied it either; the rerun-1 "fast path" was `num_reals=8`, not workers. It is now echoed as advisory (`num_workers`/`parallelism`) instead of silently implying parallel execution.
+- [x] Calibration cancel: `jobs.submit`/`cancel` gained an `on_cancel` hook; `start_calibration` restores the externalised inputs (`<gwf>_k(.dat)`, `<gwf>_k33.dat`, `<gwf>.csub_<keyword>.dat`, `<gwf>.csub_packagedata.dat`) from their base snapshots after the process tree is killed, so `cancel_job` can no longer leave the model unloadable.
 - [ ] Derived observations: exact-date matching used only 17/208 measured points — add tolerance/nearest matching or an explicit observed→simulated date map
 - [ ] `add_oc_package`: expose `budgetcsv_filerecord`; `set_simulation`: expose the remaining IMS controls (`inner_maximum`, `outer_dvclose`, `inner_dvclose`, `relaxation_factor`)
 

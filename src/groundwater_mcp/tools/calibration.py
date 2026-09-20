@@ -44,6 +44,19 @@ def _err(code: str, message: str, suggestion: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 
+# PEST++ 5.x parallelises forward runs through its PANTHER manager/agent (or an
+# external run manager); the control file has no local worker-count option
+# (PEST++ users manual §5.3.5). ``num_workers`` is therefore advisory: it is
+# accepted for signature parity with run_pestpp_* and echoed back so callers are
+# not misled into thinking a value > 1 parallelised the run (6d Target 9
+# rerun-1: the agent assumed num_workers=8 was the "fast path").
+_PARALLELISM_NOTE = (
+    "Serial run manager: forward runs execute one at a time. PEST++ has no "
+    "local worker-count option — set up PANTHER agents (or an external run "
+    "manager) for parallel runs. num_workers is advisory only."
+)
+
+
 def _find_pestpp_binary(exe_name: str) -> str:
     """Locate a PEST++ executable on the system.
 
@@ -473,11 +486,89 @@ def _run_process(args: list[str], cwd: str):
     )
 
 
+def _workspace_gwf_name(model: str, ws: Path) -> str:
+    """Best-effort GWF model name without requiring the sim to load.
+
+    An ``on_cancel`` restore runs precisely when an externalised input file may
+    be missing, so loading the simulation can fail. Fall back to the model
+    ``.nam`` file when ``get_gwf`` cannot load the model.
+    """
+    try:
+        return get_gwf(model).name
+    except Exception:
+        names = sorted(p.stem for p in ws.glob("*.nam") if p.stem.lower() != "mfsim")
+        if not names:
+            raise ValueError(
+                f"Cannot determine the GWF model name for '{model}' in {ws}."
+            ) from None
+        return names[0]
+
+
+def _restore_calibration_inputs(model: str) -> dict:
+    """Rewrite the externalised calibration inputs from their base snapshots.
+
+    ``setup_calibration`` rewires NPF ``k``/``k33`` and the CSUB per-layer
+    arrays (plus the CSUB packagedata) to ``OPEN/CLOSE`` files that PEST++
+    rewrites on every forward run. If a calibration job is killed mid-run those
+    substitute files can be left missing or truncated, and the next model load
+    fails with e.g. ``Unable to open file ...csub_cg_theta.dat`` — leaving the
+    model unusable until the CSUB package is re-added (6d Target 9 rerun-1).
+
+    Restoring each file from the base-value snapshot taken at setup time makes
+    cancellation leave a loadable workspace. Files without a snapshot are left
+    untouched, and the function never loads the simulation, so it works even
+    when a missing substitute file is what broke the load.
+
+    Returns ``{model, restored}`` where ``restored`` lists the files rewritten.
+    """
+    ws = resolve_workspace(model)
+    try:
+        name = _workspace_gwf_name(model, ws)
+    except ValueError:
+        return {"model": model, "restored": []}
+    restored: list[str] = []
+
+    def _restore_array(pristine: Path, target: Path) -> None:
+        if not pristine.exists():
+            return
+        values = np.atleast_1d(np.load(pristine))
+        # MODFLOW array files are one row (NCOL values) per line; a 1-D
+        # per-layer array is one value per line.
+        rows = (
+            values.reshape(-1, values.shape[-1])
+            if values.ndim >= 2
+            else values.reshape(-1, 1)
+        )
+        np.savetxt(target, rows, fmt="%15.8f")
+        restored.append(target.name)
+
+    _restore_array(ws / f"{name}_k_pristine.npy", ws / f"{name}_k.dat")
+    _restore_array(ws / f"{name}_k33_pristine.npy", ws / f"{name}_k33.dat")
+    _restore_array(
+        ws / f"{name}_csub_cg_theta_pristine.npy", ws / f"{name}.csub_cg_theta.dat"
+    )
+    _restore_array(
+        ws / f"{name}_csub_cg_ske_cr_pristine.npy", ws / f"{name}.csub_cg_ske_cr.dat"
+    )
+
+    packagedata_name = (
+        (read_meta(model).get("csub") or {}).get("packagedata_filename")
+        or f"{name}.csub_packagedata.dat"
+    )
+    pristine_packagedata = ws / f"{name}.csub_packagedata_pristine.dat"
+    if pristine_packagedata.exists():
+        shutil.copyfile(pristine_packagedata, ws / packagedata_name)
+        restored.append(Path(packagedata_name).name)
+
+    return {"model": model, "restored": restored}
+
+
 def _impl_start_calibration(
     model: str,
     pst_file: str,
     method: str = "glm",
     num_reals: int | None = None,
+    num_workers: int = 1,
 ) -> dict:
     """Start a PEST++ calibration in the background and return a job id (7e-A3).
 
@@ -495,9 +586,16 @@ def _impl_start_calibration(
     ``da_num_reals`` is the prior CSV's row count) is not silently resized —
     the same preserve-when-unset semantics as ``run_pestpp_da`` /
     ``run_pestpp_ies``. ``noptmax`` remains the DA per-cycle update count.
+
+    ``num_workers`` mirrors the ``run_pestpp_*`` signature. It is **advisory**:
+    PEST++ has no local worker-count option (parallel forward runs need a
+    PANTHER manager/agent or an external run manager), so it is echoed back
+    rather than applied. See :data:`_PARALLELISM_NOTE`.
     """
     if method not in ("glm", "ies", "da"):
         raise ValueError(f"method must be 'glm', 'ies' or 'da', got '{method}'.")
+    if int(num_workers) < 1:
+        raise ValueError(f"num_workers must be >= 1, got {num_workers}.")
     ws = resolve_workspace(model)
     pst_path = _resolve_pst_path(model, pst_file)
     base_name = pst_path.stem
@@ -537,6 +635,8 @@ def _impl_start_calibration(
                 "converged": returncode == 0,
                 "final_phi": final_phi,
                 "iterations": len(phi_progress),
+                "num_workers": int(num_workers),
+                "parallelism": _PARALLELISM_NOTE,
                 "stdout": "".join(lines)[-3000:],
             }
         if method == "da":
@@ -551,6 +651,8 @@ def _impl_start_calibration(
                 "cycles": len(cycles),
                 "num_reals": effective_reals,
                 "noptmax": noptmax,
+                "num_workers": int(num_workers),
+                "parallelism": _PARALLELISM_NOTE,
                 "stdout": "".join(lines)[-3000:],
                 "stderr": "",
             }
@@ -573,6 +675,8 @@ def _impl_start_calibration(
             "final_phi_std": final_phi_std,
             "iterations": iterations,
             "num_reals": effective_reals,
+            "num_workers": int(num_workers),
+            "parallelism": _PARALLELISM_NOTE,
             "stdout": "".join(lines)[-3000:],
         }
 
@@ -582,6 +686,7 @@ def _impl_start_calibration(
         _worker,
         process=proc,
         progress_fn=lambda _j: _pestpp_progress(ws, base_name, method),
+        on_cancel=lambda _job: _restore_calibration_inputs(model),
     )
     return {
         "model": model,
@@ -589,6 +694,8 @@ def _impl_start_calibration(
         "kind": method,
         "pst_file": str(pst_path),
         "status": "running",
+        "num_workers": int(num_workers),
+        "parallelism": _PARALLELISM_NOTE,
         "note": "Poll progress with get_job_status; stop with cancel_job.",
     }
 
@@ -4772,8 +4879,10 @@ def _impl_run_pestpp_glm(
     pst_file:
         Path to the PST control file (absolute or relative to workspace).
     num_workers:
-        Number of parallel workers.  Values > 1 are noted in the return dict;
-        parallel execution (PANTHER) is not managed automatically.
+        Accepted for API parity and echoed in the return dict, but advisory:
+        PEST++ has no local worker-count option, so forward runs are serial
+        unless PANTHER agents (or an external run manager) are used. See
+        :data:`_PARALLELISM_NOTE`.
     """
     exe = _find_pestpp_binary("pestpp-glm")
     ws = resolve_workspace(model)
@@ -4804,6 +4913,8 @@ def _impl_run_pestpp_glm(
         "converged": converged,
         "final_phi": final_phi,
         "iterations": iterations,
+        "num_workers": int(num_workers),
+        "parallelism": _PARALLELISM_NOTE,
         "stdout": result.stdout[-3000:] if result.stdout else "",
         "stderr": result.stderr[-1000:] if result.stderr else "",
     }
@@ -4840,7 +4951,8 @@ def _impl_run_pestpp_da(
         Ensemble size, written to ``da_num_reals``. ``None`` leaves the PST's
         existing ``da_num_reals`` unchanged.
     num_workers:
-        Number of parallel workers (see run_pestpp_glm note on parallelism).
+        Accepted for API parity and echoed in the return dict, but advisory
+        (see run_pestpp_glm note on parallelism).
     da_options:
         Extra ``++`` options written into the PST. PEST++-DA recognises the
         cycle options ``da_observation_cycle_table``,
@@ -4910,6 +5022,8 @@ def _impl_run_pestpp_da(
         "cycles": cycles,
         "num_reals": effective_reals,
         "noptmax": int(pst.control_data.noptmax),
+        "num_workers": int(num_workers),
+        "parallelism": _PARALLELISM_NOTE,
         "stdout": result.stdout[-3000:] if result.stdout else "",
         "stderr": result.stderr[-1000:] if result.stderr else "",
     }
@@ -4932,7 +5046,8 @@ def _impl_run_pestpp_ies(
     num_reals:
         Number of realisations in the ensemble.
     num_workers:
-        Number of parallel workers (see run_pestpp_glm note on parallelism).
+        Accepted for API parity and echoed in the return dict, but advisory
+        (see run_pestpp_glm note on parallelism).
     """
     exe = _find_pestpp_binary("pestpp-ies")
     ws = resolve_workspace(model)
@@ -4987,6 +5102,8 @@ def _impl_run_pestpp_ies(
         "final_phi_std": final_phi_std,
         "iterations": iterations,
         "num_reals": num_reals,
+        "num_workers": int(num_workers),
+        "parallelism": _PARALLELISM_NOTE,
         "stdout": result.stdout[-3000:] if result.stdout else "",
         "stderr": result.stderr[-1000:] if result.stderr else "",
     }
@@ -5616,6 +5733,7 @@ def register(mcp: FastMCP) -> None:
         pst_file: str,
         method: str = "glm",
         num_reals: int | None = None,
+        num_workers: int = 1,
     ) -> dict:
         """Start PEST++ calibration (GLM, IES or DA) in the background and
         return a job id immediately (7e-A3).
@@ -5627,6 +5745,9 @@ def register(mcp: FastMCP) -> None:
         num_reals is omitted the PST's own ``ies_num_reals`` / ``da_num_reals``
         is preserved, so a ``setup_da_control(num_reals=N)`` PST (its
         ``da_num_reals`` is the prior CSV's row count) is not silently resized.
+        num_workers is accepted for parity with run_pestpp_* but is advisory:
+        PEST++ has no local worker-count option, so forward runs stay serial
+        unless PANTHER agents (or an external run manager) are used.
         The calibration runs in a worker thread instead of blocking until the
         client timeout. Poll progress and the final result with
         get_job_status(job_id) — while running it reports live iteration + phi
@@ -5635,7 +5756,9 @@ def register(mcp: FastMCP) -> None:
         stop it with cancel_job(job_id). The finished job's result matches
         run_pestpp_glm / run_pestpp_ies / run_pestpp_da."""
         try:
-            return _impl_start_calibration(model, pst_file, method, num_reals)
+            return _impl_start_calibration(
+                model, pst_file, method, num_reals, num_workers
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:

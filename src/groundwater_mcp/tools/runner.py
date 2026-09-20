@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -294,6 +295,70 @@ def _impl_cancel_job(job_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _fast_stress_period_data(sim):
+    """Make FloPy's ``sim.check`` cheap and CSUB-safe.
+
+    FloPy's ``_check_oc`` re-materialises ``stress_period_data.data`` (the whole
+    pandas-backed list converted to a recarray) twice per stress period, so a
+    period-rich boundary package makes ``check`` O(nper^2): 158 GHB periods took
+    ~62 s of a 65 s check on the 6d Target 9 model and exceeded the MCP client
+    timeout. The same method calls ``spd.data.keys()`` on any package that
+    reports ``has_stress_period_data`` but holds no records (CSUB), raising
+    ``AttributeError: 'NoneType' object has no attribute 'keys'``.
+
+    For the duration of the check, memoise each stress-period list's ``data``
+    property per instance and present ``None`` as an empty mapping, then restore
+    the original property. The workaround touches only the list ``data``
+    property on the classes actually used by this simulation.
+    """
+    list_classes: set[type] = set()
+    for mname in list(sim.model_names):
+        try:
+            model = sim.get_model(mname)
+            package_names = list(model.get_package_list())
+        except Exception:
+            continue
+        for pname in package_names:
+            try:
+                pkg = model.get_package(pname)
+            except Exception:
+                continue
+            spd = getattr(pkg, "stress_period_data", None)
+            if spd is not None:
+                list_classes.add(type(spd))
+
+    # ``data`` may be defined on a base class; patch the defining class so the
+    # temporary property is what every instance resolves.
+    owners: dict[type, property] = {}
+    for cls in list_classes:
+        for base in cls.__mro__:
+            prop = base.__dict__.get("data")
+            if isinstance(prop, property):
+                owners[base] = prop
+                break
+
+    cache: dict[int, object] = {}
+
+    def _getter(original: property):
+        def _cached(self):
+            key = id(self)
+            if key not in cache:
+                value = original.fget(self)
+                cache[key] = {} if value is None else value
+            return cache[key]
+
+        return _cached
+
+    try:
+        for owner, prop in owners.items():
+            owner.data = property(_getter(prop))
+        yield
+    finally:
+        for owner, prop in owners.items():
+            owner.data = prop
+
+
 def _impl_check_model(model: str) -> dict:
     """Run FloPy's model checker and return structured warnings and errors."""
     # Flush staged changes so the check validates the on-disk state that a run
@@ -306,7 +371,8 @@ def _impl_check_model(model: str) -> dict:
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout = sys.stderr = buf
     try:
-        check_results = sim.check(verbose=True, level=1)
+        with _fast_stress_period_data(sim):
+            check_results = sim.check(verbose=True, level=1)
     finally:
         sys.stdout, sys.stderr = old_stdout, old_stderr
     captured = buf.getvalue()

@@ -212,6 +212,70 @@ def test_check_model_clean_with_sto(tmp_path, model_name):
     assert all("STO" not in w.get("package", "").upper() for w in result["warnings"])
 
 
+def _build_period_rich_csub(tmp_path, name: str, nper: int) -> str:
+    """A 1x1x2 CSUB column with *nper* GHB stress periods.
+
+    CSUB is the case flopy's checker mishandles (``has_stress_period_data`` but
+    no records), and a period-rich GHB makes flopy re-materialise its plist
+    once per period — the two causes of the 6d Target 9 rerun-1 failure.
+    """
+    from groundwater_mcp.tools.builder import _impl_add_csub_package
+
+    ws = str(tmp_path / name)
+    _impl_create_model(name, ws, "FEET", "DAYS")
+    _impl_set_simulation(name, nper, [365.0] * nper, [1] * nper, "simple")
+    _impl_add_dis_package(name, 2, 1, 1, 1.0, 1.0, 0.0, [-10.0, -20.0])
+    _impl_add_npf_package(name, icelltype=1, k=[1.0, 1.0], k33=[1.0, 1.0], save_flows=True)
+    _impl_add_ic_package(name, strt=[-1.0, -1.0])
+    _impl_add_sto_package(
+        name, iconvert=0, ss=1e-5, sy=0.2, steady_state=[0], save_flows=True
+    )
+    ghb = {
+        per: [[(0, 0, 0), -1.0 - per, 1.0], [(1, 0, 0), -1.0 - per, 1.0]]
+        for per in range(nper)
+    }
+    _impl_add_boundary_package(name, "GHB", ghb, None)
+    records = [
+        [0, [0, 0, 0], "nodelay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+        [1, [1, 0, 0], "nodelay", 0.0, 0.5, 1.0, 1e-5, 1e-6, 0.2, 1e-6, -1.0],
+    ]
+    added = _impl_add_csub_package(
+        name,
+        packagedata=records,
+        sgm=[1.7, 1.7],
+        sgs=[2.0, 2.0],
+        cg_theta=[0.2, 0.2],
+        cg_ske_cr=[1e-5, 1e-5],
+    )
+    assert "error" not in added, added
+    _impl_add_oc_package(name, None, None, None, None)
+    return name
+
+
+def test_check_model_with_csub_does_not_crash(tmp_path):
+    """Regression: flopy's ``_check_oc`` assumed every package with
+    ``has_stress_period_data`` had a populated ``stress_period_data.data`` and
+    raised AttributeError on CSUB (6d Target 9 rerun-1)."""
+    name = _build_period_rich_csub(tmp_path, "csub_check", nper=3)
+    result = _impl_check_model(name)
+    assert "error" not in result, result
+    assert result["check_passed"] is True, result
+
+
+def test_check_model_period_rich_is_not_quadratic(tmp_path):
+    """Regression: flopy re-materialises a boundary plist once per stress
+    period (O(nper^2)); 158 periods took ~65 s and timed out the client. The
+    check must stay interactive."""
+    import time
+
+    name = _build_period_rich_csub(tmp_path, "csub_check_many", nper=160)
+    t0 = time.perf_counter()
+    result = _impl_check_model(name)
+    elapsed = time.perf_counter() - t0
+    assert "error" not in result, result
+    assert elapsed < 20.0, f"check_model took {elapsed:.1f}s (O(nper^2) regression)"
+
+
 def test_run_simulation_warns_transient_without_sto(runnable_model, monkeypatch):
     """run_simulation returns a warning field when the trap fires (no binary needed)."""
     import groundwater_mcp.tools.runner as runner_module
