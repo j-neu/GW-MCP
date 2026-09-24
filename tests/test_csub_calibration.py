@@ -152,6 +152,7 @@ def _register_subsidence_obs(
     values=None,
     sim_times=None,
     sim_csv=None,
+    **register_kwargs,
 ):
     """Register a derived subsidence target and fake the CSUB obs CSV (Task 8).
 
@@ -178,6 +179,7 @@ def _register_subsidence_obs(
         str(obs_csv),
         time_col="Date",
         value_col="Subsidence_ft",
+        **register_kwargs,
     )
     assert "error" not in res, res
 
@@ -1046,6 +1048,120 @@ def test_derived_observation_plan_defers_without_sim_csv(tmp_path):
     assert group["deferred"] is True
     assert group["dates"] == ["1904-01-01", "1905-01-01"]
     assert group["skipped"] == []
+
+
+def test_derived_observation_plan_nearest_matching_default(tmp_path):
+    """Non-coincident observed dates snap to the nearest simulated time.
+
+    6d Target 9 rerun-7: the raw dated survey matched 0/208 simulated dates and
+    forced a resampling workaround; nearest matching inside one output interval
+    removes that reprompt.
+    """
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(
+        tmp_path,
+        name,
+        dates=["1904-03-01", "1905-03-01"],
+        values=[0.1, 0.4],
+        sim_times=[0.0, 365.0],  # -> 1904-01-01 and 1905-01-01
+    )
+
+    group = _derived_observation_plan(name)[0]
+    assert group["skipped"] == []
+    assert group["match"] == "nearest"
+    assert group["dates"] == ["1904-03-01", "1905-03-01"]
+    # 1904 is a leap year, so elapsed day 365 is 1904-12-31.
+    assert group["keys"] == ["1904-01-01", "1904-12-31"]
+    assert group["match_days"] == [60.0, 60.0]
+    assert group["tokens"] == ["subsidence_1", "subsidence_2"]
+
+
+def test_derived_observation_plan_exact_matching_skips_coincidence_gaps(tmp_path):
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(
+        tmp_path,
+        name,
+        dates=["1904-03-01", "1905-03-01"],
+        values=[0.1, 0.4],
+        sim_times=[0.0, 365.0],
+        match="exact",
+    )
+    group = _derived_observation_plan(name)[0]
+    assert group["dates"] == []
+    assert group["skipped"] == ["1904-03-01", "1905-03-01"]
+    assert group["tokens"] == []
+
+
+def test_derived_observation_plan_tolerance_bounds_the_snap(tmp_path):
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(
+        tmp_path,
+        name,
+        dates=["1904-03-01", "1905-03-01"],
+        values=[0.1, 0.4],
+        sim_times=[0.0, 365.0],
+        tolerance_days=30,
+    )
+    group = _derived_observation_plan(name)[0]
+    assert group["dates"] == []
+    assert group["skipped"] == ["1904-03-01", "1905-03-01"]
+
+
+def test_derived_observation_plan_explicit_date_map_wins(tmp_path):
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(
+        tmp_path,
+        name,
+        dates=["1904-03-01", "1905-03-01"],
+        values=[0.1, 0.4],
+        sim_times=[0.0, 365.0],
+        date_map={"1904-03-01": "1904-12-31"},
+    )
+    group = _derived_observation_plan(name)[0]
+    assert group["keys"][0] == "1904-12-31"
+    assert group["keys"][1] == "1904-12-31"
+
+
+def test_import_subsidence_observations_rejects_unknown_match(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_subsidence_observations
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    obs = resolve_workspace(name) / "obs.csv"
+    obs.write_text("Date,Subsidence_ft\n1904-01-01,0.0\n")
+    res = _impl_import_subsidence_observations(
+        name, str(obs), time_col="Date", match="fuzzy"
+    )
+    assert res["code"] == "INVALID_INPUT"
+
+
+def test_derived_wrapper_source_carries_resolved_keys_and_matcher(tmp_path):
+    from groundwater_mcp.tools.calibration import _derived_wrapper_source
+
+    name = _csub_model(tmp_path, nlay=1)
+    _install_csub(tmp_path, name)
+    _register_subsidence_obs(
+        tmp_path,
+        name,
+        dates=["1904-03-01", "1905-03-01"],
+        values=[0.1, 0.4],
+        sim_times=[0.0, 365.0],
+    )
+    _, step = _derived_wrapper_source(name)
+    assert "def _match_key(" in step
+    assert "'keys': ['1904-01-01', '1904-12-31']" in step
 
 
 def test_setup_calibration_derived_obs_builds_pif(tmp_path):

@@ -1803,6 +1803,9 @@ def _impl_import_subsidence_observations(
     value_col: str = "Subsidence_ft",
     sim_source: dict | None = None,
     name: str = "subsidence",
+    match: str = "nearest",
+    tolerance_days: float | None = None,
+    date_map: dict | None = None,
 ) -> dict:
     """Register a derived time-series subsidence observation target.
 
@@ -1813,6 +1816,16 @@ def _impl_import_subsidence_observations(
     the time column to match on (``time_col``). No model files change now —
     Task 8's generated forward wrapper materialises the derived series at run
     time.
+
+    ``match`` picks how observed dates bind to simulated times: ``"nearest"``
+    (default) snaps each observed date to the closest simulated time — within a
+    tolerance — so a dated survey that never lands on a stress-period end still
+    calibrates; ``"exact"`` keeps only coincident dates. ``tolerance_days``
+    caps the snap distance (``None`` = one median output interval, 0 for a
+    single simulated time). ``date_map`` (observed -> simulated) overrides the
+    automatic match for individual dates. (6d Target 9 rerun-7: the raw dated
+    survey matched 0/208 simulated dates under exact matching and forced a
+    resampling workaround.)
 
     ``time_col`` falls back to the first CSV column when it is not present in
     the header, so the holdout's unnamed index (time) column works. Dates are
@@ -1826,6 +1839,32 @@ def _impl_import_subsidence_observations(
 
     gwf = get_gwf(model)
     ws = resolve_workspace(model)
+
+    match_mode = str(match).strip().lower()
+    if match_mode not in ("exact", "nearest"):
+        return _err(
+            "INVALID_INPUT",
+            f"match must be 'exact' or 'nearest', got '{match}'.",
+            "Use match='exact' for coincident dates only, or the default "
+            "'nearest' to snap each observed date to the closest simulated time.",
+        )
+    tolerance_value: float | None = None
+    if tolerance_days is not None:
+        try:
+            tolerance_value = float(tolerance_days)
+        except (TypeError, ValueError):
+            return _err(
+                "INVALID_INPUT",
+                f"tolerance_days must be numeric, got {tolerance_days!r}.",
+                "Pass a number of days (model time units) or omit it.",
+            )
+        if tolerance_value < 0:
+            return _err(
+                "INVALID_INPUT",
+                "tolerance_days must be >= 0.",
+                "Pass a non-negative number of days, or omit it.",
+            )
+    resolved_map = {str(k): str(v) for k, v in (date_map or {}).items()}
 
     p = Path(observed_csv)
     cand = p if p.is_absolute() else ws / p
@@ -1941,6 +1980,9 @@ def _impl_import_subsidence_observations(
         "values": values,
         "dates": dates,
         "sim_source": resolved_sim,
+        "match": match_mode,
+        "tolerance_days": tolerance_value,
+        "date_map": resolved_map,
     }
     meta.setdefault("provenance", {})[f"derived_observations.{safe_name}"] = {
         "source": str(cand),
@@ -1956,6 +1998,9 @@ def _impl_import_subsidence_observations(
         "value_col": resolved_value,
         "n_observations": len(values),
         "sim_source": dict(resolved_sim),
+        "match": match_mode,
+        "tolerance_days": tolerance_value,
+        "date_map": resolved_map,
         "written": written,
     }
 
@@ -2370,6 +2415,9 @@ def register(mcp) -> None:
         value_col: str = "Subsidence_ft",
         sim_source: dict | None = None,
         name: str = "subsidence",
+        match: str = "nearest",
+        tolerance_days: float | None = None,
+        date_map: dict | None = None,
     ) -> dict:
         """Register a derived time-series subsidence observation target.
 
@@ -2381,6 +2429,15 @@ def register(mcp) -> None:
         build a compaction-summed ``<gwf>_subsidence.csv`` before PEST++ reads
         it (``setup_calibration(obs_source="derived")``).
 
+        ``match`` binds observed dates to simulated times: ``"nearest"``
+        (default) snaps each observed date to the closest simulated time within
+        a tolerance, so a dated survey need not land on a stress-period end;
+        ``"exact"`` keeps only coincident dates. ``tolerance_days`` caps the
+        snap (None = one median output interval, 0 for a single simulated
+        time); ``date_map`` maps individual observed dates to simulated dates
+        explicitly. ``setup_calibration`` reports matched/skipped counts and the
+        largest snap distance per group.
+
         ``sim_source`` defaults to the model's CSUB observation CSV
         (``meta["csub"]["obs_output_csv"]``, else ``<gwf>.csub.obs.csv``), the
         layer compaction columns (``sum_cols=["compaction"]``) and
@@ -2388,11 +2445,20 @@ def register(mcp) -> None:
         sorted ascending; rows with a non-finite value are dropped. ``time_col``
         falls back to the first CSV column when it is not named in the header,
         so an unnamed date index (the holdout layout) works. A missing file, no
-        usable value column, or no finite rows returns ``INVALID_INPUT``.
+        usable value column, no finite rows, or an unknown ``match`` returns
+        ``INVALID_INPUT``.
         """
         try:
             return _impl_import_subsidence_observations(
-                model, observed_csv, time_col, value_col, sim_source, name
+                model,
+                observed_csv,
+                time_col,
+                value_col,
+                sim_source,
+                name,
+                match,
+                tolerance_days,
+                date_map,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

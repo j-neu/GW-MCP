@@ -700,6 +700,68 @@ def test_plot_subsidence_respects_output_file_name(tmp_path):
     assert out.exists()
 
 
+def test_observed_subsidence_series_maps_dates_to_model_time(tmp_path):
+    """Dated observations must land on the model time axis, not the row index.
+
+    6d Target 9 rerun-7 finding: with a date time-column the overlay fell back
+    to ``x = 0..N-1``, so it collapsed into the corner of a 0–57346-day axis.
+    """
+    from groundwater_mcp.tools.postprocess import _observed_subsidence_series
+
+    obs = tmp_path / "observed_dates.csv"
+    obs.write_text("datetime,Subsidence_ft\n2000-01-01,0.0\n2001-01-01,0.6\n2000-07-01,0.3\n")
+    x, y, axis = _observed_subsidence_series(
+        obs, start_date_time="2000-01-01", time_units="DAYS"
+    )
+    assert axis == "model-time"
+    assert x == [0.0, 366.0, 182.0]  # 2000 is a leap year
+    assert y == [0.0, 0.6, 0.3]
+
+
+def test_observed_subsidence_series_numeric_time_unchanged(tmp_path):
+    """A numeric time column is already model time and is used verbatim."""
+    from groundwater_mcp.tools.postprocess import _observed_subsidence_series
+
+    obs = tmp_path / "observed.csv"
+    obs.write_text("time,Subsidence_ft\n0.0,0.0\n366.0,0.6\n")
+    x, y, axis = _observed_subsidence_series(
+        obs, start_date_time="2000-01-01", time_units="DAYS"
+    )
+    assert axis == "model-time"
+    assert x == [0.0, 366.0]
+    assert y == [0.0, 0.6]
+
+
+def test_plot_subsidence_dated_observed_lands_on_model_axis(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_set_simulation
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    _impl_set_simulation(
+        name, 2, [366.0, 366.0], [1, 1], "simple", start_date_time="2000-01-01"
+    )
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n366.0,0.5\n")
+    obs = resolve_workspace(name) / "observed_dates.csv"
+    obs.write_text("datetime,Subsidence_ft\n2000-01-01,0.0\n2001-01-01,0.6\n")
+    res = _impl_plot_subsidence(name, observed_csv=str(obs))
+    assert "error" not in res, res
+    assert res["observed_axis"] == "model-time"
+
+
+def test_plot_subsidence_numeric_observed_axis_is_model_time(tmp_path):
+    from groundwater_mcp.tools.postprocess import _impl_plot_subsidence
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    name = _csub_model(tmp_path, nlay=1)
+    _write_csub_obs(tmp_path, name, "time,COMPACTION.01\n0.0,0.0\n366.0,0.5\n")
+    obs = resolve_workspace(name) / "observed.csv"
+    obs.write_text("time,Subsidence_ft\n0.0,0.0\n366.0,0.6\n")
+    res = _impl_plot_subsidence(name, observed_csv=str(obs))
+    assert "error" not in res, res
+    assert res["observed_axis"] == "model-time"
+
+
 # ---------------------------------------------------------------------------
 # import_subsidence_observations
 # ---------------------------------------------------------------------------

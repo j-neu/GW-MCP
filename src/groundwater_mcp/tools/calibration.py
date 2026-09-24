@@ -2082,6 +2082,99 @@ def _derived_time_key(
     return "num:" + canonical
 
 
+def _key_distance_days(iso_a, iso_b) -> float | None:
+    """Absolute day distance between two ISO date keys (None if not dates)."""
+    try:
+        a = datetime.date.fromisoformat(str(iso_a))
+        b = datetime.date.fromisoformat(str(iso_b))
+    except (TypeError, ValueError):
+        return None
+    return float(abs((a - b).days))
+
+
+def _default_tolerance_days(series) -> float:
+    """Default snap tolerance: one median output interval, in days.
+
+    With a single simulated time there is no interval, so the tolerance is 0 —
+    an observation only matches the one simulated time when it falls on that
+    date exactly (never extrapolate a lone run's value onto another year).
+    """
+    dates = sorted(
+        d
+        for d in (
+            _safe_iso_date(key) for key in series
+        )
+        if d is not None
+    )
+    gaps = sorted((b - a).days for a, b in zip(dates, dates[1:]) if (b - a).days > 0)
+    if not gaps:
+        return 0.0
+    return float(gaps[len(gaps) // 2])
+
+
+def _safe_iso_date(value):
+    try:
+        return datetime.date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_derived_key(
+    observed,
+    series,
+    *,
+    match: str = "nearest",
+    tolerance_days: float | None = None,
+    date_map: dict | None = None,
+    start_date_time=None,
+    time_units: str = "DAYS",
+) -> tuple[str | None, float | None]:
+    """Resolve an observed date to a simulated-series key.
+
+    Returns ``(key, distance_days)``. ``date_map`` (observed -> simulated) takes
+    precedence; then an exact key wins; with ``match="nearest"`` the closest
+    simulated date is used when within ``tolerance_days`` (``None`` = one median
+    output interval via :func:`_default_tolerance_days`). Unresolvable dates
+    return ``(None, None)``.
+    """
+    observed_iso = _derived_time_key(observed)
+    if observed_iso is None or observed_iso.startswith(("num:", "str:")):
+        return None, None
+
+    if date_map:
+        for src, dst in date_map.items():
+            if _derived_time_key(src) != observed_iso:
+                continue
+            wanted = _derived_time_key(
+                dst, start_date_time=start_date_time, time_units=time_units
+            )
+            if wanted in series:
+                return wanted, _key_distance_days(observed_iso, wanted)
+            return None, None
+
+    if observed_iso in series:
+        return observed_iso, 0.0
+    if str(match).strip().lower() != "nearest":
+        return None, None
+
+    best_key: str | None = None
+    best_days: float | None = None
+    for key in series:
+        days = _key_distance_days(observed_iso, key)
+        if days is None:
+            continue
+        if best_days is None or days < best_days:
+            best_key, best_days = key, days
+    if best_key is None or best_days is None:
+        return None, None
+    limit = (
+        _default_tolerance_days(series) if tolerance_days is None else float(tolerance_days)
+    )
+    if best_days > limit:
+        return None, None
+    return best_key, best_days
+
+
 
 def _derived_sum_columns(columns, sum_cols) -> list:
     """Columns summed into the derived subsidence series (prefix selectors).
@@ -2226,6 +2319,9 @@ def _derived_observation_plan(model: str) -> list[dict]:
             sum_cols = [sum_cols]
         dates = [str(d) for d in (block.get("dates") or [])]
         values = [float(v) for v in (block.get("values") or [])]
+        match_mode = str(block.get("match") or "nearest").strip().lower()
+        tolerance_days = block.get("tolerance_days")
+        date_map = dict(block.get("date_map") or {})
         built = _derived_sim_series(
             ws,
             sim_csv,
@@ -2238,14 +2334,32 @@ def _derived_observation_plan(model: str) -> list[dict]:
         series, time_map = ({}, {}) if built is None else built
         kept_dates: list[str] = []
         kept_values: list[float] = []
+        kept_keys: list[str | None] = []
+        match_days: list[float | None] = []
         skipped: list[str] = []
         for date, value in zip(dates, values):
-            key = _derived_time_key(date)
-            if deferred or (key is not None and key in series):
+            if deferred:
                 kept_dates.append(date)
                 kept_values.append(value)
-            else:
+                kept_keys.append(None)
+                match_days.append(None)
+                continue
+            key, days = _match_derived_key(
+                date,
+                series,
+                match=match_mode,
+                tolerance_days=tolerance_days,
+                date_map=date_map,
+                start_date_time=start_date_time,
+                time_units=time_units,
+            )
+            if key is None:
                 skipped.append(date)
+            else:
+                kept_dates.append(date)
+                kept_values.append(value)
+                kept_keys.append(key)
+                match_days.append(days)
         plan.append(
             {
                 "name": name,
@@ -2256,6 +2370,10 @@ def _derived_observation_plan(model: str) -> list[dict]:
                 "output_csv": f"{gwf.name}_{name}.csv",
                 "dates": kept_dates,
                 "values": kept_values,
+                "keys": kept_keys,
+                "match_days": match_days,
+                "match": match_mode,
+                "tolerance_days": tolerance_days,
                 "tokens": _derived_obs_tokens(name, len(kept_dates)),
                 "skipped": skipped,
                 "deferred": deferred,
@@ -2368,6 +2486,47 @@ _DERIVED_WRAPPER_BODY = (
     "            return (base + datetime.timedelta(days=days)).strftime('%Y-%m-%d')\n"
     "    return 'num:' + canonical\n"
     "\n"
+    "def _match_tolerance(matched, spec):\n"
+    "    tol = spec.get('tolerance_days')\n"
+    "    if tol is not None:\n"
+    "        return float(tol)\n"
+    "    dates = []\n"
+    "    for key in matched:\n"
+    "        try:\n"
+    "            dates.append(datetime.date.fromisoformat(str(key)))\n"
+    "        except (TypeError, ValueError):\n"
+    "            continue\n"
+    "    dates.sort()\n"
+    "    gaps = sorted(\n"
+    "        (b - a).days for a, b in zip(dates, dates[1:]) if (b - a).days > 0\n"
+    "    )\n"
+    "    return float(gaps[len(gaps) // 2]) if gaps else 0.0\n"
+    "\n"
+    "def _match_key(iso, matched, spec):\n"
+    "    if iso is None:\n"
+    "        return None\n"
+    "    if iso in matched:\n"
+    "        return iso\n"
+    "    if str(spec.get('match') or 'nearest') != 'nearest':\n"
+    "        return None\n"
+    "    try:\n"
+    "        target = datetime.date.fromisoformat(iso)\n"
+    "    except (TypeError, ValueError):\n"
+    "        return None\n"
+    "    best = None\n"
+    "    best_days = None\n"
+    "    for key in matched:\n"
+    "        try:\n"
+    "            other = datetime.date.fromisoformat(str(key))\n"
+    "        except (TypeError, ValueError):\n"
+    "            continue\n"
+    "        days = abs((other - target).days)\n"
+    "        if best_days is None or days < best_days:\n"
+    "            best, best_days = key, days\n"
+    "    if best is None or best_days > _match_tolerance(matched, spec):\n"
+    "        return None\n"
+    "    return best\n"
+    "\n"
     "def _derive_subsidence():\n"
     "    for spec in DERIVED:\n"
     "        src = spec['src']\n"
@@ -2424,8 +2583,13 @@ _DERIVED_WRAPPER_BODY = (
     "        with open(out, 'w', newline='') as fh:\n"
     "            writer = csv.writer(fh)\n"
     "            writer.writerow(['time', 'sim-subsidence-ft'])\n"
-    "            for date in spec['obs_dates']:\n"
-    "                key = _obs_key(date)\n"
+    "            for index, date in enumerate(spec['obs_dates']):\n"
+    "                resolved = spec.get('keys') or []\n"
+    "                key = (\n"
+    "                    resolved[index]\n"
+    "                    if index < len(resolved) and resolved[index]\n"
+    "                    else _match_key(_obs_key(date), matched, spec)\n"
+    "                )\n"
     "                if key is not None and key in matched:\n"
     "                    sim_time, value = matched[key]\n"
     "                    writer.writerow([sim_time, '%.10g' % value])\n"
@@ -2452,6 +2616,9 @@ def _derived_wrapper_source(model: str) -> tuple[str, str]:
             "sum_cols": list(group["sum_cols"]),
             "out": group["output_csv"],
             "obs_dates": list(group["dates"]),
+            "keys": list(group["keys"]),
+            "match": group["match"],
+            "tolerance_days": group["tolerance_days"],
             "start_date": group["start_date_time"],
             "days_per_unit": group["days_per_unit"],
             "time_map": dict(group["time_map"]),
@@ -3667,6 +3834,10 @@ def _impl_setup_calibration(
                 "n_matched": len(group["dates"]),
                 "skipped_dates": list(group["skipped"]),
                 "matching_deferred": group["deferred"],
+                "match": group["match"],
+                "max_match_days": max(
+                    (d for d in group["match_days"] if d is not None), default=None
+                ),
             }
             for group in _derived_observation_plan(model)
         }

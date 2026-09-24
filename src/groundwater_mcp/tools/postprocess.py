@@ -318,14 +318,39 @@ def _impl_read_compaction(model: str, max_rows: int = 500) -> dict:
     return result
 
 
-def _observed_subsidence_series(csv_path: Path) -> tuple[list[float], list[float]]:
-    """Return ``(x, y)`` from an observed subsidence CSV.
+# Model time unit -> days (mirrors calibration._TIME_UNIT_DAYS) so a dated
+# observed series can be placed on the simulated elapsed-time axis.
+_TIME_UNIT_DAYS = {
+    "SECONDS": 1.0 / 86400.0,
+    "MINUTES": 1.0 / 1440.0,
+    "HOURS": 1.0 / 24.0,
+    "DAYS": 1.0,
+    "YEARS": 365.0,
+}
+
+
+def _observed_subsidence_series(
+    csv_path: Path,
+    *,
+    start_date_time=None,
+    time_units: str = "DAYS",
+) -> tuple[list[float], list[float], str]:
+    """Return ``(x, y, axis)`` from an observed subsidence CSV.
 
     The value column is ``Subsidence_ft`` case-insensitively when present,
     else the first numeric column that is not the time column. The time column
-    is ``time``/``datetime``/``date`` case-insensitively; with no time column
-    the row index is used as x. Raises ``ValueError`` when no numeric value
-    column can be identified or the chosen column holds non-numeric values.
+    is ``time``/``datetime``/``date`` case-insensitively, else the first column
+    (which catches pandas' unnamed index, e.g. ``Unnamed: 0``).
+
+    ``x`` is placed on the **model time axis** so the overlay lines up with the
+    simulated series: a numeric time column is already elapsed model time;
+    parseable calendar dates are converted to elapsed time via
+    ``start_date_time`` in the model's ``time_units``. With neither, ``x`` falls
+    back to the row index and ``axis`` reports ``"row-index"`` (the 6d Target 9
+    rerun-7 overlay defect: dates silently became ``0..N-1`` and collapsed into
+    the corner of a 0–57346-day axis). Raises ``ValueError`` when no numeric
+    value column can be identified or the chosen column holds non-numeric
+    values.
     """
     import pandas as pd
 
@@ -336,6 +361,8 @@ def _observed_subsidence_series(csv_path: Path) -> tuple[list[float], list[float
     time_col = next(
         (lower[k] for k in ("time", "datetime", "date") if k in lower), None
     )
+    if time_col is None and len(df.columns) > 1:
+        time_col = str(df.columns[0])
     value_col = lower.get("subsidence_ft")
     if value_col is None:
         for col in df.columns:
@@ -357,15 +384,30 @@ def _observed_subsidence_series(csv_path: Path) -> tuple[list[float], list[float
             f"values in {csv_path.name}."
         )
 
+    x: list[float] | None = None
+    axis = "row-index"
     if time_col is not None:
-        x_numeric = pd.to_numeric(df[time_col], errors="coerce")
-        if x_numeric.isna().any():
-            x = [float(i) for i in range(len(df))]
+        numeric_x = pd.to_numeric(df[time_col], errors="coerce")
+        if bool(numeric_x.notna().all()):
+            x = [float(v) for v in numeric_x]
+            axis = "model-time"
         else:
-            x = [float(v) for v in x_numeric]
-    else:
+            dates = pd.to_datetime(df[time_col], errors="coerce")
+            anchor = (
+                pd.to_datetime(str(start_date_time), errors="coerce")
+                if start_date_time
+                else pd.NaT
+            )
+            if pd.notna(anchor) and bool(dates.notna().all()):
+                days_per_unit = _TIME_UNIT_DAYS.get(str(time_units).upper(), 1.0)
+                x = [
+                    (stamp - anchor).total_seconds() / 86400.0 / days_per_unit
+                    for stamp in dates
+                ]
+                axis = "model-time"
+    if x is None:
         x = [float(i) for i in range(len(df))]
-    return x, [float(v) for v in values]
+    return x, [float(v) for v in values], axis
 
 
 def _impl_plot_subsidence(
@@ -394,6 +436,7 @@ def _impl_plot_subsidence(
 
     observed_x: list[float] | None = None
     observed_y: list[float] | None = None
+    observed_axis: str | None = None
     obs_path: str | None = None
     if observed_csv:
         p = Path(observed_csv)
@@ -405,7 +448,11 @@ def _impl_plot_subsidence(
                 "Pass observed_csv as a two-column time,subsidence CSV.",
             )
         try:
-            observed_x, observed_y = _observed_subsidence_series(cand)
+            observed_x, observed_y, observed_axis = _observed_subsidence_series(
+                cand,
+                start_date_time=read_meta(model).get("start_date_time"),
+                time_units=str(read_meta(model).get("time_units") or "DAYS"),
+            )
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         obs_path = str(cand)
@@ -423,7 +470,7 @@ def _impl_plot_subsidence(
                 label="Observed",
             )
             ax.legend()
-        ax.set_xlabel("Time")
+        ax.set_xlabel("Elapsed time (model time units)")
         ax.set_ylabel("Cumulative subsidence")
         ax.set_title(f"{model} — cumulative subsidence")
         target = _resolve_output_path(ws, output_file, "") if output_file else None
@@ -435,6 +482,7 @@ def _impl_plot_subsidence(
         "n_times": len(subsidence),
         "has_observed": observed_x is not None,
         "observed_csv": obs_path,
+        "observed_axis": observed_axis,
     }
 
 

@@ -64,7 +64,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
 | `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None` | Observation summary: site count, record count, date range, written observation file path |
-| `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`) |
+| `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"`, `match: str = "nearest"`, `tolerance_days: float \| None`, `date_map: dict \| None` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`), `match`/`tolerance_days`/`date_map` |
 
 `import_obs_from_csv` persists the observation targets as model state
 (7f-F1.1): the site → cellid map, observed values and dates are stored in
@@ -89,7 +89,7 @@ re-established before further calls (2026-08-30 rerun-5 finding).
 - `assign_array_from_raster` is the catch-all for any other model array driven by a raster: an enumerated target table names the (package, array) pair — `NPF.k`/`NPF.k33`, `IC.strt`, `STO.ss`/`STO.sy` (per layer) and `RCHA.recharge`, `EVTA.surface`/`EVTA.rate`/`EVTA.depth` (per stress period, on the layer-0 footprint = topmost active cell per column, the MF6 default). Rate targets (`RCHA.recharge`, `EVTA.rate`) accept `rate_units` (e.g. `mm/yr`) and convert to m/d, recording the declared units. Odd values (negative ET rates, non-positive ET depth) are reported in `value_warnings`, never written silently. RCHA/EVTA packages are created on first use; NPF/IC/STO need their builder call first. This completes the file-based ingestion path — an agent names a file, never a payload of cell values.
 - `import_river_from_shapefile` intersects the river network with the model grid and snaps reaches to cell faces.
 - `import_obs_from_csv` matches observation sites to model cells by an explicit `cellid_col` cell-id column if provided (0-based node on DISU → written 1-based; `layer,row,col`/`layer,node` on DIS/DISV), otherwise by (x, y) coordinate if provided, otherwise sequentially. The explicit column is required where coordinates are ambiguous (DISU/DISV layers stack in x/y).
-- `import_subsidence_observations` registers a **derived** time-series target under `derived_observations` in `.gwmcp_meta.json` — a measured subsidence CSV plus the recipe (`sim_source`) for the simulated series, which the calibration forward wrapper materialises as `<gwf>_subsidence.csv` before PEST++ reads it (`setup_calibration(obs_source="derived")`). `time_col` falls back to the first CSV column when the header does not name it (an unnamed date index works); `dates` are stored as ISO `YYYY-MM-DD` sorted ascending with non-finite values dropped. It writes no MODFLOW 6 observation package because a derived series has no native MF6 observation type.
+- `import_subsidence_observations` registers a **derived** time-series target under `derived_observations` in `.gwmcp_meta.json` — a measured subsidence CSV plus the recipe (`sim_source`) for the simulated series, which the calibration forward wrapper materialises as `<gwf>_subsidence.csv` before PEST++ reads it (`setup_calibration(obs_source="derived")`). `time_col` falls back to the first CSV column when the header does not name it (an unnamed date index works); `dates` are stored as ISO `YYYY-MM-DD` sorted ascending with non-finite values dropped. `match` picks how observed dates bind to simulated times — `"nearest"` (default) snaps each observed date to the closest simulated time, so a dated survey that never lands on a stress-period end still calibrates; `"exact"` keeps only coincident dates. `tolerance_days` caps the snap (None = one median output interval, 0 for a single simulated time) and `date_map` (observed → simulated) overrides the automatic match per date; `setup_calibration` reports the matched/skipped counts and the largest snap distance. It writes no MODFLOW 6 observation package because a derived series has no native MF6 observation type.
 
 ---
 
@@ -347,7 +347,7 @@ Layer indices are validated against the model's `nlay` (7f-D3): `layer < 0` or `
 | `read_simulated_observations` | `model: str` | Per-site simulated values from the model's obs CSV at the final output time (7f-F1.2) |
 | `compare_to_observed` | `model: str`, `output_file: str \| None` | RMSE, bias, R², MAE, per-site residual table (CSV) and a scatter plot — no PEST setup needed (7f-F1.3) |
 | `read_compaction` | `model: str`, `max_rows: int = 500` | Per-layer compaction + derived cumulative `subsidence` (sum of the layer compaction columns), `interbed_strain` from `<gwf>.strainib.csv`; full table written to `<model>_compaction.csv` |
-| `plot_subsidence` | `model: str`, `observed_csv: str \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + `{ model, output_file, n_times, has_observed, observed_csv }` — cumulative subsidence vs time, with an optional observed overlay |
+| `plot_subsidence` | `model: str`, `observed_csv: str \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + `{ model, output_file, n_times, has_observed, observed_csv, observed_axis }` — cumulative subsidence vs model time, with an optional observed overlay placed on the same axis (`observed_axis` = `"model-time"`/`"row-index"`) |
 | `plot_heads_map` | `model: str`, `layer: int = 0`, `kstpkper: tuple \| None`, `contour_intervals: int = 10`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 | `plot_cross_section` | `model: str`, `line: dict`, `kstpkper: tuple \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 
@@ -442,7 +442,13 @@ columns returns `INVALID_INPUT`.
 time, returning the PNG natively. Pass `observed_csv` (a two-column
 `time,subsidence` CSV) to overlay a measured series: the value column is
 `Subsidence_ft` case-insensitively when present, else the first numeric
-non-time column, and the time column is `time`/`datetime`/`date`. A missing
+non-time column, and the time column is `time`/`datetime`/`date` (else the first
+column, which catches an unnamed date index). The observed series is placed on
+the **model time axis** — a numeric time column is elapsed model time, and
+calendar dates are converted to elapsed time via the model's `start_date_time`
+and `time_units` — so the overlay lines up with the simulated curve instead of
+collapsing to `x = 0..N-1`; the result reports `observed_axis`
+(`"model-time"` or `"row-index"`). A missing
 observed file returns `OUTPUT_FILE_MISSING`; when no numeric value column can
 be identified it returns `INVALID_INPUT`. `read_compaction`'s error envelope is
 propagated unchanged.
