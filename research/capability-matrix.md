@@ -195,14 +195,16 @@ derived time-series target); `setup_calibration` gains a target resolver with
 than the head-obs first row. → 74 tools. CSUB therefore moves from "extra scope"
 to a real covered row (below); the v0.3.0 release gate remains the Tier-1
 `1DSubsidenceModeling-MF6CSUB` target through the 6d rerun loop (playbook
-Target 9). **Validation status 2026-09-24:** rerun-1 (2026-09-20) was
-green-with-gaps; reruns 2–6 built/ran/post-processed `H201` green MCP-only but
-never completed the calibration step. All rerun findings are fixed (incl. the
-MF6-stdio forward-wrapper deadlock, `f1e7015`); the remaining blocker is an
-MCP-tree-specific `mf6` launch stall under the VS Code-spawned MCP server. Next:
-a closed-book rerun with the MCP server started outside VS Code (owner decision
-2026-09-24). The v0.3.0 gate stays **open** until CSUB passes with ≥2
-consecutive green reruns.
+Target 9). **Validation status 2026-09-24 — PASSED (owner tick pending):** rerun-1 (2026-09-20)
+was green-with-gaps; reruns 2–6 built/ran/post-processed `H201` green MCP-only but never
+completed the calibration step, which surfaced and fixed the MF6-stdio forward-wrapper deadlock
+(`f1e7015`) plus the derived-matching/unit/overlay defects; rerun-7 (2026-09-24) completed all
+criteria (IES φ 1119.56 → 15.68, RMSE 0.315 ft; 1 reprompt) and **rerun-8 (2026-09-24) was green
+set-and-forget** — 208/208 observations matched by nearest matching with no resampling, IES
+φ 575811 → 14.03, RMSE 0.2596 ft, R² 0.7904, 0 reprompts / 0 permission prompts / 0 MCP-only
+violations. Two consecutive green closed-book runs with the last set-and-forget meet the v0.3.0
+CSUB gate condition. (Residual non-blocking: the context-dependent background `start_calibration`
+stall, avoided via the synchronous runner.)
 
 ## GWF — flow (discretisation + stress packages)
 
@@ -305,9 +307,9 @@ No capability-coverage rows changed except OBS (partial → covered).
   (UCODE SVD estimation and UCODE linear/MCMC uncertainty rows removed
   2026-08-17 — UCODE is no longer part of the project's calibration scope)
   · CSUB moved from catalog "extra scope" to the covered GWF row on 2026-09-19
-  (v0.3.0 capability; validation via 6d playbook Target 9 **in progress** —
-  reruns 1–6 run 2026-09-20, tool-side findings fixed, calibration awaiting a
-  rerun with the MCP server outside VS Code; the v0.3.0 gate is still open)
+  (v0.3.0 capability; validation via 6d playbook Target 9 **PASSED 2026-09-24,
+  owner tick pending** — rerun-7 + rerun-8 were two consecutive green closed-book
+  runs, the last set-and-forget; the v0.3.0 gate condition is met)
 - Round-1 red flags (see `discovery/catalog.md` "Round-1 red flags"): SWT has
   no MF6 SWT6 package (variable density via GWT hydraulic-head formulation);
   GNC coverage is thin (2 testmodels + 1 flopy notebook). Every GAP row now has
