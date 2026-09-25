@@ -195,7 +195,7 @@ derived time-series target); `setup_calibration` gains a target resolver with
 than the head-obs first row. → 74 tools. CSUB therefore moves from "extra scope"
 to a real covered row (below); the v0.3.0 release gate remains the Tier-1
 `1DSubsidenceModeling-MF6CSUB` target through the 6d rerun loop (playbook
-Target 9). **Validation status 2026-09-24 — PASSED (owner tick pending):** rerun-1 (2026-09-20)
+Target 9). **Validation status 2026-09-24 — PASSED (owner tick 2026-09-25):** rerun-1 (2026-09-20)
 was green-with-gaps; reruns 2–6 built/ran/post-processed `H201` green MCP-only but never
 completed the calibration step, which surfaced and fixed the MF6-stdio forward-wrapper deadlock
 (`f1e7015`) plus the derived-matching/unit/overlay defects; rerun-7 (2026-09-24) completed all
@@ -308,7 +308,7 @@ No capability-coverage rows changed except OBS (partial → covered).
   2026-08-17 — UCODE is no longer part of the project's calibration scope)
   · CSUB moved from catalog "extra scope" to the covered GWF row on 2026-09-19
   (v0.3.0 capability; validation via 6d playbook Target 9 **PASSED 2026-09-24,
-  owner tick pending** — rerun-7 + rerun-8 were two consecutive green closed-book
+  owner tick 2026-09-25** — rerun-7 + rerun-8 were two consecutive green closed-book
   runs, the last set-and-forget; the v0.3.0 gate condition is met)
 - Round-1 red flags (see `discovery/catalog.md` "Round-1 red flags"): SWT has
   no MF6 SWT6 package (variable density via GWT hydraulic-head formulation);
