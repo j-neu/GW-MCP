@@ -144,6 +144,17 @@ time unit. Declared units are recorded in `.gwmcp_meta.json` and reported by
 `gammaw`/`beta` default to the model's unit system (METERS 9806.65 / 4.6512e-10;
 FEET 62.48 / 2.227e-8) rather than FloPy's SI defaults.
 
+**Multi-model simulations (v0.3.0, 2026-09-25):** one simulation can hold several models
+(`gwf`, `gwe`, `prt`) addressed by an optional `component: str = "gwf"` argument. The shared
+builder tools `set_model_crs`, `add_dis_package`, `add_disv_package`, `add_disu_package`,
+`add_ic_package` and `add_oc_package` (plus `get_run_log`) accept it; the default reproduces the
+single-GWF behaviour exactly. `summarise_model` reports a `components` block (per component: MF6
+model name, package list, grid type) and `model_status` a `components` list. `add_oc_package`
+supports only `component="gwf"` today — a coupled component's OC is added by that component's spec.
+The user-facing tools for creating `gwe`/`prt` models (`add_gwe_model`, `add_prt_model`) arrive with
+the GWE and PRT specs; the underlying `add_component_model` mirrors the GWF grid and registers the
+`GWF6-GWE6`/`GWF6-PRT6` exchange.
+
 `stress_period_data` maps a **0-based** stress-period index to records with **0-based** cell indices (layer, row, col for DIS; layer, node for DISV); indices are converted to 1-based when written to the package file. `save_flows` (default on) writes the SAVE FLOWS option so the package's fluxes appear in the budget file for `compute_water_balance`.
 
 **RCHA/EVTA — array-based recharge/ET (7e-B8):** `add_boundary_package(package="RCHA"|"EVTA", ...)` accepts a full-grid array per stress period instead of cell records (`{"0": <nrow×ncol array>}` for DIS layer 0, or `<ncpl>` for DISV). `rate_units` is converted on entry exactly as for RCH/EVT. The budget term is `RCH`.
@@ -162,8 +173,8 @@ FEET 62.48 / 2.227e-8) rather than FloPy's SI defaults.
 
 `add_csub_package` defines the CSUB (subsidence) package. `packagedata` is a list of 11-field interbed records (`[icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc, sse_cr, theta, kv, h0]`, all indices 0-based and contiguous from `icsubno=0`), `{"filename": ...}` to reference a pre-externalised file that **must already exist** (then `ninterbeds` is required), or `{"filename": ..., "data": [...]}` to externalise the records to that file (flopy writes it immediately at construction; `ninterbeds` defaults to `len(data)`). `packagedata_filename` is recorded in the result/meta only when the referenced file exists on disk. `sgm`/`sgs`/`cg_theta`/`cg_ske_cr` accept a scalar or one value per layer. `ndelaycells` is **required** when any interbed has `cdelay="delay"` — it is never defaulted silently. `observations` maps a CSV name to `[(name, obs_type, index), ...]`: cell types (`compaction`, `preconstress`, `elastic-compaction`, `inelastic-compaction`; the `-cell` suffix is optional) take a cellid, interbed types (`interbed-compaction-pct`, `delay-preconstress`, `delay-head`) take a 0-based interbed number, or for the delay types a 0-based `(interbed, delay-cell)` pair (`delay-preconstress`/`delay-head` index 0 → interbed 1, delay cell 1); the registered output CSV (`obs_output_csv`/`obs_names`) is persisted in `.gwmcp_meta.json` under the `csub` block for post-processing. `filerecords` accepts `zdisplacement`, `package_convergence`, `strainib`, `compaction`. Re-adding replaces the existing CSUB package(s) unless distinct `pname` values are used.
 | `add_oc_package` | `model: str`, `head_filerecord: str \| None`, `budget_filerecord: str \| None`, `saverecord: list`, `printrecord: list \| None` | Confirmation |
-| `summarise_model` | `model: str` | Structured summary: packages, grid dimensions (+ `n_active` when idomain present), stress periods, boundary types, storage (STO steady/transient periods), registered `observations` count, `reloaded_from_disk` flag |
-| `model_status` | `model: str` | `{ runnable: bool, missing_required: list[str], missing_recommended: list[str], next_steps: list[str], warnings: list[str] }` — ordered build-order status (7e-C8) |
+| `summarise_model` | `model: str` | Structured summary: packages, grid dimensions (+ `n_active` when idomain present), stress periods, boundary types, storage (STO steady/transient periods), registered `observations` count, `components` (per-component model name/packages/grid type), `reloaded_from_disk` flag |
+| `model_status` | `model: str` | `{ runnable: bool, missing_required: list[str], missing_recommended: list[str], next_steps: list[str], warnings: list[str], components: list[str] }` — ordered build-order status (7e-C8) |
 | `list_model_files` | `model: str` | File list with sizes and types; flushes staged changes first and reports `flushed` |
 | `flush_model` | `model: str` | `{ written: bool }` — forces the pending deferred write so the on-disk input set matches the in-memory state |
 | `list_models` | *(none)* | `{ models: {name: workspace_path} }` — every registered model (7e-B4.1) |
@@ -227,7 +238,7 @@ models cannot be auto-fixed in place (clone them first).
 | `start_run` | `model: str` | `{ model, job_id, kind: "mf6", status: "running" }` — starts MODFLOW 6 in a background thread and returns a job id immediately (7e-A3) |
 | `get_job_status` | `job_id: str` | `{ job_id, model, kind, status, elapsed_s, progress \| null, result \| null, error \| null }` |
 | `cancel_job` | `job_id: str` | `{ job_id, status: "cancelled" }` (or the job's terminal status if already finished) |
-| `get_run_log` | `model: str`, `tail: int = 100` | Last N lines of the MODFLOW listing file (.lst) |
+| `get_run_log` | `model: str`, `tail: int = 100`, `component: str = "gwf"` | Last N lines of the MODFLOW listing file (.lst); a non-gwf component prefers its own `<model>.lst`, else mfsim.lst |
 
 ### diagnose_convergence (7e-C1)
 

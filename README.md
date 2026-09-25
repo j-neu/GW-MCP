@@ -42,6 +42,8 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 **CSUB (subsidence)** is covered end-to-end: `add_csub_package` builds the MODFLOW 6 CSUB package (delay and no-delay interbeds, `cg_theta`/`cg_ske_cr`, compaction observation records, filerecords), `read_compaction` and `plot_subsidence` post-process the CSUB observation output into per-layer compaction and cumulative subsidence (with an optional observed overlay), and `import_subsidence_observations` registers a measured subsidence series as a **derived** time-series target. `setup_calibration(obs_source="derived")` then calibrates `csub:packagedata` (plus `csub:cg_theta`, `csub:cg_ske_cr` and `npf:k33`) targets through `run_pestpp_ies` → `summarise_calibration`.
 
+**v0.3.0 multi-model foundation** (2026-09-25) is in place: a single simulation can hold several models (`gwf`/`gwe`/`prt`) addressed by an optional `component` argument on the model-scoped tools, with the GWF grid mirrored into a component and its exchange registered. It ships no new tool — it is the base the **GWE** and **PRT** capability specs (with **MT3D-USGS** and **MODPATH** post-processing) build on to complete the v0.3.0 gate.
+
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 
 ### Safety guarantees

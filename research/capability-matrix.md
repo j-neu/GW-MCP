@@ -297,8 +297,8 @@ No capability-coverage rows changed except OBS (partial → covered).
 |---|---|---|
 | MODFLOW-2005 / NWT / USG | legacy-out-of-scope | v0.2.0+ candidate |
 | SEAWAT | legacy-out-of-scope | — |
-| MT3D-MS / MT3D-USGS | legacy-out-of-scope | v0.2.0 candidate (tasks.md 7d) |
-| MODPATH | legacy-out-of-scope | v0.2.0 candidate (tasks.md 7d) |
+| MT3D-MS / MT3D-USGS | legacy-out-of-scope | **v0.3.0 sub-project 4** (owner decision 2026-09-25; build + closed-book validation required) |
+| MODPATH | legacy-out-of-scope | **v0.3.0 sub-project 5** (in scope, owner decision 2026-09-25) |
 
 ## Coverage summary
 

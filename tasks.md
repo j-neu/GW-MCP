@@ -196,7 +196,7 @@ rerun loop **before that release ships**:
 - pestpp-sen / pareto / sweep → `mf6_freyberg`, `neversink_workflow`
 - OBS package tool → `test005_advgw_tidal`, `ex-gwf-radial`
 - CSUB → `1DSubsidenceModeling-MF6CSUB` (capability landed 2026-09-19, 74 tools; 6d playbook Target 9). Rerun-1 GREEN-with-gaps 2026-09-20; **reruns 2–6 NOT passed 2026-09-20** — build/run/post-process green MCP-only, and the rerun findings (delay-observation index, k/rate units, CSUB `gammaw`/`beta` defaults, empty-target heal, and the MF6-stdio forward-wrapper deadlock) all fixed, but calibration completion was blocked by an MCP-tree-specific `pestpp` forward-run launch stall (Target 9 rerun-6 findings below). **Next: closed-book rerun with the MCP server started outside VS Code (owner decision 2026-09-24)**; awaiting ≥2 consecutive green, last set-and-forget. **Rerun-7 (2026-09-24) GREEN single run** (`sessions/2026-09-24-6d-csub.md`) — build/run/post-process green MCP-only (0 violations, 1 reprompt) and the calibration **completed**: IES φ 1119.56 → 15.68 (−98.6 %, 389 runs, 2.73 min), RMSE 3.00 → 0.315 ft, R² 0.925, no parameter at bounds. Completed only via the **synchronous** `run_pestpp_ies`; the background `start_calibration` stall is now **localised to the background job runner**, not the VS Code process tree (see rerun-7 findings below). **Rerun-8 (2026-09-24) GREEN set-and-forget** (`sessions/2026-09-24-6d-csub-rerun8.md`) — MCP-only build/run/post-process (0 violations), **208/208 derived observations matched with nearest matching and no resampling**, IES φ 575811 → 14.03 (232 runs), RMSE 0.2596 ft, R² 0.7904, `plot_subsidence` overlay on the model time axis; **0 reprompts / 0 permission prompts**. Two consecutive green runs, last set-and-forget → ✅ **PASSED 2026-09-24 (owner tick 2026-09-25)**.
-- GWE / PRT / MODPATH / MT3D-USGS → examples in catalog extra-scope rows (**v0.3.0 scope per owner decision 2026-09-25**: GWE, PRT and MT3D-USGS must be built and validated before v0.3.0 ships — not started; MODPATH to be confirmed in the v0.3.0 plan)
+- GWE / PRT / MODPATH / MT3D-USGS → examples in catalog extra-scope rows (**v0.3.0 scope per owner decision 2026-09-25**: GWE, PRT and MT3D-USGS must be built and validated before v0.3.0 ships; **MODPATH confirmed in scope** 2026-09-25). Decomposed 2026-09-25 into five sub-projects — **multi-model foundation → GWE → PRT → MT3D-USGS → MODPATH** — each with its own spec/plan. Sub-project 1 (multi-model-per-simulation foundation, spec `docs/superpowers/specs/2026-09-25-v0.3.0-multimodel-foundation-design.md`, plan `docs/superpowers/plans/2026-09-25-v0.3.0-multimodel-foundation.md`) **landed 2026-09-25**: one simulation can hold several models addressable by an optional `component` selector; ships no user-facing tool, so it has no rerun gate. GWE is the next sub-project.
 
 **Target 9 findings (v0.3.0 backlog — filed from the 2026-09-20 CSUB rerun-1; timeout/robustness cluster + `describe_package` fixed 2026-09-20):**
 
@@ -560,10 +560,25 @@ satisfied.
 
 **v0.3.0 remaining scope (owner decision 2026-09-25).** v0.3.0 ships only once **GWE**, **PRT** and
 **MT3D-USGS** are built and then put through the same closed-book rerun loop (≥2 consecutive green,
-last set-and-forget). All three are **not started** and are explicitly wanted in v0.3.0; the work is
-deferred to a later session that begins with a v0.3.0 plan. MT3D-USGS moves up from the v0.2.0
-candidate list below; **MODPATH** is named alongside it in the Tier-2 row, so confirm whether it is
-also in scope when that plan is written.
+last set-and-forget). All are explicitly wanted in v0.3.0; **MODPATH** is confirmed in scope
+(owner decision 2026-09-25) and joins them. The scope was decomposed the same day into five
+sub-projects built in order — **multi-model foundation → GWE → PRT → MT3D-USGS → MODPATH** — each
+with its own spec → plan → implementation cycle. MT3D-USGS moves up from the v0.2.0 candidate list
+below.
+
+- [x] **Multi-model-per-simulation foundation** (sub-project 1) — spec
+  `docs/superpowers/specs/2026-09-25-v0.3.0-multimodel-foundation-design.md`, plan
+  `docs/superpowers/plans/2026-09-25-v0.3.0-multimodel-foundation.md`. One simulation holds
+  several models (`gwf`/`gwe`/`prt`) addressed by an optional `component` selector; the GWF grid is
+  mirrored into a component and its exchange registered (`utils/components.py`, `model_store.get_model`,
+  internal `add_component_model`). Ships no user-facing tool → no rerun gate. **Landed 2026-09-25.**
+- [ ] **GWE** (sub-project 2) — energy (heat) transport model + temperature post-processing; build +
+  closed-book validation required before v0.3.0 ships.
+- [ ] **PRT** (sub-project 3) — MF6-native particle tracking + pathline post-processing; build +
+  closed-book validation required.
+- [ ] **MT3D-USGS** (sub-project 4) — legacy solute-transport post-processing (read transport output,
+  plot plumes); build + closed-book validation required.
+- [ ] **MODPATH** (sub-project 5) — legacy particle tracking (pathlines); in scope, build + validate.
 
 Residual non-blocking CSUB items (fix when convenient): the context-dependent background
 `start_calibration` stall (avoided via the synchronous runner), the client-side `-32001` timeouts on
@@ -571,8 +586,8 @@ long synchronous calls, and the open rerun-7 findings (setup-time artifact order
 calibrate→forward push-back, sensitivity tool vs derived observations).
 
 **Other v0.2.0 candidates (pre-existing):**
-- [ ] **MT3D-USGS solute transport** post-processing (read transport output, plot plumes) — **moved to v0.3.0 scope (owner decision 2026-09-25); build + closed-book validation required before v0.3.0 ships**
-- [ ] **MODPATH** particle tracking tools (backward/forward tracking, pathlines) — also named in the v0.3.0-scope Tier-2 row; confirm in the v0.3.0 plan
+- [ ] **MT3D-USGS solute transport** post-processing (read transport output, plot plumes) — **moved to v0.3.0 scope (owner decision 2026-09-25) as sub-project 4; build + closed-book validation required before v0.3.0 ships**
+- [ ] **MODPATH** particle tracking tools (backward/forward tracking, pathlines) — **confirmed in v0.3.0 scope (owner decision 2026-09-25) as sub-project 5**
 - [ ] MODFLOW-2005 + MODFLOW-NWT support (legacy compatibility)
 - [ ] Cloud execution backend (submit jobs to AWS/GCP Compute, stream results)
 - [ ] Web-based model visualiser (optional companion app for 3D inspection)

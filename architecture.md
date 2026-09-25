@@ -71,6 +71,10 @@ CSUB subsidence support (v0.3.0, 2026-09-19): `add_csub_package` builds the MODF
 
 ---
 
+Multi-model-per-simulation foundation (v0.3.0, 2026-09-25): a single MODFLOW 6 simulation can now hold several models of different types — a flow model (`gwf`), an energy-transport model (`gwe`) and a particle-tracking model (`prt`) — addressed by an optional `component` argument on the model-scoped tools. `utils/components.py` is a small registry mapping a component name to its FloPy model/grid/IC/OC classes and its exchange class; `model_store.get_model(name, component)` resolves the model through the component map persisted in `.gwmcp_meta.json` (auto-detected by model class on `adopt_model`), with `get_gwf` a thin delegate so every existing call is unchanged. The shared builder tools (`add_dis_package`/`add_disv_package`/`add_disu_package`/`add_ic_package`/`add_oc_package`/`set_model_crs`) and `get_run_log` take `component="gwf"`; the internal `add_component_model` creates a component with the source grid mirrored and the `GWF6-GWE6`/`GWF6-PRT6` exchange registered, and `summarise_model`/`model_status` report the components present. This is the internal foundation the GWE and PRT capability specs build on; it ships no user-facing tool.
+
+---
+
 ## File structure
 
 ```
@@ -89,6 +93,7 @@ groundwater-mcp/
 │       └── utils/
 │           ├── workspace.py    ← model directory management
 │           ├── plotting.py     ← shared matplotlib helpers
+│           ├── components.py   ← component registry for multi-model simulations
 │           └── spatial.py      ← shared raster/vector helpers (rasterio, geopandas)
 ├── scripts/
 │   └── build_index.py          ← indexes docs at install time
