@@ -86,3 +86,20 @@ def test_get_model_unknown_component_raises(tmp_path):
     _two_model_sim(tmp_path)
     with pytest.raises(KeyError, match="Available components"):
         model_store.get_model("run_a", "prt")
+
+
+def test_create_model_writes_components(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_create_model
+    from groundwater_mcp.utils.model_store import read_meta
+
+    _impl_create_model("cmp_create", str(tmp_path / "cmp_create"), "METERS", "DAYS")
+    assert read_meta("cmp_create")["components"] == {"gwf": "cmp_create"}
+
+
+def test_adopt_model_detects_components(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_adopt_model
+    from groundwater_mcp.utils.model_store import read_meta
+
+    _two_model_sim(tmp_path)  # writes mfsim.nam + models to tmp_path/ws_two
+    _impl_adopt_model("cmp_adopt", str(tmp_path / "ws_two"), "METERS", "DAYS")
+    assert read_meta("cmp_adopt")["components"] == {"gwf": "run_a", "gwe": "run_a_gwe"}

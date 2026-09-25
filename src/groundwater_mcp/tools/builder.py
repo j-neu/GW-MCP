@@ -15,6 +15,7 @@ from groundwater_mcp.utils.model_store import (
     clear_csub_base_snapshot,
     clear_k_base_snapshot,
     consume_reload_flag,
+    detect_components,
     flush_model,
     get_gwf,
     get_sim,
@@ -206,7 +207,12 @@ def _impl_create_model(
         sim_ws=str(model_dir),
     )
     mf6.ModflowGwf(sim, modelname=name, model_nam_file=f"{name}.nam")
-    _write_meta(model_dir, {"name": name, "units": units.upper(), "time_units": time_units.upper()})
+    _write_meta(model_dir, {
+        "name": name,
+        "units": units.upper(),
+        "time_units": time_units.upper(),
+        "components": {"gwf": name},
+    })
     written = save_sim(name, sim)
     return {
         "model": name,
@@ -265,6 +271,7 @@ def _impl_adopt_model(
         "time_units": time_units.upper(),
         "adopted": True,
         "allow_modify": bool(allow_modify),
+        "components": detect_components(sim),
     })
     result: dict = {
         "model": name,
