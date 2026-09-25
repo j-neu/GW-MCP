@@ -103,3 +103,45 @@ def test_adopt_model_detects_components(tmp_path):
     _two_model_sim(tmp_path)  # writes mfsim.nam + models to tmp_path/ws_two
     _impl_adopt_model("cmp_adopt", str(tmp_path / "ws_two"), "METERS", "DAYS")
     assert read_meta("cmp_adopt")["components"] == {"gwf": "run_a", "gwe": "run_a_gwe"}
+
+
+def test_add_component_model_mirrors_grid_and_exchange(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    _impl_create_model("cmp_add", str(tmp_path / "cmp_add"), "METERS", "DAYS")
+    _impl_set_simulation("cmp_add", 1, [1.0], [1], "moderate")
+    _impl_add_dis_package(
+        "cmp_add", nlay=1, nrow=2, ncol=3, delr=2.0, delc=2.0, top=5.0, botm=[0.0]
+    )
+    result = _impl_add_component_model("cmp_add", "gwe")
+    assert result["component"] == "gwe"
+    assert result["grid_type"] == "DIS"
+
+    sim = model_store.get_sim("cmp_add")
+    assert set(sim.model_names) == {"cmp_add", "cmp_add_gwe"}
+    gwe_dis = model_store.get_model("cmp_add", "gwe").get_package("dis")
+    assert int(gwe_dis.nrow.data) == 2 and int(gwe_dis.ncol.data) == 3
+    assert model_store.component_map("cmp_add")["gwe"] == "cmp_add_gwe"
+    # exchange written on flush
+    model_store.flush_model("cmp_add")
+    assert (tmp_path / "cmp_add" / "mfsim.gwfgwe").exists()
+
+
+def test_add_component_model_rejects_duplicate(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_create_model,
+    )
+
+    _impl_create_model("cmp_dup", str(tmp_path / "cmp_dup"), "METERS", "DAYS")
+    _impl_add_dis_package("cmp_dup", nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_component_model("cmp_dup", "gwe")
+    with pytest.raises(ValueError, match="already"):
+        _impl_add_component_model("cmp_dup", "gwe")

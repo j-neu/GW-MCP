@@ -8,16 +8,19 @@ from pathlib import Path
 import flopy.mf6 as mf6
 import numpy as np
 
+from groundwater_mcp.utils.components import grid_class_for, spec_for
 from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv, grid_size
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_sim,
     clear_csub_base_snapshot,
     clear_k_base_snapshot,
+    component_map,
     consume_reload_flag,
     detect_components,
     flush_model,
     get_gwf,
+    get_model,
     get_sim,
     invalidate,
     restore_oc_period_records,
@@ -286,6 +289,123 @@ def _impl_adopt_model(
     else:
         result["read_only"] = True
     return result
+
+
+def _grid_type_of(model) -> str | None:
+    """Return the grid kind ('dis'/'disv'/'disu') of a model, or None."""
+    for kind, getter in (("dis", get_dis), ("disv", get_disv), ("disu", get_disu)):
+        if getter(model) is not None:
+            return kind
+    return None
+
+
+def _mirror_grid(src_model, dst_model, component: str) -> str:
+    """Create the component's grid package from the source model's grid."""
+    kind = _grid_type_of(src_model)
+    if kind is None:
+        raise ValueError("Source model has no grid package to mirror (DIS/DISV/DISU).")
+    grid_cls = grid_class_for(component, kind)
+    if grid_cls is None:
+        raise ValueError(
+            f"Component '{component}' has no {kind.upper()} grid class — "
+            "cannot mirror this grid type."
+        )
+    kwargs: dict = {}
+    if kind == "dis":
+        src = get_dis(src_model)
+        top = np.asarray(src.top.array)
+        kwargs = {
+            "nlay": int(src.nlay.data),
+            "nrow": int(src.nrow.data),
+            "ncol": int(src.ncol.data),
+            "delr": np.asarray(src.delr.array).tolist(),
+            "delc": np.asarray(src.delc.array).tolist(),
+            "top": top.tolist() if top.ndim else float(top),
+            "botm": np.asarray(src.botm.array).tolist(),
+        }
+        idom = getattr(src, "idomain", None)
+        if idom is not None:
+            kwargs["idomain"] = np.asarray(idom.array).tolist()
+    elif kind == "disv":
+        src = get_disv(src_model)
+        kwargs = {
+            "nlay": int(src.nlay.data),
+            "ncpl": int(src.ncpl.data),
+            "nvert": int(src.nvert.data),
+            "vertices": np.asarray(src.vertices.array).tolist(),
+            "cell2d": np.asarray(src.cell2d.array).tolist(),
+            "top": np.asarray(src.top.array).tolist(),
+            "botm": np.asarray(src.botm.array).tolist(),
+        }
+        idom = getattr(src, "idomain", None)
+        if idom is not None:
+            kwargs["idomain"] = np.asarray(idom.array).tolist()
+    else:  # disu
+        src = get_disu(src_model)
+        kwargs = {
+            "nodes": int(src.nodes.data),
+            "nja": int(src.nja.data),
+            "top": np.asarray(src.top.array).tolist(),
+            "bot": np.asarray(src.bot.array).tolist(),
+            "area": np.asarray(src.area.array).tolist(),
+            "iac": np.asarray(src.iac.array).tolist(),
+            "ja": np.asarray(src.ja.array).tolist(),
+        }
+        for opt in ("ihc", "cl12", "hwva"):
+            ds = getattr(src, opt, None)
+            if ds is not None:
+                kwargs[opt] = np.asarray(ds.array).tolist()
+    grid_cls(dst_model, **kwargs)
+    return kind.upper()
+
+
+def _impl_add_component_model(model: str, component: str, grid_from: str = "gwf") -> dict:
+    """Add a coupled component model with the source grid mirrored + exchange.
+
+    Internal foundation helper: the GWE/PRT specs expose user-facing tools
+    that call it. No physics packages are added here.
+    """
+    key = component.lower()
+    spec = spec_for(key)
+    if key == "gwf":
+        raise ValueError(
+            "component='gwf' is the flow model created by create_model — use a "
+            "different component (e.g. 'gwe', 'prt')."
+        )
+    sim = get_sim(model)
+    if key in component_map(model):
+        raise ValueError(f"Simulation '{model}' already has a '{key}' component.")
+
+    src_model = get_model(model, grid_from)
+    gwf_model = get_model(model, "gwf")
+
+    comp_name = f"{model}_{key}"[:16]
+    dst_model = spec.model_class(
+        sim, modelname=comp_name, model_nam_file=f"{comp_name}.nam"
+    )
+    grid_type = _mirror_grid(src_model, dst_model, key)
+
+    exchange = None
+    if spec.exchange_class is not None:
+        spec.exchange_class(
+            sim, exgmnamea=getattr(gwf_model, "name", model), exgmnameb=comp_name
+        )
+        exchange = spec.exchange_class.__name__
+
+    written = save_sim(model, sim)
+    model_dir = resolve_workspace(model)
+    meta = _read_meta(model_dir)
+    meta.setdefault("components", {})[key] = comp_name
+    _write_meta(model_dir, meta)
+
+    return {
+        "model": model,
+        "component": key,
+        "component_model": comp_name,
+        "grid_type": grid_type,
+        "exchange": exchange,
+        "written": written,
+    }
 
 
 def _impl_set_simulation(
