@@ -28,6 +28,15 @@ class ComponentSpec:
     exchange_class: type | None = None
 
 
+class UnknownComponentError(KeyError, ValueError):
+    """Raised when a component name is unknown or absent from a simulation.
+
+    Subclasses both ``KeyError`` (so existing callers that catch KeyError keep
+    working) and ``ValueError`` (so tool wrappers can map it to INVALID_INPUT
+    ahead of the MODEL_NOT_FOUND KeyError branch).
+    """
+
+
 _COMPONENTS: dict[str, ComponentSpec] = {}
 
 

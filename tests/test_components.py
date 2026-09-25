@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import flopy.mf6 as mf6
+import numpy as np
 import pytest
 
 from groundwater_mcp.utils import components
@@ -251,3 +252,186 @@ def test_get_run_log_component_param(tmp_path):
     (ws / "mfsim.lst").write_text("Normal termination\n")
     out = _impl_get_run_log("cmp_log", tail=5, component="gwf")
     assert out["listing_file"].endswith("mfsim.lst")
+
+
+# ---------------------------------------------------------------------------
+# Review-fix tests (Critical C1 + Important I1-I7)
+# ---------------------------------------------------------------------------
+
+
+def _call_tool(name: str, args: dict):
+    import asyncio
+    import json
+
+    from groundwater_mcp.server import mcp
+
+    result = asyncio.run(mcp.call_tool(name, args))
+    return json.loads(result[0].text)
+
+
+def test_component_model_name_no_collision_at_16_chars(tmp_path):
+    """C1: a legal 16-char base must not truncate onto itself."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_create_model,
+    )
+    from groundwater_mcp.utils import model_store
+
+    name = "abcdefghijklmnop"  # exactly 16 → the MF6 limit
+    _impl_create_model(name, str(tmp_path / name), "METERS", "DAYS")
+    _impl_add_dis_package(name, nlay=1, nrow=2, ncol=2, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    result = _impl_add_component_model(name, "gwe")
+    comp = result["component_model"]
+    assert comp != name
+    assert len(comp) <= 16
+    sim = model_store.get_sim(name)
+    assert len(sim.model_names) == 2  # two distinct model names
+    assert model_store.component_map(name)["gwe"] == comp
+
+
+def test_unknown_component_is_invalid_input(tmp_path):
+    """I1: a bad component through a tool must be INVALID_INPUT, not MODEL_NOT_FOUND."""
+    from groundwater_mcp.tools.builder import _impl_add_dis_package, _impl_create_model
+
+    _impl_create_model("cmp_bad", str(tmp_path / "cmp_bad"), "METERS", "DAYS")
+    _impl_add_dis_package("cmp_bad", nlay=1, nrow=2, ncol=2, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    out = _call_tool("add_ic_package", {"model": "cmp_bad", "strt": 1.0, "component": "gwt"})
+    assert out["error"] is True
+    assert out["code"] == "INVALID_INPUT"
+    assert "Available components" in out["message"]
+
+
+def test_get_run_log_unknown_component_errors(tmp_path):
+    """I2: get_run_log must not silently fall back to mfsim.lst for a bad component."""
+    from groundwater_mcp.tools.builder import _impl_add_dis_package, _impl_create_model
+    from groundwater_mcp.utils.model_store import flush_model
+
+    ws = tmp_path / "cmp_log2"
+    _impl_create_model("cmp_log2", str(ws), "METERS", "DAYS")
+    _impl_add_dis_package("cmp_log2", nlay=1, nrow=2, ncol=2, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    flush_model("cmp_log2")
+    (ws / "mfsim.lst").write_text("Normal termination\n")
+    out = _call_tool("get_run_log", {"model": "cmp_log2", "component": "gwt"})
+    assert out["error"] is True
+    assert out["code"] == "INVALID_INPUT"
+
+
+def test_component_grid_type_replacement(tmp_path):
+    """I3: switching a component's grid type must not leave two grid packages."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_add_disv_package,
+        _impl_create_model,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "cmp_grid"
+    _impl_create_model("cmp_grid", str(ws), "METERS", "DAYS")
+    _impl_add_disv_package(
+        "cmp_grid",
+        nlay=1,
+        vertices=[[0, 0.0, 0.0], [1, 1.0, 0.0], [2, 1.0, 1.0], [3, 0.0, 1.0],
+                  [4, 2.0, 0.0], [5, 3.0, 0.0], [6, 3.0, 1.0], [7, 2.0, 1.0]],
+        cell2d=[[0, 0.5, 0.5, 4, 0, 1, 2, 3], [1, 2.5, 0.5, 4, 4, 5, 6, 7]],
+        top=[1.0, 1.0],
+        botm=[[0.0, 0.0]],
+    )
+    _impl_add_component_model("cmp_grid", "gwe")
+    _impl_add_dis_package(
+        "cmp_grid", nlay=1, nrow=2, ncol=2, delr=1.0, delc=1.0, top=1.0, botm=[0.0],
+        component="gwe",
+    )
+    pkgs = model_store.get_model("cmp_grid", "gwe").get_package_list()
+    assert "DIS" in pkgs
+    assert "DISV" not in pkgs
+
+
+def test_summarise_reports_component_grid_type(tmp_path):
+    """I4: _grid_type_of must work for non-GWF components."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_summarise_model,
+    )
+
+    _impl_create_model("cmp_gt", str(tmp_path / "cmp_gt"), "METERS", "DAYS")
+    _impl_add_dis_package("cmp_gt", nlay=1, nrow=2, ncol=2, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_component_model("cmp_gt", "gwe")
+    out = _impl_summarise_model("cmp_gt")
+    assert out["components"]["gwf"]["grid_type"] == "DIS"
+    assert out["components"]["gwe"]["grid_type"] == "DIS"
+
+
+def test_add_component_model_mirrors_disu_extras(tmp_path):
+    """I5: DISU mirroring must carry idomain and cell geometry."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_disu_package,
+        _impl_create_model,
+    )
+    from groundwater_mcp.utils import model_store
+
+    name = "cmp_disu"
+    _impl_create_model(name, str(tmp_path / name), "METERS", "DAYS")
+    _impl_add_disu_package(
+        name,
+        nodes=2,
+        nja=2,
+        top=[10.0, 10.0],
+        bot=[0.0, 0.0],
+        area=[1.0, 1.0],
+        iac=[1, 1],
+        ja=[0, 1],
+        idomain=[1, 0],
+        vertices=[[0, 0.0, 0.0], [1, 1.0, 0.0], [2, 1.0, 1.0], [3, 0.0, 1.0],
+                  [4, 2.0, 0.0], [5, 3.0, 0.0], [6, 3.0, 1.0], [7, 2.0, 1.0]],
+        cell2d=[[0, 0.5, 0.5, 4, 0, 1, 2, 3], [1, 2.5, 0.5, 4, 4, 5, 6, 7]],
+        nvert=8,
+    )
+    _impl_add_component_model(name, "gwe")
+    disu = model_store.get_model(name, "gwe").get_package("disu")
+    assert disu is not None
+    assert list(np.asarray(disu.idomain.array).ravel()) == [1, 0]
+    assert disu.cell2d is not None
+
+
+def test_add_component_model_rolls_back_on_failure(tmp_path):
+    """I6: a failed component build must not leave an orphan model."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_disu_package,
+        _impl_create_model,
+    )
+    from groundwater_mcp.utils import model_store
+
+    name = "cmp_rb"
+    _impl_create_model(name, str(tmp_path / name), "METERS", "DAYS")
+    _impl_add_disu_package(
+        name, nodes=2, nja=2, top=[10.0, 10.0], bot=[0.0, 0.0], area=[1.0, 1.0],
+        iac=[1, 1], ja=[0, 1],
+    )
+    before = list(model_store.get_sim(name).model_names)
+    with pytest.raises(ValueError):
+        _impl_add_component_model(name, "prt")  # PRT has no DISU grid class
+    assert list(model_store.get_sim(name).model_names) == before
+    assert "prt" not in model_store.component_map(name)
+
+
+def test_component_map_reconciles_stale_meta(tmp_path):
+    """I7: a stored map naming models absent from the sim must not create phantoms."""
+    from groundwater_mcp.utils import model_store
+
+    _two_model_sim(tmp_path)
+    model_store.write_meta("run_a", {
+        "name": "run_a",
+        "units": "METERS",
+        "time_units": "DAYS",
+        "components": {"gwf": "ghostgwf", "gwe": "ghostgwe"},
+    })
+    comps = model_store.component_map("run_a")
+    assert comps == {"gwf": "run_a", "gwe": "run_a_gwe"}
+    assert "ghostgwf" not in comps.values()
+    assert model_store.get_model("run_a", "gwe").name == "run_a_gwe"

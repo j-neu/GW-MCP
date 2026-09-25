@@ -33,6 +33,7 @@ from pathlib import Path
 
 import flopy.mf6 as mf6
 
+from groundwater_mcp.utils.components import UnknownComponentError
 from groundwater_mcp.utils.workspace import resolve_workspace
 
 
@@ -466,15 +467,20 @@ def detect_components(sim: mf6.MFSimulation) -> dict[str, str]:
 def component_map(name: str) -> dict[str, str]:
     """Return the component -> model-name map for a simulation.
 
-    The persisted ``components`` block in ``.gwmcp_meta.json`` wins; a
-    simulation registered before this feature (or adopted without a meta
-    write) falls back to class-based detection on the loaded simulation.
+    The persisted ``components`` block in ``.gwmcp_meta.json`` is reconciled
+    with the simulation: stored entries naming a model that is no longer
+    present are dropped (no phantom components), and components present in the
+    simulation but missing from the stored map are recovered by class
+    detection.
     """
-    meta = read_meta(name)
-    stored = meta.get("components")
-    if stored:
-        return dict(stored)
-    return detect_components(get_sim(name))
+    sim = get_sim(name)
+    detected = detect_components(sim)
+    stored = read_meta(name).get("components") or {}
+    existing = set(sim.model_names)
+    resolved = {c: m for c, m in stored.items() if m in existing}
+    for cname, mname in detected.items():
+        resolved.setdefault(cname, mname)
+    return resolved
 
 
 def list_components(name: str) -> dict[str, str]:
@@ -502,7 +508,7 @@ def get_model(name: str, component: str = "gwf") -> mf6.MFModel:
         if mnames:
             return sim.get_model(mnames[0])
     available = sorted(comps) or sorted(detect_components(sim))
-    raise KeyError(
+    raise UnknownComponentError(
         f"Component '{component}' not found in simulation '{name}'. "
         f"Available components: {available or 'none'}."
     )

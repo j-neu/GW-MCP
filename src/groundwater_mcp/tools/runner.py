@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from groundwater_mcp.tools.builder import _transient_like_without_sto
 from groundwater_mcp.tools.postprocess import _compute_obs_fit
 from groundwater_mcp.utils import jobs
+from groundwater_mcp.utils.components import UnknownComponentError
 from groundwater_mcp.utils.grid import get_dis
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
@@ -536,12 +537,8 @@ def _impl_get_run_log(model: str, tail: int = 100, component: str = "gwf") -> di
     # component, prefer that model's own listing file when it exists.
     lst_file = None
     if component.lower() != "gwf":
-        try:
-            comp_name = str(get_model(model, component).name)
-        except KeyError:
-            comp_name = None
-        if comp_name:
-            lst_file = next((f for f in lst_files if f.name == f"{comp_name}.lst"), None)
+        comp_name = str(get_model(model, component).name)
+        lst_file = next((f for f in lst_files if f.name == f"{comp_name}.lst"), None)
     if lst_file is None:
         lst_file = next((f for f in lst_files if f.name == "mfsim.lst"), lst_files[0])
 
@@ -1052,6 +1049,8 @@ def register(mcp: FastMCP) -> None:
         """Run FloPy's pre-run model checker and return structured warnings and errors."""
         try:
             return _impl_check_model(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
@@ -1067,6 +1066,8 @@ def register(mcp: FastMCP) -> None:
         changes in auto_fix_applied."""
         try:
             return _impl_run_simulation(model, silent, auto_fix)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except RuntimeError as exc:
@@ -1093,6 +1094,8 @@ def register(mcp: FastMCP) -> None:
         failure_class="converged" when the run succeeded."""
         try:
             return _impl_diagnose_convergence(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except FileNotFoundError as exc:
@@ -1117,6 +1120,8 @@ def register(mcp: FastMCP) -> None:
         findings=[] when none are found."""
         try:
             return _impl_validate_model(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
@@ -1130,6 +1135,8 @@ def register(mcp: FastMCP) -> None:
         file when it exists; otherwise mfsim.lst is used."""
         try:
             return _impl_get_run_log(model, tail, component)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except FileNotFoundError as exc:
@@ -1153,6 +1160,8 @@ def register(mcp: FastMCP) -> None:
         observation_fit."""
         try:
             return _impl_start_run(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except RuntimeError as exc:

@@ -8,7 +8,11 @@ from pathlib import Path
 import flopy.mf6 as mf6
 import numpy as np
 
-from groundwater_mcp.utils.components import grid_class_for, spec_for
+from groundwater_mcp.utils.components import (
+    UnknownComponentError,
+    grid_class_for,
+    spec_for,
+)
 from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv, grid_size
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
@@ -292,12 +296,64 @@ def _impl_adopt_model(
     return result
 
 
+def _grid_kind_map() -> dict[type, str]:
+    """Map every registered grid package class to its kind ('dis'/...)."""
+    from groundwater_mcp.utils.components import all_components
+
+    mapping: dict[type, str] = {}
+    for spec in all_components().values():
+        for kind, cls in spec.grid_classes.items():
+            mapping[cls] = kind
+    return mapping
+
+
 def _grid_type_of(model) -> str | None:
-    """Return the grid kind ('dis'/'disv'/'disu') of a model, or None."""
-    for kind, getter in (("dis", get_dis), ("disv", get_disv), ("disu", get_disu)):
-        if getter(model) is not None:
+    """Return the grid kind ('dis'/'disv'/'disu') of any component model."""
+    mapping = _grid_kind_map()
+    for pname in list(model.get_package_list()):
+        pkg = model.get_package(pname)
+        if pkg is None:
+            continue
+        kind = mapping.get(type(pkg))
+        if kind is not None:
             return kind
     return None
+
+
+def _remove_grid_packages(model, component: str, kinds: tuple[str, ...]) -> None:
+    """Remove the named grid packages of *component* (class-based, so it works
+    for GWE/PRT packages too — the GWF-only ``get_dis`` helpers do not)."""
+    classes = tuple(
+        c for c in (grid_class_for(component, k) for k in kinds) if c is not None
+    )
+    if not classes:
+        return
+    for pname in list(model.get_package_list()):
+        pkg = model.get_package(pname)
+        if isinstance(pkg, classes):
+            model.remove_package(pkg)
+
+
+def _component_model_name(model: str, key: str, existing: set[str]) -> str:
+    """Derive a <=16-char, unique MF6 model name for a component.
+
+    A plain ``f"{model}_{key}"[:16]`` truncates back onto the base name when
+    the base is already 16 characters, producing two models that share one
+    MODELNAME (an invalid simulation). This keeps room for the suffix and
+    guarantees the result differs from every existing model name.
+    """
+    suffix = f"_{key}"
+    room = 16 - len(suffix)
+    candidate = f"{model[:room]}{suffix}" if room >= 1 else key[:16]
+    if candidate not in existing:
+        return candidate
+    for i in range(1, 1000):
+        tail = str(i)
+        room = 16 - len(suffix) - len(tail)
+        candidate = f"{model[: max(0, room)]}{suffix}{tail}"
+        if candidate not in existing:
+            return candidate
+    raise ValueError(f"Could not derive a unique component model name for '{key}'.")
 
 
 def _mirror_grid(src_model, dst_model, component: str) -> str:
@@ -352,10 +408,25 @@ def _mirror_grid(src_model, dst_model, component: str) -> str:
             "iac": np.asarray(src.iac.array).tolist(),
             "ja": np.asarray(src.ja.array).tolist(),
         }
-        for opt in ("ihc", "cl12", "hwva"):
+        for opt in ("ihc", "cl12", "hwva", "angldegx"):
             ds = getattr(src, opt, None)
             if ds is not None:
                 kwargs[opt] = np.asarray(ds.array).tolist()
+        idom = getattr(src, "idomain", None)
+        if idom is not None:
+            kwargs["idomain"] = np.asarray(idom.array).tolist()
+        vertices = getattr(src, "vertices", None)
+        cell2d = getattr(src, "cell2d", None)
+        if vertices is not None and cell2d is not None:
+            varr = np.asarray(vertices.array)
+            kwargs["vertices"] = varr.tolist()
+            kwargs["cell2d"] = np.asarray(cell2d.array).tolist()
+            nvert = getattr(src, "nvert", None)
+            kwargs["nvert"] = (
+                int(nvert.data)
+                if nvert is not None and getattr(nvert, "data", None) is not None
+                else len(varr)
+            )
     grid_cls(dst_model, **kwargs)
     return kind.upper()
 
@@ -380,18 +451,25 @@ def _impl_add_component_model(model: str, component: str, grid_from: str = "gwf"
     src_model = get_model(model, grid_from)
     gwf_model = get_model(model, "gwf")
 
-    comp_name = f"{model}_{key}"[:16]
+    comp_name = _component_model_name(model, key, set(sim.model_names))
     dst_model = spec.model_class(
         sim, modelname=comp_name, model_nam_file=f"{comp_name}.nam"
     )
-    grid_type = _mirror_grid(src_model, dst_model, key)
-
     exchange = None
-    if spec.exchange_class is not None:
-        spec.exchange_class(
-            sim, exgmnamea=getattr(gwf_model, "name", model), exgmnameb=comp_name
-        )
-        exchange = spec.exchange_class.__name__
+    try:
+        grid_type = _mirror_grid(src_model, dst_model, key)
+        if spec.exchange_class is not None:
+            spec.exchange_class(
+                sim, exgmnamea=getattr(gwf_model, "name", model), exgmnameb=comp_name
+            )
+            exchange = spec.exchange_class.__name__
+    except Exception:
+        # Never leave a half-built (package-less) model in the simulation.
+        try:
+            sim.remove_model(comp_name)
+        except Exception:
+            pass
+        raise
 
     written = save_sim(model, sim)
     model_dir = resolve_workspace(model)
@@ -570,9 +648,7 @@ def _impl_add_dis_package(
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
 
     gwf = get_model(model, component)
-    for existing in (get_dis(gwf), get_disv(gwf)):
-        if existing is not None:
-            gwf.remove_package(existing)
+    _remove_grid_packages(gwf, component, ("dis", "disv"))
 
     dis_kwargs: dict = {
         "nlay": nlay,
@@ -636,9 +712,7 @@ def _impl_add_disv_package(
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
 
     gwf = get_model(model, component)
-    for existing in (get_dis(gwf), get_disv(gwf)):
-        if existing is not None:
-            gwf.remove_package(existing)
+    _remove_grid_packages(gwf, component, ("dis", "disv"))
 
     disv_cls = grid_class_for(component, "disv")
     if disv_cls is None:
@@ -749,9 +823,7 @@ def _impl_add_disu_package(
         raise ValueError(f"len(hwva)={len(hwva)} must equal nja={nja}.")
 
     gwf = get_model(model, component)
-    for existing in (get_dis(gwf), get_disv(gwf), get_disu(gwf)):
-        if existing is not None:
-            gwf.remove_package(existing)
+    _remove_grid_packages(gwf, component, ("dis", "disv", "disu"))
 
     kwargs: dict = {
         "nodes": nodes,
@@ -1748,10 +1820,11 @@ def _impl_summarise_model(model: str) -> dict:
             comp_model = get_model(model, cname)
         except KeyError:
             continue
+        grid_kind = _grid_type_of(comp_model)
         components_info[cname] = {
             "model": mname,
             "packages": list(comp_model.get_package_list()),
-            "grid_type": _grid_type_of(comp_model),
+            "grid_type": grid_kind.upper() if grid_kind else None,
         }
 
     return {
@@ -2017,6 +2090,8 @@ def register(mcp) -> None:
                 outer_maximum,
                 under_relaxation,
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2048,6 +2123,8 @@ def register(mcp) -> None:
         coupled component model (e.g. "gwe")."""
         try:
             return _impl_set_model_crs(model, crs, xorigin, yorigin, angrot, component)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2082,6 +2159,8 @@ def register(mcp) -> None:
                 model, nlay, nrow, ncol, delr, delc, top, botm, idomain,
                 component=component,
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2114,6 +2193,8 @@ def register(mcp) -> None:
                 model, nlay, vertices, cell2d, top, botm, gridprops_file,
                 component=component,
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2168,6 +2249,8 @@ def register(mcp) -> None:
                 angldegx, idomain, vertices, cell2d, nvert, gridprops_file,
                 component=component,
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2195,6 +2278,8 @@ def register(mcp) -> None:
         m/d, m/s, m/yr, cm/s, ft/d, ft/s."""
         try:
             return _impl_add_npf_package(model, icelltype, k, k33, save_flows, k_units)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2212,6 +2297,8 @@ def register(mcp) -> None:
         (e.g. "gwe", whose IC is initial temperature)."""
         try:
             return _impl_add_ic_package(model, strt, component=component)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2242,6 +2329,8 @@ def register(mcp) -> None:
             return _impl_add_sto_package(
                 model, iconvert, ss, sy, steady_state, save_flows
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2319,6 +2408,8 @@ def register(mcp) -> None:
                 save_flows,
                 pname,
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2369,6 +2460,8 @@ def register(mcp) -> None:
             return _impl_add_boundary_package(
                 model, package, stress_period_data, kwargs, save_flows, rate_units, pname
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2396,6 +2489,8 @@ def register(mcp) -> None:
                 model, head_filerecord, budget_filerecord, saverecord, printrecord,
                 component=component,
             )
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2410,6 +2505,8 @@ def register(mcp) -> None:
         """Return a structured summary of a model's packages, grid, and stress periods."""
         try:
             return _impl_summarise_model(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
@@ -2429,6 +2526,8 @@ def register(mcp) -> None:
         result also carries a next_steps list for the same reason."""
         try:
             return _compute_model_status(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
@@ -2439,6 +2538,8 @@ def register(mcp) -> None:
         """List all files in the model workspace with sizes and extensions."""
         try:
             return _impl_list_model_files(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
@@ -2458,6 +2559,8 @@ def register(mcp) -> None:
         """
         try:
             return _impl_flush_model(model)
+        except UnknownComponentError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except Exception as exc:
