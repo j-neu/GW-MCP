@@ -145,3 +145,30 @@ def test_add_component_model_rejects_duplicate(tmp_path):
     _impl_add_component_model("cmp_dup", "gwe")
     with pytest.raises(ValueError, match="already"):
         _impl_add_component_model("cmp_dup", "gwe")
+
+
+def test_add_dis_and_ic_per_component(tmp_path):
+    import flopy.mf6 as mf6
+
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_add_ic_package,
+        _impl_create_model,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "cmp_shared"
+    _impl_create_model("cmp_shared", str(ws), "METERS", "DAYS")
+    _impl_add_dis_package(
+        "cmp_shared", nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0]
+    )
+    _impl_add_component_model("cmp_shared", "gwe")
+    _impl_add_ic_package("cmp_shared", strt=10.0)
+    _impl_add_ic_package("cmp_shared", strt=20.0, component="gwe")
+
+    gwf_ic = model_store.get_model("cmp_shared", "gwf").get_package("ic")
+    gwe_ic = model_store.get_model("cmp_shared", "gwe").get_package("ic")
+    assert float(gwf_ic.strt.array.ravel()[0]) == 10.0
+    assert float(gwe_ic.strt.array.ravel()[0]) == 20.0
+    assert isinstance(gwe_ic, mf6.ModflowGweic)

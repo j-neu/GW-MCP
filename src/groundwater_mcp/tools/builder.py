@@ -504,6 +504,7 @@ def _impl_set_model_crs(
     xorigin: float | None = None,
     yorigin: float | None = None,
     angrot: float | None = None,
+    component: str = "gwf",
 ) -> dict:
     """Set the coordinate reference system and offsets on the model grid.
 
@@ -515,7 +516,7 @@ def _impl_set_model_crs(
     or a WKT string). ``xorigin``/``yorigin`` are the lower-left corner of the
     grid; ``angrot`` the rotation in degrees (default 0).
     """
-    gwf = get_gwf(model)
+    gwf = get_model(model, component)
     angrot = angrot if angrot is not None else 0.0
     gwf.modelgrid.set_coord_info(xoff=xorigin, yoff=yorigin, angrot=angrot, crs=crs)
 
@@ -562,11 +563,12 @@ def _impl_add_dis_package(
     top: float | list,
     botm: list,
     idomain: int | list | None = None,
+    component: str = "gwf",
 ) -> dict:
     if len(botm) != nlay:
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
 
-    gwf = get_gwf(model)
+    gwf = get_model(model, component)
     for existing in (get_dis(gwf), get_disv(gwf)):
         if existing is not None:
             gwf.remove_package(existing)
@@ -582,7 +584,10 @@ def _impl_add_dis_package(
     }
     if idomain is not None:
         dis_kwargs["idomain"] = idomain
-    mf6.ModflowGwfdis(gwf, **dis_kwargs)
+    dis_cls = grid_class_for(component, "dis")
+    if dis_cls is None:
+        raise ValueError(f"Component '{component}' has no DIS grid class.")
+    dis_cls(gwf, **dis_kwargs)
     written = save_sim(model, gwf.simulation)
     return {
         "model": model,
@@ -603,6 +608,7 @@ def _impl_add_disv_package(
     top: list,
     botm: list,
     gridprops_file: str | None = None,
+    component: str = "gwf",
 ) -> dict:
     # Inline cell2d payloads are impractical beyond a size guard; accept a
     # gridprops file (JSON) instead (7f-I4).
@@ -628,12 +634,15 @@ def _impl_add_disv_package(
     if len(botm) != nlay:
         raise ValueError(f"len(botm)={len(botm)} must equal nlay={nlay}.")
 
-    gwf = get_gwf(model)
+    gwf = get_model(model, component)
     for existing in (get_dis(gwf), get_disv(gwf)):
         if existing is not None:
             gwf.remove_package(existing)
 
-    mf6.ModflowGwfdisv(
+    disv_cls = grid_class_for(component, "disv")
+    if disv_cls is None:
+        raise ValueError(f"Component '{component}' has no DISV grid class.")
+    disv_cls(
         gwf,
         nlay=nlay,
         ncpl=ncpl,
@@ -673,6 +682,7 @@ def _impl_add_disu_package(
     cell2d=None,
     nvert: int | None = None,
     gridprops_file: str | None = None,
+    component: str = "gwf",
 ) -> dict:
     """Add a fully-unstructured (DISU) grid from explicit node connectivity.
 
@@ -737,7 +747,7 @@ def _impl_add_disu_package(
     if hwva is not None and len(hwva) != nja:
         raise ValueError(f"len(hwva)={len(hwva)} must equal nja={nja}.")
 
-    gwf = get_gwf(model)
+    gwf = get_model(model, component)
     for existing in (get_dis(gwf), get_disv(gwf), get_disu(gwf)):
         if existing is not None:
             gwf.remove_package(existing)
@@ -768,7 +778,10 @@ def _impl_add_disu_package(
         kwargs["nvert"] = int(nvert)
     if cell2d is not None:
         kwargs["cell2d"] = cell2d
-    mf6.ModflowGwfdisu(gwf, **kwargs)
+    disu_cls = grid_class_for(component, "disu")
+    if disu_cls is None:
+        raise ValueError(f"Component '{component}' has no DISU grid class.")
+    disu_cls(gwf, **kwargs)
     written = save_sim(model, gwf.simulation)
     return {
         "model": model,
@@ -818,13 +831,16 @@ def _impl_add_npf_package(
     }
 
 
-def _impl_add_ic_package(model: str, strt: float | list) -> dict:
-    gwf = get_gwf(model)
+def _impl_add_ic_package(model: str, strt: float | list, component: str = "gwf") -> dict:
+    gwf = get_model(model, component)
     pkg = gwf.get_package("ic")
     if pkg is not None:
         gwf.remove_package(pkg)
 
-    mf6.ModflowGwfic(gwf, strt=strt)
+    ic_cls = spec_for(component).ic_class
+    if ic_cls is None:
+        raise ValueError(f"Component '{component}' has no IC package class.")
+    ic_cls(gwf, strt=strt)
     written = save_sim(model, gwf.simulation)
     return {"model": model, "package": "IC", "written": written}
 
@@ -1582,8 +1598,14 @@ def _impl_add_oc_package(
     budget_filerecord: str | None,
     saverecord: list | None,
     printrecord: list | None,
+    component: str = "gwf",
 ) -> dict:
-    gwf = get_gwf(model)
+    if component.lower() != "gwf":
+        raise ValueError(
+            f"OC package for component '{component}' is not supported yet — "
+            "the component's owning spec adds its own OC handling."
+        )
+    gwf = get_model(model, component)
     gwf_name = gwf.name
 
     head_file = head_filerecord or f"{gwf_name}.hds"
@@ -1983,6 +2005,7 @@ def register(mcp) -> None:
         xorigin: float | None = None,
         yorigin: float | None = None,
         angrot: float | None = None,
+        component: str = "gwf",
     ) -> dict:
         """Set the coordinate reference system (and optional offsets) on the
         model grid.
@@ -1993,9 +2016,10 @@ def register(mcp) -> None:
         carry a CRS to compare coordinates — without one they fail with
         CRS_UNKNOWN rather than guessing. ``crs`` accepts anything rasterio
         accepts (e.g. "EPSG:32718"); ``xorigin``/``yorigin`` are the grid
-        lower-left corner in that CRS."""
+        lower-left corner in that CRS. ``component`` (default "gwf") targets a
+        coupled component model (e.g. "gwe")."""
         try:
-            return _impl_set_model_crs(model, crs, xorigin, yorigin, angrot)
+            return _impl_set_model_crs(model, crs, xorigin, yorigin, angrot, component)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2016,16 +2040,19 @@ def register(mcp) -> None:
         top: float | list,
         botm: list,
         idomain: int | list | None = None,
+        component: str = "gwf",
     ) -> dict:
         """Add a structured (DIS) grid to the model.
 
         ``idomain`` marks active/inactive cells: 1 = active, 0 = inactive,
         -1 = inactive (constant head under some formulations). A 2-D array
         (nrow, ncol) is broadcast across layers; a 3-D array is (nlay, nrow,
-        ncol). Without it every cell is active."""
+        ncol). Without it every cell is active. ``component`` (default "gwf")
+        targets a coupled component model (e.g. "gwe")."""
         try:
             return _impl_add_dis_package(
-                model, nlay, nrow, ncol, delr, delc, top, botm, idomain
+                model, nlay, nrow, ncol, delr, delc, top, botm, idomain,
+                component=component,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -2045,15 +2072,20 @@ def register(mcp) -> None:
         top: list,
         botm: list,
         gridprops_file: str | None = None,
+        component: str = "gwf",
     ) -> dict:
         """Add an unstructured vertex-based (DISV) grid to the model.
 
         Inline vertices/cell2d are rejected beyond 50,000 cells
         (PAYLOAD_TOO_LARGE) — pass gridprops_file (a JSON file with
         vertices/cell2d/top/botm) or use import_grid_from_shapefile
-        (method='disv') for real Voronoi grids."""
+        (method='disv') for real Voronoi grids. ``component`` (default "gwf")
+        targets a coupled component model (e.g. "gwe")."""
         try:
-            return _impl_add_disv_package(model, nlay, vertices, cell2d, top, botm, gridprops_file)
+            return _impl_add_disv_package(
+                model, nlay, vertices, cell2d, top, botm, gridprops_file,
+                component=component,
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
@@ -2089,6 +2121,7 @@ def register(mcp) -> None:
         cell2d: list | None = None,
         nvert: int | None = None,
         gridprops_file: str | None = None,
+        component: str = "gwf",
     ) -> dict:
         """Add a fully-unstructured (DISU) grid from explicit node connectivity.
 
@@ -2098,12 +2131,14 @@ def register(mcp) -> None:
         and ``bot`` are required and ``area`` defaults to 1.0. Optional
         ``vertices``/``cell2d`` add cell x/y geometry (enabling coordinate
         observations and plan-view plots). Pass ``gridprops_file`` (JSON with
-        any of these keys) for large grids.
+        any of these keys) for large grids. ``component`` (default "gwf")
+        targets a coupled component model.
         """
         try:
             return _impl_add_disu_package(
                 model, nodes, nja, top, bot, area, iac, ja, ihc, cl12, hwva,
                 angldegx, idomain, vertices, cell2d, nvert, gridprops_file,
+                component=component,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -2142,14 +2177,19 @@ def register(mcp) -> None:
             return _err("PACKAGE_ERROR", str(exc))
 
     @mcp.tool()
-    def add_ic_package(model: str, strt: float | list) -> dict:
-        """Add an Initial Conditions (IC) package with starting heads."""
+    def add_ic_package(model: str, strt: float | list, component: str = "gwf") -> dict:
+        """Add an Initial Conditions (IC) package with starting values.
+
+        ``component`` (default "gwf") targets a coupled component model
+        (e.g. "gwe", whose IC is initial temperature)."""
         try:
-            return _impl_add_ic_package(model, strt)
+            return _impl_add_ic_package(model, strt, component=component)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
             return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
 
@@ -2317,16 +2357,23 @@ def register(mcp) -> None:
         budget_filerecord: str | None = None,
         saverecord: list | None = None,
         printrecord: list | None = None,
+        component: str = "gwf",
     ) -> dict:
-        """Add an Output Control (OC) package."""
+        """Add an Output Control (OC) package.
+
+        Only ``component="gwf"`` is supported today; a coupled component's OC
+        is added by that component's own spec."""
         try:
             return _impl_add_oc_package(
-                model, head_filerecord, budget_filerecord, saverecord, printrecord
+                model, head_filerecord, budget_filerecord, saverecord, printrecord,
+                component=component,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
             return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
 
