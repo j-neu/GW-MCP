@@ -172,3 +172,38 @@ def test_add_dis_and_ic_per_component(tmp_path):
     assert float(gwf_ic.strt.array.ravel()[0]) == 10.0
     assert float(gwe_ic.strt.array.ravel()[0]) == 20.0
     assert isinstance(gwe_ic, mf6.ModflowGweic)
+
+
+def test_summarise_model_reports_components(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_summarise_model,
+    )
+
+    _impl_create_model("cmp_sum", str(tmp_path / "cmp_sum"), "METERS", "DAYS")
+    _impl_add_dis_package(
+        "cmp_sum", nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0]
+    )
+    _impl_add_component_model("cmp_sum", "gwe")
+    out = _impl_summarise_model("cmp_sum")
+    assert set(out["components"]) == {"gwf", "gwe"}
+    assert out["components"]["gwe"]["model"] == "cmp_sum_gwe"
+    assert out["components"]["gwf"]["model"] == "cmp_sum"
+
+
+def test_model_status_reports_components(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _compute_model_status,
+        _impl_add_component_model,
+        _impl_add_dis_package,
+        _impl_create_model,
+    )
+
+    _impl_create_model("cmp_stat", str(tmp_path / "cmp_stat"), "METERS", "DAYS")
+    _impl_add_dis_package(
+        "cmp_stat", nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0]
+    )
+    _impl_add_component_model("cmp_stat", "gwe")
+    assert set(_compute_model_status("cmp_stat")["components"]) == {"gwf", "gwe"}

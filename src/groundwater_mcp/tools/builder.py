@@ -23,6 +23,7 @@ from groundwater_mcp.utils.model_store import (
     get_model,
     get_sim,
     invalidate,
+    list_components,
     restore_oc_period_records,
     save_sim,
 )
@@ -1741,6 +1742,18 @@ def _impl_summarise_model(model: str) -> dict:
         "recharge": declared.get("recharge", "m/d"),
     }
 
+    components_info: dict[str, dict] = {}
+    for cname, mname in list_components(model).items():
+        try:
+            comp_model = get_model(model, cname)
+        except KeyError:
+            continue
+        components_info[cname] = {
+            "model": mname,
+            "packages": list(comp_model.get_package_list()),
+            "grid_type": _grid_type_of(comp_model),
+        }
+
     return {
         "model": model,
         "workspace": str(ws),
@@ -1751,6 +1764,7 @@ def _impl_summarise_model(model: str) -> dict:
         "storage": storage,
         "observations": observations,
         "units": units,
+        "components": components_info,
         "reloaded_from_disk": consume_reload_flag(model),
     }
 
@@ -1767,7 +1781,20 @@ def _compute_model_status(model: str) -> dict:
     one, it just won't do anything interesting.
     """
     sim = get_sim(model)
-    gwf = get_gwf(model)
+    try:
+        gwf = get_model(model, "gwf")
+    except KeyError:
+        return {
+            "model": model,
+            "runnable": False,
+            "missing_required": ["gwf"],
+            "missing_recommended": [],
+            "next_steps": [
+                "create_model(...) — this simulation has no flow (gwf) model."
+            ],
+            "warnings": [],
+            "components": sorted(list_components(model)),
+        }
 
     dis_pkg = get_dis(gwf)
     disv_pkg = get_disv(gwf)
@@ -1836,6 +1863,7 @@ def _compute_model_status(model: str) -> dict:
         "missing_recommended": missing_recommended,
         "next_steps": next_steps,
         "warnings": warnings,
+        "components": sorted(list_components(model)),
     }
 
 
