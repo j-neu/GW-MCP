@@ -167,7 +167,13 @@ def _apply_meta_crs(sim: mf6.MFSimulation, ws: Path) -> None:
     kwargs["crs"] = crs
     for mname in list(sim.model_names):
         try:
-            sim.get_model(mname).modelgrid.set_coord_info(**kwargs)
+            model = sim.get_model(mname)
+        except Exception:
+            continue
+        if not hasattr(model, "modelgrid"):
+            continue
+        try:
+            model.modelgrid.set_coord_info(**kwargs)
         except Exception:
             pass
 
@@ -216,6 +222,10 @@ def restore_oc_period_records(sim: mf6.MFSimulation, ws: Path) -> None:
         try:
             gwf = sim.get_model(mname)
         except Exception:
+            continue
+        if not isinstance(gwf, mf6.ModflowGwf):
+            # The external-OC period restore is GWF-specific (HEAD/BUDGET
+            # saverecords). A coupled component's OC is handled by its spec.
             continue
         oc = gwf.get_package("oc")
         if oc is None:

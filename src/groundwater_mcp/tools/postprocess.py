@@ -10,8 +10,9 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
+from groundwater_mcp.utils.components import spec_for
 from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
-from groundwater_mcp.utils.model_store import get_gwf, read_meta
+from groundwater_mcp.utils.model_store import get_gwf, get_model, read_meta
 from groundwater_mcp.utils.workspace import resolve_workspace
 
 # ---------------------------------------------------------------------------
@@ -70,7 +71,9 @@ def _resolve_declared_file(workspace: Path, declared: str | None) -> Path | None
     return cand if cand.exists() else None
 
 
-def _find_output_file(model: str, workspace: Path, extension: str) -> tuple[Path, str | None]:
+def _find_output_file(
+    model: str, workspace: Path, extension: str, component: str = "gwf"
+) -> tuple[Path, str | None]:
     """Return (path, warning) for the head output file.
 
     The file declared in the OC package's ``head_filerecord`` wins — resolved
@@ -85,9 +88,12 @@ def _find_output_file(model: str, workspace: Path, extension: str) -> tuple[Path
         If no matching file exists.
     """
     exts = _HEAD_EXTENSIONS if extension in _HEAD_EXTENSIONS else (extension,)
+    value_keyword = (
+        spec_for(component).oc_value_keyword if extension in _HEAD_EXTENSIONS else None
+    )
     declared = (
-        _oc_file_record(get_gwf(model), "head_filerecord")
-        if extension in _HEAD_EXTENSIONS
+        _oc_file_record(get_model(model, component), value_keyword)
+        if value_keyword
         else None
     )
     declared_path = _resolve_declared_file(workspace, declared)
@@ -111,14 +117,16 @@ def _find_output_file(model: str, workspace: Path, extension: str) -> tuple[Path
     return matches[0], None
 
 
-def _find_budget_file(model: str, workspace: Path) -> tuple[Path, str | None]:
+def _find_budget_file(
+    model: str, workspace: Path, component: str = "gwf"
+) -> tuple[Path, str | None]:
     """Locate the cell-by-cell budget file (.cbb/.cbc/.ccf).
 
     Prefers the OC ``budget_filerecord`` (resolved relative to the workspace,
     so subdirectory output is found, and accepting the GMS ``.ccf`` spelling);
     warns when several undeclared candidates exist (7e-B13).
     """
-    declared = _oc_file_record(get_gwf(model), "budget_filerecord")
+    declared = _oc_file_record(get_model(model, component), "budget_filerecord")
     declared_path = _resolve_declared_file(workspace, declared)
     if declared_path is not None:
         return declared_path, None

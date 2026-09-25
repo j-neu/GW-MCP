@@ -25,6 +25,7 @@ from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     flush_model,
     get_gwf,
+    get_model,
     get_sim,
     invalidate,
     save_sim,
@@ -520,7 +521,7 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
     return result
 
 
-def _impl_get_run_log(model: str, tail: int = 100) -> dict:
+def _impl_get_run_log(model: str, tail: int = 100, component: str = "gwf") -> dict:
     """Return the last N lines of the MODFLOW listing file."""
     ws = resolve_workspace(model)
 
@@ -531,8 +532,18 @@ def _impl_get_run_log(model: str, tail: int = 100) -> dict:
             "Run the simulation first with run_simulation."
         )
 
-    # Prefer mfsim.lst (main listing file) over model-specific ones
-    lst_file = next((f for f in lst_files if f.name == "mfsim.lst"), lst_files[0])
+    # Default (gwf) keeps the historical mfsim.lst preference. For a coupled
+    # component, prefer that model's own listing file when it exists.
+    lst_file = None
+    if component.lower() != "gwf":
+        try:
+            comp_name = str(get_model(model, component).name)
+        except KeyError:
+            comp_name = None
+        if comp_name:
+            lst_file = next((f for f in lst_files if f.name == f"{comp_name}.lst"), None)
+    if lst_file is None:
+        lst_file = next((f for f in lst_files if f.name == "mfsim.lst"), lst_files[0])
 
     lines = lst_file.read_text(errors="replace").splitlines()
     tail_lines = lines[-tail:] if len(lines) > tail else lines
@@ -1112,10 +1123,13 @@ def register(mcp: FastMCP) -> None:
             return _err("VALIDATION_FAILED", str(exc))
 
     @mcp.tool()
-    def get_run_log(model: str, tail: int = 100) -> dict:
-        """Return the last N lines of the MODFLOW listing file (.lst)."""
+    def get_run_log(model: str, tail: int = 100, component: str = "gwf") -> dict:
+        """Return the last N lines of the MODFLOW listing file (.lst).
+
+        ``component`` (default "gwf") selects a coupled component's listing
+        file when it exists; otherwise mfsim.lst is used."""
         try:
-            return _impl_get_run_log(model, tail)
+            return _impl_get_run_log(model, tail, component)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except FileNotFoundError as exc:

@@ -207,3 +207,47 @@ def test_model_status_reports_components(tmp_path):
     )
     _impl_add_component_model("cmp_stat", "gwe")
     assert set(_compute_model_status("cmp_stat")["components"]) == {"gwf", "gwe"}
+
+
+def test_restore_oc_gated_to_gwf(tmp_path):
+    """A non-GWF OC must be left alone by the GWF-specific OC restore."""
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "ws_gate"
+    ws.mkdir()
+    sim = mf6.MFSimulation(sim_name="mfsim", version="mf6", sim_ws=str(ws))
+    mf6.ModflowTdis(sim, nper=1, perioddata=[(1.0, 1, 1.0)])
+    mf6.ModflowIms(sim)
+    gwf = mf6.ModflowGwf(sim, modelname="g1", model_nam_file="g1.nam")
+    mf6.ModflowGwfdis(gwf, nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=0.0)
+    gwe = mf6.ModflowGwe(sim, modelname="g1_gwe", model_nam_file="g1_gwe.nam")
+    mf6.ModflowGwedis(gwe, nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=0.0)
+    mf6.ModflowGweoc(gwe, filename="g1_gwe.oc")
+    mf6.ModflowGwfgwe(sim, exgmnamea="g1", exgmnameb="g1_gwe")
+    (ws / "g1_gwe.oc_1.txt").write_text("SAVE HEAD FIRST\n")
+    (ws / "g1_gwe.oc").write_text(
+        "BEGIN PERIOD 1\n  OPEN/CLOSE g1_gwe.oc_1.txt\nEND PERIOD\n"
+    )
+
+    model_store.restore_oc_period_records(sim, ws)
+    oc = gwe.get_package("oc")
+    assert not oc.saverecord.data  # untouched: non-gwf OC is skipped
+
+
+def test_get_run_log_component_param(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+    )
+    from groundwater_mcp.tools.runner import _impl_get_run_log
+    from groundwater_mcp.utils.model_store import flush_model
+
+    ws = tmp_path / "cmp_log"
+    _impl_create_model("cmp_log", str(ws), "METERS", "DAYS")
+    _impl_add_dis_package(
+        "cmp_log", nlay=1, nrow=2, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0]
+    )
+    flush_model("cmp_log")
+    (ws / "mfsim.lst").write_text("Normal termination\n")
+    out = _impl_get_run_log("cmp_log", tail=5, component="gwf")
+    assert out["listing_file"].endswith("mfsim.lst")
