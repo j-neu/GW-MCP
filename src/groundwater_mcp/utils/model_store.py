@@ -437,17 +437,70 @@ def consume_reload_flag(name: str) -> bool:
     return _reload_flags.pop(name, False)
 
 
+def detect_components(sim: mf6.MFSimulation) -> dict[str, str]:
+    """Map component name -> MF6 model name by model class, in registry order."""
+    from groundwater_mcp.utils.components import all_components
+
+    found: dict[str, str] = {}
+    for mname in list(sim.model_names):
+        try:
+            model = sim.get_model(mname)
+        except Exception:
+            continue
+        for cname, spec in all_components().items():
+            if cname not in found and isinstance(model, spec.model_class):
+                found[cname] = mname
+    return found
+
+
+def component_map(name: str) -> dict[str, str]:
+    """Return the component -> model-name map for a simulation.
+
+    The persisted ``components`` block in ``.gwmcp_meta.json`` wins; a
+    simulation registered before this feature (or adopted without a meta
+    write) falls back to class-based detection on the loaded simulation.
+    """
+    meta = read_meta(name)
+    stored = meta.get("components")
+    if stored:
+        return dict(stored)
+    return detect_components(get_sim(name))
+
+
+def list_components(name: str) -> dict[str, str]:
+    """Return the component -> MF6 model-name map for a registered model."""
+    return component_map(name)
+
+
+def get_model(name: str, component: str = "gwf") -> mf6.MFModel:
+    """Return the MF6 model for a component of a registered simulation.
+
+    With the default ``component="gwf"`` this is the historical behaviour:
+    the model named ``name``, falling back to the first model in the
+    simulation when the GWF name differs (adopted models).
+    """
+    sim = get_sim(name)
+    key = component.lower()
+    comps = component_map(name)
+    mname = comps.get(key)
+    if mname is not None:
+        model = sim.get_model(mname)
+        if model is not None:
+            return model
+    if key == "gwf":
+        mnames = list(sim.model_names)
+        if mnames:
+            return sim.get_model(mnames[0])
+    available = sorted(comps) or sorted(detect_components(sim))
+    raise KeyError(
+        f"Component '{component}' not found in simulation '{name}'. "
+        f"Available components: {available or 'none'}."
+    )
+
+
 def get_gwf(name: str) -> mf6.ModflowGwf:
     """Return the GWF model object for a registered model name."""
-    sim = get_sim(name)
-    gwf = sim.get_model(name)
-    if gwf is None:
-        # Fallback: take the first model in the simulation
-        model_names = list(sim.model_names)
-        if not model_names:
-            raise KeyError(f"No models found in simulation for '{name}'.")
-        gwf = sim.get_model(model_names[0])
-    return gwf
+    return get_model(name, "gwf")
 
 
 def invalidate(name: str) -> None:
