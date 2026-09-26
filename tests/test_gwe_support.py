@@ -313,3 +313,53 @@ def test_heat_run_skipped_when_flow_fails(tmp_path, monkeypatch):
     assert out["components"][0]["success"] is False
     assert out["components"][0]["skipped"] == "flow run failed"
     assert ran["heat"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 6: read_temperature (end-to-end)
+# ---------------------------------------------------------------------------
+
+
+@requires_mf6
+def test_read_temperature_end_to_end(tmp_path):
+    from groundwater_mcp.tools import builder, postprocess, runner
+
+    ws = tmp_path / "rt"
+    builder._impl_create_model("rt", str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation("rt", 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package("rt", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package("rt", 0, 1.0, None, True)
+    builder._impl_add_ic_package("rt", 1.0)
+    builder._impl_add_boundary_package(
+        "rt", "CHD",
+        {0: [[(0, 0, 0), 1.0, 20.0], [(0, 2, 2), 0.0, 0.0]]},
+        {"auxiliary": "TEMPERATURE"}, pname="CHD",
+    )
+    builder._impl_add_oc_package("rt", "rt.hds", "rt.cbc", [("HEAD", "ALL"), ("BUDGET", "ALL")], None)
+    builder._impl_add_gwe_model("rt")
+    builder._impl_add_dis_package(
+        "rt", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0], component="gwe"
+    )
+    builder._impl_add_ic_package("rt", 0.0, component="gwe")
+    builder._impl_add_gwe_adv_package("rt", "TVD")
+    builder._impl_add_gwe_cnd_package("rt", alh=0.0, ath1=0.0, ktw=48.384, kts=216.0)
+    builder._impl_add_gwe_est_package(
+        "rt", porosity=0.2, heat_capacity_water=4180.0,
+        density_solid=2650.0, heat_capacity_solid=900.0,
+    )
+    builder._impl_add_gwe_ssm_package("rt", sources=[("CHD", "AUX", "TEMPERATURE")])
+    builder._impl_add_oc_package(
+        "rt", "rt_gwe.ucn", "rt_gwe.cbc", [("TEMPERATURE", "ALL")], None, component="gwe"
+    )
+
+    out = runner._impl_run_simulation("rt", silent=True)
+    if not out["success"]:
+        heat_lst = ws / "gwe" / "rt_gwe.lst"
+        detail = heat_lst.read_text(errors="replace") if heat_lst.exists() else ""
+        raise AssertionError(f"{out}\n{detail[-2000:]}")
+
+    temp = postprocess._impl_read_temperature("rt")
+    assert temp["component"] == "gwe"
+    assert temp["shape"] == [3, 3]
+    assert temp["n_active"] == 9
+    assert temp["max"] >= 0.0

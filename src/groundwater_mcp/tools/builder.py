@@ -499,7 +499,10 @@ def _oc_filename(oc, attr: str, default: str) -> str:
         return default
     try:
         first = data[0]
-        value = first[0] if isinstance(first, (list, tuple)) else first
+        if isinstance(first, str):
+            value = first
+        else:
+            value = first[0]
         return str(value) if value else default
     except Exception:
         return default

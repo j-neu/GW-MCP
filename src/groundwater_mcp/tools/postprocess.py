@@ -12,7 +12,12 @@ from mcp.server.fastmcp.utilities.types import Image
 
 from groundwater_mcp.utils.components import spec_for
 from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
-from groundwater_mcp.utils.model_store import get_gwf, get_model, read_meta
+from groundwater_mcp.utils.model_store import (
+    component_workspace,
+    get_gwf,
+    get_model,
+    read_meta,
+)
 from groundwater_mcp.utils.workspace import resolve_workspace
 
 # ---------------------------------------------------------------------------
@@ -659,6 +664,65 @@ def _compute_obs_fit(model: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
+
+
+def _impl_read_temperature(
+    model: str,
+    kstpkper: tuple[int, int] | None = None,
+    layer: int = 0,
+) -> dict:
+    """Read GWE temperature from the heat simulation's temperature output.
+
+    The heat model (``add_gwe_model``) writes a ``*.ucn`` file in
+    ``<workspace>/gwe/``. Returns statistics plus an ``output_file`` (a
+    ``.npy`` of the layer array), mirroring ``read_heads``.
+    """
+    ws = resolve_workspace(model)
+    sub = component_workspace(model, "gwe") or "gwe"
+    comp_ws = ws / sub
+    gwe = get_model(model, "gwe")
+
+    keyword = spec_for("gwe").oc_value_keyword or "temperature_filerecord"
+    declared = _oc_file_record(gwe, keyword)
+    ucn = comp_ws / (Path(declared).name if declared else f"{gwe.name}.ucn")
+    if not ucn.exists():
+        raise FileNotFoundError(
+            f"No GWE temperature output ({ucn.name}) in {comp_ws}. "
+            "Run run_simulation first."
+        )
+
+    reader = None
+    for precision in ("double", "single"):
+        try:
+            reader = fu.HeadFile(str(ucn), text="TEMPERATURE", precision=precision)
+            break
+        except Exception:
+            reader = None
+    if reader is None:
+        raise ValueError(f"Could not read GWE temperature file {ucn}.")
+
+    kstpkper_list = reader.get_kstpkper()
+    if not kstpkper_list:
+        raise ValueError("Temperature file contains no data.")
+    target = tuple(kstpkper) if kstpkper is not None else kstpkper_list[-1]
+    if target not in kstpkper_list:
+        raise ValueError(f"kstpkper {target} not found. Available: {kstpkper_list}")
+
+    data = reader.get_data(kstpkper=target)
+    arr = data[layer]
+    result: dict = {
+        "model": model,
+        "component": "gwe",
+        "kstpkper": [int(v) for v in target],
+        "layer": layer,
+        "shape": list(arr.shape),
+        "n_active": int(np.sum(np.abs(arr) < 1e20)),
+        **_array_stats(arr),
+    }
+    out = comp_ws / f"{model}_temperature_k{target[0]}_p{target[1]}.npy"
+    np.save(out, arr)
+    result["output_file"] = str(out)
+    return result
 
 
 def _impl_read_heads(
