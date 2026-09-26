@@ -259,10 +259,10 @@ def _impl_start_run(model: str) -> dict:
             "flushed": flushed,
             "returncode": returncode,
         }
-    result["observation_fit"] = _compute_obs_fit(model)
-    if trap:
-        result["warning"] = sto_msg
-    return result
+        result["observation_fit"] = _compute_obs_fit(model)
+        if trap:
+            result["warning"] = sto_msg
+        return result
 
     def _progress(job) -> dict:
         lst_files = list(ws.glob("*.lst"))
