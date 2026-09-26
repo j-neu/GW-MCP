@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 74
+_EXPECTED_TOOL_COUNT = 83
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).

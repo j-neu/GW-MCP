@@ -155,6 +155,19 @@ The user-facing tools for creating `gwe`/`prt` models (`add_gwe_model`, `add_prt
 the GWE and PRT specs; the underlying `add_component_model` mirrors the GWF grid and registers the
 `GWF6-GWE6`/`GWF6-PRT6` exchange.
 
+**GWE heat transport (v0.3.0, 2026-09-25):** `add_gwe_model` creates a derived
+heat simulation in `<workspace>/gwe/` coupled to a flow run through the Flow
+Model Interface (FMI). Build its packages with `add_gwe_adv_package` /
+`add_gwe_cnd_package` / `add_gwe_est_package` / `add_gwe_ssm_package` /
+`add_gwe_esl_package`, add its grid and initial temperature with the shared
+tools using `component="gwe"`, and its output control with
+`add_oc_package(component="gwe")` (temperature_filerecord). `run_simulation`
+runs the flow model first and the heat model second. Post-process with
+`read_temperature`, `plot_temperature_map` and `plot_temperature_timeseries`.
+The flow model is made FMI-ready automatically (`save_flows`,
+`save_specific_discharge`, `save_saturation` on NPF); a GWE model requires an
+SSM package whenever the flow model has boundary packages.
+
 `stress_period_data` maps a **0-based** stress-period index to records with **0-based** cell indices (layer, row, col for DIS; layer, node for DISV); indices are converted to 1-based when written to the package file. `save_flows` (default on) writes the SAVE FLOWS option so the package's fluxes appear in the budget file for `compute_water_balance`.
 
 **RCHA/EVTA — array-based recharge/ET (7e-B8):** `add_boundary_package(package="RCHA"|"EVTA", ...)` accepts a full-grid array per stress period instead of cell records (`{"0": <nrow×ncol array>}` for DIS layer 0, or `<ncpl>` for DISV). `rate_units` is converted on entry exactly as for RCH/EVT. The budget term is `RCH`.

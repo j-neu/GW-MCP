@@ -182,6 +182,17 @@ row), and per-cycle residuals from the latest `<case>.<cycle>.<iter>.base.rei`.
 → 70 tools. `setup_da_control` / `run_pestpp_da` / `summarise_da` now cover the
 whole loop.
 
+**GWE heat transport (v0.3.0 scope) built 2026-09-25.** Nine new tools close the
+MODFLOW 6 energy-transport path: a derived heat simulation coupled to a flow run
+through the Flow Model Interface (`add_gwe_model`), the physics packages
+(`add_gwe_adv_package`, `add_gwe_cnd_package`, `add_gwe_est_package`,
+`add_gwe_ssm_package` — required whenever the flow model has boundaries — and
+`add_gwe_esl_package`), `read_temperature` and `plot_temperature_map` /
+`plot_temperature_timeseries`; grid/IC/OC reuse the shared tools with
+`component="gwe"`. → 83 tools. Spec `docs/superpowers/specs/2026-09-25-v0.3.0-gwe-design.md`.
+**Validation status: NOT YET RUN** — the v0.3.0 gate for GWE is the Tier-2
+`ex-gwe-radial` target through the 6d rerun loop.
+
 **CSUB (v0.3.0 scope) landed 2026-09-19.** Four new tools close the MODFLOW 6
 subsidence path: `add_csub_package` (11-field interbed `packagedata` with
 delay/no-delay `cdelay`, `ndelaycells`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr`,

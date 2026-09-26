@@ -44,6 +44,8 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 **v0.3.0 multi-model foundation** (2026-09-25) is in place: a single simulation can hold several models (`gwf`/`gwe`/`prt`) addressed by an optional `component` argument on the model-scoped tools, with the GWF grid mirrored into a component and its exchange registered. It ships no new tool — it is the base the **GWE** and **PRT** capability specs (with **MT3D-USGS** and **MODPATH** post-processing) build on to complete the v0.3.0 gate.
 
+**GWE heat transport** (2026-09-25) is built: `add_gwe_model` creates a heat simulation coupled to a completed flow run through MF6's Flow Model Interface, with `add_gwe_adv/cnd/est/ssm/esl_package` for the physics, `read_temperature` and `plot_temperature_*` for post-processing, and `run_simulation` running flow then heat. The ex-gwe-radial closed-book validation is the remaining v0.3.0 gate for GWE.
+
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 
 ### Safety guarantees

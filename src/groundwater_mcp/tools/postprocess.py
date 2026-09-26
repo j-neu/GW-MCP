@@ -2009,3 +2009,76 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PLOT_FAILED", str(exc))
+
+    @mcp.tool()
+    def read_temperature(
+        model: str,
+        kstpkper: tuple[int, int] | None = None,
+        layer: int = 0,
+    ) -> dict:
+        """Read GWE temperature from the heat simulation's output.
+
+        Returns statistics plus an ``output_file`` (a .npy of the layer array),
+        mirroring ``read_heads``. Requires a completed ``run_simulation`` (the
+        flow model runs first, then the heat model)."""
+        try:
+            return _impl_read_temperature(model, kstpkper, layer)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("READ_FAILED", str(exc))
+
+    @mcp.tool(structured_output=False)
+    def plot_temperature_map(
+        model: str,
+        kstpkper: tuple[int, int] | None = None,
+        layer: int = 0,
+        output_file: str | None = None,
+        title: str | None = None,
+    ) -> dict | list:
+        """Plot a plan view of GWE temperature and save as PNG.
+
+        Returns the PNG image natively (ImageContent) together with the file
+        path."""
+        try:
+            result = _impl_plot_temperature_map(model, kstpkper, layer, output_file, title)
+            return [Image(path=result["output_file"]), result]
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PLOT_FAILED", str(exc))
+
+    @mcp.tool(structured_output=False)
+    def plot_temperature_timeseries(
+        model: str,
+        cells: list[int],
+        observed_csv: str | None = None,
+        output_file: str | None = None,
+        title: str | None = None,
+    ) -> dict | list:
+        """Plot temperature against time at one or more cells.
+
+        ``cells`` are flattened node indices into the layer array (row-major for
+        a structured grid, node order for DISV). ``observed_csv`` optionally
+        overlays a two-column time,temperature series."""
+        try:
+            result = _impl_plot_temperature_timeseries(
+                model, cells, observed_csv, output_file, title
+            )
+            return [Image(path=result["output_file"]), result]
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PLOT_FAILED", str(exc))

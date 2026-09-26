@@ -2727,8 +2727,8 @@ def register(mcp) -> None:
     ) -> dict:
         """Add an Output Control (OC) package.
 
-        Only ``component="gwf"`` is supported today; a coupled component's OC
-        is added by that component's own spec."""
+        ``component="gwf"`` (default) writes the head/budget filerecords;
+        ``component="gwe"`` writes the GWE temperature/budget filerecords."""
         try:
             return _impl_add_oc_package(
                 model, head_filerecord, budget_filerecord, saverecord, printrecord,
@@ -2740,6 +2740,111 @@ def register(mcp) -> None:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:
             return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_gwe_model(model: str, flow_model: str | None = None) -> dict:
+        """Create a derived GWE heat-transport simulation coupled to a flow run.
+
+        The heat model lives in ``<workspace>/gwe/`` and reads the flow run's
+        head/budget files through the Flow Model Interface. Build its packages
+        with the ``add_gwe_*`` tools (and grid/IC with ``component="gwe"``), then
+        ``run_simulation`` runs the flow model first and the heat model second."""
+        try:
+            return _impl_add_gwe_model(model, flow_model=flow_model)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("GWE_BUILD_FAILED", str(exc))
+
+    @mcp.tool()
+    def add_gwe_adv_package(model: str, scheme: str = "TVD") -> dict:
+        """Add the GWE advection package. ``scheme`` is the transport scheme
+        (TVD, upstream, central, ...)."""
+        try:
+            return _impl_add_gwe_adv_package(model, scheme=scheme)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_gwe_cnd_package(
+        model: str,
+        alh: float | list | None = None,
+        ath1: float | list | None = None,
+        ath2: float | list | None = None,
+        alv: float | list | None = None,
+        atv: float | list | None = None,
+        ktw: float | list | None = None,
+        kts: float | list | None = None,
+    ) -> dict:
+        """Add the GWE conduction/dispersion package: thermal conductivities
+        (ktw water, kts solid) and dispersivities (alh/ath1/ath2/alv/atv)."""
+        try:
+            return _impl_add_gwe_cnd_package(model, alh, ath1, ath2, alv, atv, ktw, kts)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_gwe_est_package(
+        model: str,
+        porosity: float | list,
+        heat_capacity_water: float | None = None,
+        density_water: float | None = None,
+        heat_capacity_solid: float | list | None = None,
+        density_solid: float | list | None = None,
+        latent_heat_vaporization: float | None = None,
+        save_flows: bool = False,
+    ) -> dict:
+        """Add the GWE energy storage and transfer (EST) package."""
+        try:
+            return _impl_add_gwe_est_package(
+                model, porosity, heat_capacity_water, density_water,
+                heat_capacity_solid, density_solid, latent_heat_vaporization, save_flows,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_gwe_ssm_package(model: str, sources: list | None = None) -> dict:
+        """Add the GWE source-sink mixing (SSM) package. Required whenever the
+        flow model has boundary packages. ``sources`` is a list of
+        ``(package_name, source_type, aux_name)`` tuples, e.g.
+        ``[("CHD", "AUX", "TEMPERATURE")]``."""
+        try:
+            return _impl_add_gwe_ssm_package(model, sources)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_gwe_esl_package(model: str, stress_period_data: dict, save_flows: bool = False) -> dict:
+        """Add the GWE energy source loading (ESL) package."""
+        try:
+            return _impl_add_gwe_esl_package(model, stress_period_data, save_flows)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")
         except ValueError as exc:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
