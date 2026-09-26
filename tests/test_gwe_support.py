@@ -181,3 +181,67 @@ def test_add_gwe_model_creates_fmi_simulation(tmp_path):
     npf = model_store.get_model("gm", "gwf").get_package("npf")
     assert npf.save_specific_discharge is not None
     assert npf.save_saturation is not None
+
+
+# ---------------------------------------------------------------------------
+# Task 4: GWE packages + GWE OC + CHD auxiliary
+# ---------------------------------------------------------------------------
+
+
+def test_gwe_packages_and_oc(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_gwe_adv_package,
+        _impl_add_gwe_cnd_package,
+        _impl_add_gwe_esl_package,
+        _impl_add_gwe_est_package,
+        _impl_add_gwe_model,
+        _impl_add_gwe_ssm_package,
+        _impl_add_oc_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "pk"
+    _impl_create_model("pk", str(ws), "METERS", "DAYS")
+    _impl_set_simulation("pk", 1, [1.0], [1], "moderate")
+    _impl_add_dis_package("pk", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_gwe_model("pk")
+    _impl_add_gwe_adv_package("pk", scheme="TVD")
+    _impl_add_gwe_cnd_package("pk", alh=0.0, ath1=0.0, ktw=48.384, kts=216.0)
+    _impl_add_gwe_est_package(
+        "pk", porosity=0.2, heat_capacity_water=4180.0,
+        density_solid=2650.0, heat_capacity_solid=900.0,
+    )
+    _impl_add_gwe_ssm_package("pk", sources=[("CHD", "AUX", "TEMPERATURE")])
+    _impl_add_gwe_esl_package("pk", stress_period_data={0: [[0, 0, 100.0]]})
+    _impl_add_oc_package(
+        "pk", "pk.ucn", "pk.cbc",
+        [("TEMPERATURE", "LAST")], None, component="gwe",
+    )
+    gwe = model_store.get_model("pk", "gwe")
+    for name in ("adv", "cnd", "est", "ssm", "esl", "oc"):
+        assert gwe.get_package(name) is not None, f"missing {name}"
+
+
+def test_chd_auxiliary_temperature(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_boundary_package,
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    _impl_create_model("auxmod", str(tmp_path / "auxmod"), "METERS", "DAYS")
+    _impl_set_simulation("auxmod", 1, [1.0], [1], "moderate")
+    _impl_add_dis_package("auxmod", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_boundary_package(
+        "auxmod", "CHD",
+        {0: [[(0, 0, 0), 1.0, 20.0], [(0, 2, 2), 0.0, 0.0]]},
+        {"auxiliary": "TEMPERATURE"}, pname="CHD",
+    )
+    chd = model_store.get_model("auxmod", "gwf").get_package("chd")
+    assert chd is not None
+    assert "TEMPERATURE" in str(chd.auxiliary.array.tolist()).upper()

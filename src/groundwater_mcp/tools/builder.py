@@ -631,6 +631,97 @@ def _impl_add_gwe_model(
     }
 
 
+def _impl_add_gwe_adv_package(model: str, scheme: str = "TVD") -> dict:
+    """Add the GWE advection package (transport scheme)."""
+    gwe = get_model(model, "gwe")
+    pkg = gwe.get_package("adv")
+    if pkg is not None:
+        gwe.remove_package(pkg)
+    mf6.ModflowGweadv(gwe, scheme=scheme)
+    return {"model": model, "package": "ADV", "scheme": scheme,
+            "written": save_sim(model, gwe.simulation)}
+
+
+def _impl_add_gwe_cnd_package(
+    model: str,
+    alh: float | list | None = None,
+    ath1: float | list | None = None,
+    ath2: float | list | None = None,
+    alv: float | list | None = None,
+    atv: float | list | None = None,
+    ktw: float | list | None = None,
+    kts: float | list | None = None,
+) -> dict:
+    """Add the GWE conduction/dispersion package."""
+    gwe = get_model(model, "gwe")
+    pkg = gwe.get_package("cnd")
+    if pkg is not None:
+        gwe.remove_package(pkg)
+    kwargs: dict = {}
+    for name, value in (
+        ("alh", alh), ("ath1", ath1), ("ath2", ath2), ("alv", alv),
+        ("atv", atv), ("ktw", ktw), ("kts", kts),
+    ):
+        if value is not None:
+            kwargs[name] = value
+    mf6.ModflowGwecnd(gwe, **kwargs)
+    return {"model": model, "package": "CND", "written": save_sim(model, gwe.simulation)}
+
+
+def _impl_add_gwe_est_package(
+    model: str,
+    porosity: float | list,
+    heat_capacity_water: float | None = None,
+    density_water: float | None = None,
+    heat_capacity_solid: float | list | None = None,
+    density_solid: float | list | None = None,
+    latent_heat_vaporization: float | None = None,
+    save_flows: bool = False,
+) -> dict:
+    """Add the GWE energy storage and transfer package."""
+    gwe = get_model(model, "gwe")
+    pkg = gwe.get_package("est")
+    if pkg is not None:
+        gwe.remove_package(pkg)
+    kwargs: dict = {"porosity": porosity}
+    for name, value in (
+        ("heat_capacity_water", heat_capacity_water), ("density_water", density_water),
+        ("heat_capacity_solid", heat_capacity_solid), ("density_solid", density_solid),
+        ("latent_heat_vaporization", latent_heat_vaporization), ("save_flows", save_flows),
+    ):
+        if value is not None:
+            kwargs[name] = value
+    mf6.ModflowGweest(gwe, **kwargs)
+    return {"model": model, "package": "EST", "written": save_sim(model, gwe.simulation)}
+
+
+def _impl_add_gwe_ssm_package(model: str, sources: list | None = None) -> dict:
+    """Add the GWE source-sink mixing package (required when the flow model has
+    boundary packages). ``sources`` is [(pname, srctype, auxname)]."""
+    gwe = get_model(model, "gwe")
+    pkg = gwe.get_package("ssm")
+    if pkg is not None:
+        gwe.remove_package(pkg)
+    kwargs: dict = {}
+    if sources:
+        kwargs["sources"] = sources
+    mf6.ModflowGwessm(gwe, **kwargs)
+    return {"model": model, "package": "SSM", "written": save_sim(model, gwe.simulation)}
+
+
+def _impl_add_gwe_esl_package(
+    model: str, stress_period_data: dict, save_flows: bool = False
+) -> dict:
+    """Add the GWE energy source loading (ESL) package."""
+    gwe = get_model(model, "gwe")
+    pkg = gwe.get_package("esl")
+    if pkg is not None:
+        gwe.remove_package(pkg)
+    spd = {int(k): v for k, v in stress_period_data.items()}
+    mf6.ModflowGweesl(gwe, stress_period_data=spd, save_flows=save_flows)
+    return {"model": model, "package": "ESL", "written": save_sim(model, gwe.simulation)}
+
+
 def _impl_set_simulation(
     model: str,
     nper: int,
@@ -1817,34 +1908,41 @@ def _impl_add_oc_package(
     printrecord: list | None,
     component: str = "gwf",
 ) -> dict:
-    if component.lower() != "gwf":
-        raise ValueError(
-            f"OC package for component '{component}' is not supported yet — "
-            "the component's owning spec adds its own OC handling."
-        )
-    gwf = get_model(model, component)
-    gwf_name = gwf.name
+    key = component.lower()
+    spec = spec_for(key)
+    comp = get_model(model, key)
+    name = comp.name
 
-    head_file = head_filerecord or f"{gwf_name}.hds"
-    budget_file = budget_filerecord or f"{gwf_name}.cbb"
-    save_rec = saverecord or [("HEAD", "ALL"), ("BUDGET", "ALL")]
-
-    pkg = gwf.get_package("oc")
-    if pkg is not None:
-        gwf.remove_package(pkg)
-
-    oc_kwargs: dict = {
-        "head_filerecord": head_file,
-        "budget_filerecord": budget_file,
-        "saverecord": save_rec,
-    }
+    if key == "gwf":
+        head_file = head_filerecord or f"{name}.hds"
+        budget_file = budget_filerecord or f"{name}.cbb"
+        save_rec = saverecord or [("HEAD", "ALL"), ("BUDGET", "ALL")]
+        oc_kwargs: dict = {"head_filerecord": head_file}
+    else:
+        head_file = head_filerecord or f"{name}.ucn"
+        budget_file = budget_filerecord or f"{name}.cbb"
+        oc_kwargs = {}
+        if spec.oc_value_keyword:
+            save_rec = saverecord or [("TEMPERATURE", "ALL"), ("BUDGET", "ALL")]
+            oc_kwargs[spec.oc_value_keyword] = head_file
+        else:
+            save_rec = saverecord or [("BUDGET", "ALL")]
+    oc_kwargs["budget_filerecord"] = budget_file
+    oc_kwargs["saverecord"] = save_rec
     if printrecord is not None:
         oc_kwargs["printrecord"] = printrecord
 
-    mf6.ModflowGwfoc(gwf, **oc_kwargs)
-    written = save_sim(model, gwf.simulation)
+    pkg = comp.get_package("oc")
+    if pkg is not None:
+        comp.remove_package(pkg)
+
+    if spec.oc_class is None:
+        raise ValueError(f"Component '{key}' has no OC package class.")
+    spec.oc_class(comp, **oc_kwargs)
+    written = save_sim(model, comp.simulation)
     return {
         "model": model,
+        "component": key,
         "package": "OC",
         "head_file": head_file,
         "budget_file": budget_file,
