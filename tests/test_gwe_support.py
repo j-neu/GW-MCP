@@ -107,3 +107,42 @@ def test_gwe_fmi_two_simulation_run_and_temperature_reader(tmp_path):
     assert data is not None, "could not read the GWE temperature file"
     assert data.shape == (1, 3, 3)
     assert float(data.min()) > -50.0  # plausible temperatures, not garbage
+
+
+# ---------------------------------------------------------------------------
+# Task 2: component-simulation cache
+# ---------------------------------------------------------------------------
+
+
+def test_component_sim_cache_roundtrip(tmp_path):
+    from groundwater_mcp.utils import model_store
+
+    component = mf6.MFSimulation(sim_name="heat", version="mf6", sim_ws=str(tmp_path / "heat"))
+    model_store.cache_component_sim("gwe_cache", "gwe", component)
+    assert model_store.get_component_sim("gwe_cache", "gwe") is component
+    assert model_store.component_sim_names("gwe_cache") == ["gwe"]
+    with pytest.raises(KeyError, match="add_gwe_model"):
+        model_store.get_component_sim("gwe_cache", "prt")
+    model_store.invalidate("gwe_cache")
+    with pytest.raises(KeyError):
+        model_store.get_component_sim("gwe_cache", "gwe")
+
+
+def test_flush_writes_component_sim(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_create_model
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "gwe_flush"
+    _impl_create_model("gwe_flush", str(ws), "METERS", "DAYS")
+    csim = mf6.MFSimulation(sim_name="heat", version="mf6", sim_ws=str(ws / "gwe"))
+    import flopy.mf6 as m6
+
+    m6.ModflowTdis(csim, nper=1, perioddata=[(1.0, 1, 1.0)])
+    m6.ModflowIms(csim, complexity="SIMPLE", linear_acceleration="BICGSTAB")
+    gwe = m6.ModflowGwe(csim, modelname="gf_gwe", model_nam_file="gf_gwe.nam")
+    m6.ModflowGwedis(gwe, nlay=1, nrow=2, ncol=2, delr=1.0, delc=1.0, top=1.0, botm=0.0)
+    model_store.cache_component_sim("gwe_flush", "gwe", csim)
+    model_store.save_sim("gwe_flush", model_store.get_sim("gwe_flush"))
+    assert model_store.flush_model("gwe_flush") is True
+    assert (ws / "gwe" / "mfsim.nam").exists()
+    assert (ws / "gwe" / "gf_gwe.nam").exists()

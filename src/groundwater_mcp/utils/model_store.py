@@ -51,6 +51,7 @@ class ModelReadOnlyError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 _cache: dict[str, mf6.MFSimulation] = {}
+_component_cache: dict[str, dict[str, mf6.MFSimulation]] = {}
 _mtimes: dict[str, dict[str, float]] = {}
 _reload_flags: dict[str, bool] = {}
 _dirty: dict[str, bool] = {}
@@ -370,6 +371,8 @@ def flush_model(name: str) -> bool:
         return False
     sim = _cache[name]
     _write_sim_to_disk(sim)
+    for csim in _component_cache.get(name, {}).values():
+        _write_sim_to_disk(csim)
     _dirty[name] = False
     _record_mtimes(name, sim, resolve_workspace(name))
     return True
@@ -437,6 +440,33 @@ def cache_sim(name: str, sim: mf6.MFSimulation) -> None:
     _record_mtimes(name, sim, ws)
     _reload_flags.pop(name, None)
     _dirty.pop(name, None)
+    _component_cache.pop(name, None)
+
+
+def cache_component_sim(name: str, component: str, sim: mf6.MFSimulation) -> None:
+    """Cache a derived component simulation (e.g. an FMI-coupled heat model)."""
+    _component_cache.setdefault(name, {})[component] = sim
+
+
+def get_component_sim(name: str, component: str) -> mf6.MFSimulation:
+    """Return a cached component simulation, or raise KeyError if absent."""
+    try:
+        return _component_cache[name][component]
+    except KeyError:
+        raise KeyError(
+            f"No '{component}' simulation for model '{name}'. "
+            f"Call add_gwe_model('{name}') first."
+        ) from None
+
+
+def component_sim_names(name: str) -> list[str]:
+    """Return the component names that have a cached simulation, sorted."""
+    return sorted(_component_cache.get(name, {}))
+
+
+def invalidate_component_sim(name: str, component: str) -> None:
+    """Drop one cached component simulation."""
+    _component_cache.get(name, {}).pop(component, None)
 
 
 def consume_reload_flag(name: str) -> bool:
@@ -525,3 +555,4 @@ def invalidate(name: str) -> None:
     _mtimes.pop(name, None)
     _reload_flags.pop(name, None)
     _dirty.pop(name, None)
+    _component_cache.pop(name, None)
