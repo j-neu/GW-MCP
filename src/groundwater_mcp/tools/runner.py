@@ -25,6 +25,7 @@ from groundwater_mcp.utils.grid import get_dis
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     component_sim_names,
+    component_workspace,
     flush_model,
     get_component_sim,
     get_gwf,
@@ -498,6 +499,7 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
     # the flow model — heat advection reads the flow run's output. A heat run
     # is skipped when the flow run failed.
     component_results: list[dict] = []
+    component_listing_summary = ""
     for cname in component_sim_names(model):
         csim = get_component_sim(model, cname)
         if not success:
@@ -519,8 +521,8 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
             if not csuccess:
                 success = False
                 if cbuff:
-                    tail = cbuff[-20:] if len(cbuff) > 20 else cbuff
-                    listing_summary = "\n".join(tail)
+                    ctail = cbuff[-20:] if len(cbuff) > 20 else cbuff
+                    component_listing_summary = "\n".join(ctail)
         except Exception as exc:
             component_results.append(
                 {"component": cname, "success": False, "error": str(exc)}
@@ -551,6 +553,8 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
     result["observation_fit"] = _compute_obs_fit(model)
     if component_results:
         result["components"] = component_results
+    if component_listing_summary:
+        result["component_listing_summary"] = component_listing_summary
     if trap:
         assert sto_msg is not None
         result["warning"] = sto_msg
@@ -563,7 +567,14 @@ def _impl_get_run_log(model: str, tail: int = 100, component: str = "gwf") -> di
     """Return the last N lines of the MODFLOW listing file."""
     ws = resolve_workspace(model)
 
-    lst_files = list(ws.glob("*.lst"))
+    lst_dirs = [ws]
+    if component.lower() != "gwf":
+        sub = component_workspace(model, component)
+        if sub:
+            lst_dirs = [ws / sub, ws]
+    lst_files: list = []
+    for d in lst_dirs:
+        lst_files.extend(sorted(d.glob("*.lst")))
     if not lst_files:
         raise FileNotFoundError(
             f"No listing file (.lst) found in workspace {ws}. "

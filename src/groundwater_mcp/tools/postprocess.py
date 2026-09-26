@@ -684,7 +684,7 @@ def _impl_read_temperature(
 
     keyword = spec_for("gwe").oc_value_keyword or "temperature_filerecord"
     declared = _oc_file_record(gwe, keyword)
-    ucn = comp_ws / (Path(declared).name if declared else f"{gwe.name}.ucn")
+    ucn = comp_ws / declared if declared else comp_ws / f"{gwe.name}.ucn"
     if not ucn.exists():
         raise FileNotFoundError(
             f"No GWE temperature output ({ucn.name}) in {comp_ws}. "
@@ -733,7 +733,7 @@ def _temperature_reader(model: str):
     gwe = get_model(model, "gwe")
     keyword = spec_for("gwe").oc_value_keyword or "temperature_filerecord"
     declared = _oc_file_record(gwe, keyword)
-    ucn = comp_ws / (Path(declared).name if declared else f"{gwe.name}.ucn")
+    ucn = comp_ws / declared if declared else comp_ws / f"{gwe.name}.ucn"
     if not ucn.exists():
         raise FileNotFoundError(
             f"No GWE temperature output ({ucn.name}) in {comp_ws}. "
@@ -2073,6 +2073,8 @@ def register(mcp: FastMCP) -> None:
             result = _impl_plot_temperature_timeseries(
                 model, cells, observed_csv, output_file, title
             )
+            if isinstance(result, dict) and result.get("error"):
+                return result
             return [Image(path=result["output_file"]), result]
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwe_model first.")

@@ -18,6 +18,7 @@ from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
     cache_component_sim,
     cache_sim,
+    clear_component_sims,
     clear_csub_base_snapshot,
     clear_k_base_snapshot,
     component_map,
@@ -28,6 +29,7 @@ from groundwater_mcp.utils.model_store import (
     get_model,
     get_sim,
     invalidate,
+    is_readonly,
     list_components,
     restore_oc_period_records,
     save_sim,
@@ -274,13 +276,20 @@ def _impl_adopt_model(
     sim = mf6.MFSimulation.load(sim_ws=str(model_dir), verbosity_level=0)
     restore_oc_period_records(sim, model_dir)
     cache_sim(name, sim)
+    # Preserve separate-simulation components (e.g. a saved GWE heat model):
+    # detect_components only sees the flow simulation.
+    components: dict = dict(detect_components(sim))
+    for cname, value in (_read_meta(model_dir).get("components") or {}).items():
+        if isinstance(value, dict) and value.get("workspace"):
+            if (model_dir / value["workspace"] / "mfsim.nam").exists():
+                components.setdefault(cname, value)
     _write_meta(model_dir, {
         "name": name,
         "units": units.upper(),
         "time_units": time_units.upper(),
         "adopted": True,
         "allow_modify": bool(allow_modify),
-        "components": detect_components(sim),
+        "components": components,
     })
     result: dict = {
         "model": name,
@@ -519,8 +528,8 @@ def _flow_output_filenames(gwf) -> tuple[str, str]:
     )
 
 
-def _mirror_flow_perioddata(flow_sim) -> list:
-    """Copy the flow TDIS period data, defaulting to one 1-day period."""
+def _mirror_flow_tdis(flow_sim) -> dict:
+    """Copy the flow TDIS timing (period data, units, start date) for the heat run."""
     tdis = getattr(flow_sim, "tdis", None)
     if tdis is None:
         try:
@@ -528,12 +537,23 @@ def _mirror_flow_perioddata(flow_sim) -> list:
         except Exception:
             tdis = None
     if tdis is None:
-        return [(1.0, 1, 1.0)]
+        return {"perioddata": [(1.0, 1, 1.0)]}
+    out: dict = {"perioddata": [(1.0, 1, 1.0)]}
     try:
         data = tdis.perioddata.get_data()
-        return [(float(r[0]), int(r[1]), float(r[2])) for r in data]
+        out["perioddata"] = [(float(r[0]), int(r[1]), float(r[2])) for r in data]
     except Exception:
-        return [(1.0, 1, 1.0)]
+        pass
+    for attr in ("time_units", "start_date_time"):
+        item = getattr(tdis, attr, None)
+        if item is not None:
+            try:
+                value = item.data
+                if value:
+                    out[attr] = str(value)
+            except Exception:
+                pass
+    return out
 
 
 def _ensure_flow_saving_for_fmi(gwf, model: str) -> None:
@@ -542,29 +562,17 @@ def _ensure_flow_saving_for_fmi(gwf, model: str) -> None:
     FMI advection reads the flow model's specific discharge and saturation, so
     NPF must have ``save_specific_discharge``/``save_saturation`` (and flows)
     enabled; every boundary package must save its flows too so the aux-based
-    SSM terms reach the budget. The NPF is rebuilt in place, preserving its
-    ``k``/``icelltype``. A ``gwe_flow_saving`` meta flag lets a later
-    ``add_npf_package`` re-apply the flags.
+    SSM terms reach the budget. The flags are set **in place** on the existing
+    NPF (never rebuilt, so no other NPF setting is lost). A ``gwe_flow_saving``
+    meta flag lets a later ``add_npf_package`` re-apply the flags.
     """
     npf = gwf.get_package("npf")
     if npf is not None:
-        k = np.asarray(npf.k.array).tolist()
-        icell = np.asarray(npf.icelltype.array).tolist()
-        kwargs: dict = {
-            "icelltype": icell,
-            "k": k,
-            "save_flows": True,
-            "save_specific_discharge": True,
-            "save_saturation": True,
-        }
-        k33 = getattr(npf, "k33", None)
-        if k33 is not None:
+        for attr in ("save_flows", "save_specific_discharge", "save_saturation"):
             try:
-                kwargs["k33"] = np.asarray(k33.array).tolist()
+                setattr(npf, attr, True)
             except Exception:
                 pass
-        gwf.remove_package(npf)
-        mf6.ModflowGwfnpf(gwf, **kwargs)
     for pname in gwf.get_package_list():
         pkg = gwf.get_package(pname)
         if pkg is not None and hasattr(pkg, "save_flows"):
@@ -588,27 +596,41 @@ def _impl_add_gwe_model(
 
     The heat model lives in ``<workspace>/gwe/`` and reads the flow run's head
     and budget files through ``ModflowGwefmi``. Run the flow model first, then
-    the heat model. Packages are added with the ``add_gwe_*`` tools.
+    the heat model. Packages are added with the ``add_gwe_*`` tools. Omit
+    ``perioddata`` to mirror the flow TDIS (including its time units).
     """
     key = "gwe"
-    flow_name = flow_model or model
+    if flow_model is not None and flow_model != model:
+        raise ValueError(
+            "flow_model must be the same registered model; the derived heat "
+            "simulation is built inside this model's workspace."
+        )
+    flow_name = model
+    if is_readonly(model):
+        raise ModelReadOnlyError(
+            f"Model '{model}' was registered with adopt_model and is read-only; "
+            "add_gwe_model cannot modify its flow input set."
+        )
     flow_sim = get_sim(flow_name)
     gwf = get_model(flow_name, "gwf")
     ws = resolve_workspace(model)
     if key in component_map(model):
         raise ValueError(f"Simulation '{model}' already has a '{key}' component.")
 
-    _ensure_flow_saving_for_fmi(gwf, flow_name)
+    mirror = _mirror_flow_tdis(flow_sim)
+    pd = perioddata if perioddata is not None else mirror["perioddata"]
+    tu = time_units if time_units is not None else mirror.get("time_units")
 
     heat_ws = ws / "gwe"
     heat_ws.mkdir(parents=True, exist_ok=True)
     comp_name = _component_model_name(model, key, set(flow_sim.model_names))
 
     hsim = mf6.MFSimulation(sim_name=f"{model}_gwe", version="mf6", sim_ws=str(heat_ws))
-    pd = perioddata if perioddata is not None else _mirror_flow_perioddata(flow_sim)
     tdis_kwargs: dict = {"nper": len(pd), "perioddata": pd}
-    if time_units is not None:
-        tdis_kwargs["time_units"] = time_units
+    if tu is not None:
+        tdis_kwargs["time_units"] = tu
+    if mirror.get("start_date_time"):
+        tdis_kwargs["start_date_time"] = mirror["start_date_time"]
     mf6.ModflowTdis(hsim, **tdis_kwargs)
     # GWE matrices are asymmetric — the solver must use BICGSTAB.
     mf6.ModflowIms(hsim, complexity="SIMPLE", linear_acceleration="BICGSTAB")
@@ -620,6 +642,7 @@ def _impl_add_gwe_model(
         packagedata=[("GWFHEAD", f"../{hds}", None), ("GWFBUDGET", f"../{cbc}", None)],
     )
 
+    _ensure_flow_saving_for_fmi(gwf, flow_name)
     cache_component_sim(model, key, hsim)
     meta = _read_meta(ws)
     meta.setdefault("components", {})[key] = {"model": comp_name, "workspace": "gwe"}
@@ -707,6 +730,15 @@ def _impl_add_gwe_ssm_package(model: str, sources: list | None = None) -> dict:
         gwe.remove_package(pkg)
     kwargs: dict = {}
     if sources:
+        flow = get_model(model, "gwf")
+        available = {str(p).lower() for p in flow.get_package_list()}
+        for src in sources:
+            pname = str(src[0]).lower()
+            if pname not in available:
+                raise ValueError(
+                    f"SSM source package '{src[0]}' is not a package on the flow "
+                    f"model. Available: {sorted(flow.get_package_list())}."
+                )
         kwargs["sources"] = sources
     mf6.ModflowGwessm(gwe, **kwargs)
     return {"model": model, "package": "SSM", "written": save_sim(model, gwe.simulation)}
@@ -1128,6 +1160,11 @@ def _impl_add_npf_package(
     if k33 is not None:
         kwargs["k33"] = _convert_k_to_model(k33, k_units, time_units, length_units)
     meta.setdefault("declared_units", {})["k"] = k_units
+    if meta.get("gwe_flow_saving"):
+        # A GWE heat model needs specific discharge/saturation saved by NPF.
+        kwargs["save_specific_discharge"] = True
+        kwargs["save_saturation"] = True
+        kwargs["save_flows"] = True
     _write_meta(ws, meta)
 
     mf6.ModflowGwfnpf(gwf, **kwargs)
@@ -2224,6 +2261,7 @@ def _impl_list_models() -> dict:
 def _impl_delete_model(model: str, remove_files: bool = False) -> dict:
     """Unregister a model; optionally delete its workspace (7e-B4.1)."""
     delete_workspace(model, remove_files=remove_files)
+    clear_component_sims(model)
     invalidate(model)
     return {
         "model": model,
@@ -2746,15 +2784,24 @@ def register(mcp) -> None:
             return _err("PACKAGE_ERROR", str(exc))
 
     @mcp.tool()
-    def add_gwe_model(model: str, flow_model: str | None = None) -> dict:
+    def add_gwe_model(
+        model: str,
+        flow_model: str | None = None,
+        perioddata: list | None = None,
+        time_units: str | None = None,
+    ) -> dict:
         """Create a derived GWE heat-transport simulation coupled to a flow run.
 
         The heat model lives in ``<workspace>/gwe/`` and reads the flow run's
         head/budget files through the Flow Model Interface. Build its packages
         with the ``add_gwe_*`` tools (and grid/IC with ``component="gwe"``), then
-        ``run_simulation`` runs the flow model first and the heat model second."""
+        ``run_simulation`` runs the flow model first and the heat model second.
+        Omit ``perioddata`` to mirror the flow TDIS (including its time units);
+        pass ``[ (perlen, nstp, tsmult), ... ]`` for a different heat schedule."""
         try:
-            return _impl_add_gwe_model(model, flow_model=flow_model)
+            return _impl_add_gwe_model(
+                model, flow_model=flow_model, perioddata=perioddata, time_units=time_units
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:

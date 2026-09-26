@@ -21,6 +21,16 @@ def _mf6_available() -> bool:
 requires_mf6 = pytest.mark.skipif(not _mf6_available(), reason="MODFLOW 6 not installed")
 
 
+def _call_tool(name: str, args: dict):
+    import asyncio
+    import json
+
+    from groundwater_mcp.server import mcp
+
+    result = asyncio.run(mcp.call_tool(name, args))
+    return json.loads(result[0].text)
+
+
 def _build_flow_and_heat(root: Path):
     flow_ws = root / "flow"
     flow_ws.mkdir()
@@ -217,7 +227,7 @@ def test_gwe_packages_and_oc(tmp_path):
         "pk", porosity=0.2, heat_capacity_water=4180.0,
         density_solid=2650.0, heat_capacity_solid=900.0,
     )
-    _impl_add_gwe_ssm_package("pk", sources=[("CHD", "AUX", "TEMPERATURE")])
+    _impl_add_gwe_ssm_package("pk", sources=None)
     _impl_add_gwe_esl_package("pk", stress_period_data={0: [[0, 0, 100.0]]})
     _impl_add_oc_package(
         "pk", "pk.ucn", "pk.cbc",
@@ -420,3 +430,148 @@ def test_temperature_plots(tmp_path):
     assert Path(ts["output_file"]).exists()
     assert ts["n_times"] == 2
     assert ts["has_observed"] is True
+
+    bad = _call_tool(
+        "plot_temperature_timeseries",
+        {"model": "pt", "cells": [4], "observed_csv": str(ws / "nope.csv")},
+    )
+    assert bad["code"] == "OUTPUT_FILE_MISSING"
+
+
+# ---------------------------------------------------------------------------
+# Review-fix tests (C1-C3, I1-I7)
+# ---------------------------------------------------------------------------
+
+
+def _mk_gwe(tmp_path, name: str = "fx"):
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils.model_store import flush_model
+
+    ws = tmp_path / name
+    builder._impl_create_model(name, str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation(name, 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package(name, nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package(name, 0, 1.0, None, True)
+    builder._impl_add_oc_package(name, f"{name}.hds", f"{name}.cbc", [("HEAD", "ALL")], None)
+    builder._impl_add_gwe_model(name)
+    builder._impl_add_dis_package(
+        name, nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0], component="gwe"
+    )
+    flush_model(name)
+    return ws
+
+
+def test_component_sim_reloads_from_disk(tmp_path):
+    """C1: a saved heat model must be recoverable after the cache is cleared."""
+    from groundwater_mcp.utils import model_store
+
+    _mk_gwe(tmp_path, "reload")
+    model_store.clear_component_sims("reload")
+    sim = model_store.get_component_sim("reload", "gwe")
+    assert sim.get_model(model_store.component_map("reload")["gwe"]) is not None
+
+
+def test_add_gwe_model_preserves_npf_settings(tmp_path):
+    """C2: enabling FMI must not rebuild (and thus drop settings from) NPF."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "npfkeep"
+    builder._impl_create_model("npfkeep", str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation("npfkeep", 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package("npfkeep", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package("npfkeep", 0, 1.0, None, True)
+    npf = model_store.get_model("npfkeep", "gwf").get_package("npf")
+    builder._impl_add_gwe_model("npfkeep")
+    npf2 = model_store.get_model("npfkeep", "gwf").get_package("npf")
+    assert npf2 is npf  # same object: not rebuilt
+    assert npf2.save_specific_discharge is not None
+
+
+def test_add_gwe_model_mirrors_time_units(tmp_path):
+    """C3: the heat simulation inherits the flow model's time units."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "tu"
+    builder._impl_create_model("tu", str(ws), "METERS", "HOURS")
+    builder._impl_set_simulation("tu", 1, [12.0], [1], "moderate")
+    builder._impl_add_dis_package("tu", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package("tu", 0, 1.0, None, True)
+    builder._impl_add_gwe_model("tu")
+    hsim = model_store.get_component_sim("tu", "gwe")
+    assert str(hsim.tdis.time_units.data).upper() == "HOURS"
+
+
+def test_add_gwe_model_readonly_refuses_without_mutation(tmp_path):
+    """I1: a read-only adopted model must not be partially mutated."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "ro_flow"
+    builder._impl_create_model("ro_flow", str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation("ro_flow", 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package("ro_flow", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    model_store.flush_model("ro_flow")
+    builder._impl_adopt_model("roadopt", str(ws), "METERS", "DAYS")
+    with pytest.raises(model_store.ModelReadOnlyError):
+        builder._impl_add_gwe_model("roadopt")
+    assert "gwe" not in model_store.component_map("roadopt")
+
+
+def test_ssm_source_validated(tmp_path):
+    """I5: an SSM source naming an absent flow package is rejected."""
+    from groundwater_mcp.tools import builder
+
+    _mk_gwe(tmp_path, "ssmx")
+    with pytest.raises(ValueError, match="not a package"):
+        builder._impl_add_gwe_ssm_package("ssmx", sources=[("NOPE", "AUX", "TEMPERATURE")])
+
+
+def test_delete_model_clears_component_cache(tmp_path):
+    """I6: deleting a model must drop its cached component simulations."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    _mk_gwe(tmp_path, "delx")
+    builder._impl_delete_model("delx")
+    assert model_store.component_sim_names("delx") == []
+
+
+def test_adopt_preserves_separate_sim_component(tmp_path):
+    """I7: adopting a workspace keeps a saved separate-sim heat component."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = _mk_gwe(tmp_path, "adoptme")
+    model_store.invalidate("adoptme")
+    builder._impl_adopt_model("adoptgwe", str(ws), "METERS", "DAYS")
+    assert "gwe" in model_store.component_map("adoptgwe")
+
+
+def test_get_run_log_finds_heat_listing(tmp_path):
+    """I3: get_run_log(component='gwe') reads the heat listing, not mfsim.lst."""
+    from groundwater_mcp.tools import runner
+
+    ws = _mk_gwe(tmp_path, "logx")
+    (ws / "gwe" / "logx_gwe.lst").write_text("HEAT\nNormal termination\n")
+    (ws / "mfsim.lst").write_text("FLOW\n")
+    out = runner._impl_get_run_log("logx", tail=5, component="gwe")
+    assert out["listing_file"].endswith("logx_gwe.lst")
+
+
+def test_heat_failure_listing_surfaced(tmp_path, monkeypatch):
+    """I2: a heat-run failure reason must be reported, not overwritten."""
+    from groundwater_mcp.tools import runner
+    from groundwater_mcp.utils import model_store
+
+    _mk_gwe(tmp_path, "hf")
+    flow = model_store.get_sim("hf")
+    heat = model_store.get_component_sim("hf", "gwe")
+    flow.run_simulation = lambda **kw: (True, ["flow ok"])
+    heat.run_simulation = lambda **kw: (False, ["heat exploded"])
+    monkeypatch.setattr(runner, "_find_mf6_binary", lambda: "mf6")
+
+    out = runner._impl_run_simulation("hf", silent=True)
+    assert out["success"] is False
+    assert "heat exploded" in out.get("component_listing_summary", "")

@@ -454,14 +454,39 @@ def cache_component_sim(name: str, component: str, sim: mf6.MFSimulation) -> Non
 
 
 def get_component_sim(name: str, component: str) -> mf6.MFSimulation:
-    """Return a cached component simulation, or raise KeyError if absent."""
+    """Return a component simulation, reloading it from disk if not cached.
+
+    Reloading matters after a process restart or an ``adopt_model`` (which
+    clears the in-memory cache): without it a saved heat model would be
+    silently skipped by ``run_simulation``.
+    """
+    cached = _component_cache.get(name, {}).get(component)
+    if cached is not None:
+        return cached
     try:
-        return _component_cache[name][component]
+        sub = component_workspace(name, component)
     except KeyError:
-        raise KeyError(
-            f"No '{component}' simulation for model '{name}'. "
-            f"Call add_gwe_model('{name}') first."
-        ) from None
+        sub = None
+    if sub:
+        path = resolve_workspace(name) / sub
+        if (path / "mfsim.nam").exists():
+            sim = mf6.MFSimulation.load(sim_ws=str(path), verbosity_level=0)
+            cache_component_sim(name, component, sim)
+            return sim
+    raise KeyError(
+        f"No '{component}' simulation for model '{name}'. "
+        f"Call add_gwe_model('{name}') first."
+    )
+
+
+def clear_component_sims(name: str) -> None:
+    """Drop every cached component simulation for a model (e.g. on delete)."""
+    _component_cache.pop(name, None)
+
+
+def is_readonly(name: str) -> bool:
+    """Return whether a model was registered read-only via adopt_model."""
+    return _is_readonly(name)
 
 
 def component_sim_names(name: str) -> list[str]:
@@ -518,7 +543,15 @@ def component_map(name: str) -> dict[str, str]:
         mname = value.get("model") if isinstance(value, dict) else value
         if not mname:
             continue
-        if (isinstance(value, dict) and value.get("workspace")) or mname in existing:
+        if isinstance(value, dict) and value.get("workspace"):
+            # Separate-simulation component: keep while its inputs exist on
+            # disk, or while it is still cached in memory (not yet flushed).
+            sub = resolve_workspace(name) / value["workspace"]
+            if (sub / "mfsim.nam").exists() or (
+                cname in _component_cache.get(name, {})
+            ):
+                resolved[cname] = mname
+        elif mname in existing:
             resolved[cname] = mname
     for cname, mname in detected.items():
         resolved.setdefault(cname, mname)
