@@ -146,3 +146,38 @@ def test_flush_writes_component_sim(tmp_path):
     assert model_store.flush_model("gwe_flush") is True
     assert (ws / "gwe" / "mfsim.nam").exists()
     assert (ws / "gwe" / "gf_gwe.nam").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 3: add_gwe_model (FMI)
+# ---------------------------------------------------------------------------
+
+
+def test_add_gwe_model_creates_fmi_simulation(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_gwe_model,
+        _impl_add_npf_package,
+        _impl_add_oc_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "gm"
+    _impl_create_model("gm", str(ws), "METERS", "DAYS")
+    _impl_set_simulation("gm", 1, [1.0], [1], "moderate")
+    _impl_add_dis_package("gm", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("gm", 0, 1.0, None, True)
+    _impl_add_oc_package("gm", "gm.hds", "gm.cbc", [("HEAD", "ALL")], None)
+
+    out = _impl_add_gwe_model("gm")
+    assert out["component"] == "gwe"
+    hsim = model_store.get_component_sim("gm", "gwe")
+    gwe = hsim.get_model(model_store.component_map("gm")["gwe"])
+    assert gwe.get_package("fmi") is not None
+    assert model_store.component_workspace("gm", "gwe") == "gwe"
+    # FMI requires the flow model to save specific discharge/saturation.
+    npf = model_store.get_model("gm", "gwf").get_package("npf")
+    assert npf.save_specific_discharge is not None
+    assert npf.save_saturation is not None

@@ -343,6 +343,11 @@ def save_sim(name: str, sim: mf6.MFSimulation) -> bool:
             "allow_modify=True) to allow modifications, or create a copy with "
             "create_model and rebuild the model there."
         )
+    if any(csim is sim for csim in _component_cache.get(name, {}).values()):
+        # A component (e.g. heat) simulation — keep it in the component cache
+        # rather than clobbering the flow simulation under this name.
+        _dirty[name] = True
+        return False
     _cache[name] = sim
     _dirty[name] = True
     return False
@@ -497,20 +502,33 @@ def detect_components(sim: mf6.MFSimulation) -> dict[str, str]:
 def component_map(name: str) -> dict[str, str]:
     """Return the component -> model-name map for a simulation.
 
-    The persisted ``components`` block in ``.gwmcp_meta.json`` is reconciled
-    with the simulation: stored entries naming a model that is no longer
-    present are dropped (no phantom components), and components present in the
-    simulation but missing from the stored map are recovered by class
-    detection.
+    Entries may be stored as a plain model name (a component in the flow
+    simulation) or as a dict ``{"model", "workspace"}`` for a component that
+    lives in its own derived simulation (e.g. an FMI-coupled heat model). The
+    map is reconciled with reality: stored flow components naming a model that
+    is gone are dropped (no phantoms), separate-simulation components are
+    trusted, and components found by class detection are merged in.
     """
     sim = get_sim(name)
     detected = detect_components(sim)
     stored = read_meta(name).get("components") or {}
     existing = set(sim.model_names)
-    resolved = {c: m for c, m in stored.items() if m in existing}
+    resolved: dict[str, str] = {}
+    for cname, value in stored.items():
+        mname = value.get("model") if isinstance(value, dict) else value
+        if not mname:
+            continue
+        if (isinstance(value, dict) and value.get("workspace")) or mname in existing:
+            resolved[cname] = mname
     for cname, mname in detected.items():
         resolved.setdefault(cname, mname)
     return resolved
+
+
+def component_workspace(name: str, component: str) -> str | None:
+    """Return the sub-workspace of a separate-simulation component, if any."""
+    value = (read_meta(name).get("components") or {}).get(component)
+    return value.get("workspace") if isinstance(value, dict) else None
 
 
 def list_components(name: str) -> dict[str, str]:
@@ -527,6 +545,18 @@ def get_model(name: str, component: str = "gwf") -> mf6.MFModel:
     """
     sim = get_sim(name)
     key = component.lower()
+    workspace = component_workspace(name, key)
+    if workspace:
+        comps = component_map(name)
+        mname = comps.get(key)
+        csim = get_component_sim(name, key)
+        model = csim.get_model(mname) if mname else None
+        if model is not None:
+            return model
+        raise UnknownComponentError(
+            f"Component '{component}' has a separate simulation for '{name}' "
+            f"but its model '{mname}' is missing from it."
+        )
     comps = component_map(name)
     mname = comps.get(key)
     if mname is not None:

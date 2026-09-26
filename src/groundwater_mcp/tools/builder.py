@@ -16,6 +16,7 @@ from groundwater_mcp.utils.components import (
 from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv, grid_size
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
+    cache_component_sim,
     cache_sim,
     clear_csub_base_snapshot,
     clear_k_base_snapshot,
@@ -483,6 +484,149 @@ def _impl_add_component_model(model: str, component: str, grid_from: str = "gwf"
         "component_model": comp_name,
         "grid_type": grid_type,
         "exchange": exchange,
+        "written": written,
+    }
+
+
+def _oc_filename(oc, attr: str, default: str) -> str:
+    """Best-effort read of an OC filerecord name; falls back to *default*."""
+    rec = getattr(oc, attr, None)
+    if rec is None:
+        return default
+    try:
+        data = rec.get_data()
+    except Exception:
+        return default
+    try:
+        first = data[0]
+        value = first[0] if isinstance(first, (list, tuple)) else first
+        return str(value) if value else default
+    except Exception:
+        return default
+
+
+def _flow_output_filenames(gwf) -> tuple[str, str]:
+    oc = gwf.get_package("oc")
+    name = gwf.name
+    if oc is None:
+        return f"{name}.hds", f"{name}.cbc"
+    return (
+        _oc_filename(oc, "head_filerecord", f"{name}.hds"),
+        _oc_filename(oc, "budget_filerecord", f"{name}.cbc"),
+    )
+
+
+def _mirror_flow_perioddata(flow_sim) -> list:
+    """Copy the flow TDIS period data, defaulting to one 1-day period."""
+    tdis = getattr(flow_sim, "tdis", None)
+    if tdis is None:
+        try:
+            tdis = flow_sim.get_package("tdis")
+        except Exception:
+            tdis = None
+    if tdis is None:
+        return [(1.0, 1, 1.0)]
+    try:
+        data = tdis.perioddata.get_data()
+        return [(float(r[0]), int(r[1]), float(r[2])) for r in data]
+    except Exception:
+        return [(1.0, 1, 1.0)]
+
+
+def _ensure_flow_saving_for_fmi(gwf, model: str) -> None:
+    """Make the flow model save what a GWE FMI run needs.
+
+    FMI advection reads the flow model's specific discharge and saturation, so
+    NPF must have ``save_specific_discharge``/``save_saturation`` (and flows)
+    enabled; every boundary package must save its flows too so the aux-based
+    SSM terms reach the budget. The NPF is rebuilt in place, preserving its
+    ``k``/``icelltype``. A ``gwe_flow_saving`` meta flag lets a later
+    ``add_npf_package`` re-apply the flags.
+    """
+    npf = gwf.get_package("npf")
+    if npf is not None:
+        k = np.asarray(npf.k.array).tolist()
+        icell = np.asarray(npf.icelltype.array).tolist()
+        kwargs: dict = {
+            "icelltype": icell,
+            "k": k,
+            "save_flows": True,
+            "save_specific_discharge": True,
+            "save_saturation": True,
+        }
+        k33 = getattr(npf, "k33", None)
+        if k33 is not None:
+            try:
+                kwargs["k33"] = np.asarray(k33.array).tolist()
+            except Exception:
+                pass
+        gwf.remove_package(npf)
+        mf6.ModflowGwfnpf(gwf, **kwargs)
+    for pname in gwf.get_package_list():
+        pkg = gwf.get_package(pname)
+        if pkg is not None and hasattr(pkg, "save_flows"):
+            try:
+                pkg.save_flows = True
+            except Exception:
+                pass
+    ws = resolve_workspace(model)
+    meta = _read_meta(ws)
+    meta["gwe_flow_saving"] = True
+    _write_meta(ws, meta)
+
+
+def _impl_add_gwe_model(
+    model: str,
+    flow_model: str | None = None,
+    perioddata: list | None = None,
+    time_units: str | None = None,
+) -> dict:
+    """Create a derived GWE heat simulation coupled to a flow run via FMI.
+
+    The heat model lives in ``<workspace>/gwe/`` and reads the flow run's head
+    and budget files through ``ModflowGwefmi``. Run the flow model first, then
+    the heat model. Packages are added with the ``add_gwe_*`` tools.
+    """
+    key = "gwe"
+    flow_name = flow_model or model
+    flow_sim = get_sim(flow_name)
+    gwf = get_model(flow_name, "gwf")
+    ws = resolve_workspace(model)
+    if key in component_map(model):
+        raise ValueError(f"Simulation '{model}' already has a '{key}' component.")
+
+    _ensure_flow_saving_for_fmi(gwf, flow_name)
+
+    heat_ws = ws / "gwe"
+    heat_ws.mkdir(parents=True, exist_ok=True)
+    comp_name = _component_model_name(model, key, set(flow_sim.model_names))
+
+    hsim = mf6.MFSimulation(sim_name=f"{model}_gwe", version="mf6", sim_ws=str(heat_ws))
+    pd = perioddata if perioddata is not None else _mirror_flow_perioddata(flow_sim)
+    tdis_kwargs: dict = {"nper": len(pd), "perioddata": pd}
+    if time_units is not None:
+        tdis_kwargs["time_units"] = time_units
+    mf6.ModflowTdis(hsim, **tdis_kwargs)
+    # GWE matrices are asymmetric — the solver must use BICGSTAB.
+    mf6.ModflowIms(hsim, complexity="SIMPLE", linear_acceleration="BICGSTAB")
+    gwe = mf6.ModflowGwe(hsim, modelname=comp_name, model_nam_file=f"{comp_name}.nam")
+
+    hds, cbc = _flow_output_filenames(gwf)
+    mf6.ModflowGwefmi(
+        gwe,
+        packagedata=[("GWFHEAD", f"../{hds}", None), ("GWFBUDGET", f"../{cbc}", None)],
+    )
+
+    cache_component_sim(model, key, hsim)
+    meta = _read_meta(ws)
+    meta.setdefault("components", {})[key] = {"model": comp_name, "workspace": "gwe"}
+    _write_meta(ws, meta)
+    written = save_sim(model, flow_sim)
+    return {
+        "model": model,
+        "component": key,
+        "component_model": comp_name,
+        "workspace": str(heat_ws),
         "written": written,
     }
 
