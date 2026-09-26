@@ -725,6 +725,146 @@ def _impl_read_temperature(
     return result
 
 
+def _temperature_reader(model: str):
+    """Open the heat simulation's temperature file; return (reader, comp_ws)."""
+    ws = resolve_workspace(model)
+    sub = component_workspace(model, "gwe") or "gwe"
+    comp_ws = ws / sub
+    gwe = get_model(model, "gwe")
+    keyword = spec_for("gwe").oc_value_keyword or "temperature_filerecord"
+    declared = _oc_file_record(gwe, keyword)
+    ucn = comp_ws / (Path(declared).name if declared else f"{gwe.name}.ucn")
+    if not ucn.exists():
+        raise FileNotFoundError(
+            f"No GWE temperature output ({ucn.name}) in {comp_ws}. "
+            "Run run_simulation first."
+        )
+    for precision in ("double", "single"):
+        try:
+            return fu.HeadFile(str(ucn), text="TEMPERATURE", precision=precision), comp_ws
+        except Exception:
+            continue
+    raise ValueError(f"Could not read GWE temperature file {ucn}.")
+
+
+def _impl_plot_temperature_map(
+    model: str,
+    kstpkper: tuple[int, int] | None = None,
+    layer: int = 0,
+    output_file: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """Plot a plan view of GWE temperature for one time/layer and save as PNG."""
+    from flopy.plot import PlotMapView
+
+    from groundwater_mcp.utils.plotting import figure, save_figure
+
+    result = _impl_read_temperature(model, kstpkper=kstpkper, layer=layer)
+    arr = np.load(result["output_file"])
+    ws = resolve_workspace(model)
+    gwe = get_model(model, "gwe")
+
+    with figure(figsize=(8, 6)) as fig:
+        ax = fig.add_subplot(1, 1, 1)
+        pmv = PlotMapView(model=gwe, ax=ax, layer=layer)
+        cb = pmv.plot_array(arr, cmap="jet")
+        fig.colorbar(cb, ax=ax, shrink=0.7, label="Temperature")
+        ax.set_aspect("equal")
+        ax.set_title(title or f"{model} temperature")
+        target = _resolve_output_path(ws, output_file, "") if output_file else None
+        out_path = save_figure(fig, target, ws)
+
+    return {
+        "model": model,
+        "component": "gwe",
+        "output_file": out_path,
+        "kstpkper": result.get("kstpkper"),
+        "layer": layer,
+        "shape": result.get("shape"),
+        "min": result.get("min"),
+        "max": result.get("max"),
+    }
+
+
+def _impl_plot_temperature_timeseries(
+    model: str,
+    cells: list[int],
+    observed_csv: str | None = None,
+    output_file: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """Plot temperature against time at one or more cells.
+
+    ``cells`` are flattened node indices into the layer array (row-major for a
+    structured grid, node order for DISV). ``observed_csv`` optionally overlays
+    a two-column time,temperature series when exactly one cell is given.
+    """
+    from groundwater_mcp.utils.plotting import figure, save_figure
+
+    if not cells:
+        raise ValueError("Pass at least one cell index in `cells`.")
+    reader, comp_ws = _temperature_reader(model)
+    alldata = reader.get_alldata()
+    if alldata is None or len(alldata) == 0:
+        raise ValueError("Temperature file contains no data.")
+    times = list(reader.get_times())
+    if not times:
+        times = [float(i) for i in range(len(alldata))]
+    n_nodes = int(np.ravel(alldata[0]).size)
+    for c in cells:
+        if not (0 <= c < n_nodes):
+            raise ValueError(f"cell {c} out of range (0..{n_nodes - 1}).")
+
+    ws = resolve_workspace(model)
+    with figure(figsize=(9, 5)) as fig:
+        ax = fig.add_subplot(1, 1, 1)
+        for c in cells:
+            series = [float(np.ravel(alldata[t])[c]) for t in range(len(alldata))]
+            ax.plot(times, series, marker="o", label=f"cell {c}")
+        ax.set_xlabel("Elapsed time (model time units)")
+        ax.set_ylabel("Temperature")
+        ax.set_title(title or f"{model} temperature")
+        if len(cells) == 1:
+            ax.legend()
+
+        has_observed = False
+        if observed_csv is not None:
+            p = Path(observed_csv)
+            cand = p if p.is_absolute() else ws / p
+            if not cand.exists():
+                return _err(
+                    "OUTPUT_FILE_MISSING",
+                    f"Observed temperature CSV not found: {cand}",
+                    "Pass observed_csv as a two-column time,temperature CSV.",
+                )
+            obs_t, obs_y = [], []
+            for line in cand.read_text().splitlines():
+                parts = [s.strip() for s in line.replace(",", " ").split()]
+                if len(parts) >= 2:
+                    try:
+                        obs_t.append(float(parts[0]))
+                        obs_y.append(float(parts[1]))
+                    except ValueError:
+                        continue
+            if obs_t:
+                ax.plot(obs_t, obs_y, marker="s", linestyle="--", color="tab:red",
+                        label="Observed")
+                ax.legend()
+                has_observed = True
+
+        target = _resolve_output_path(ws, output_file, "") if output_file else None
+        out_path = save_figure(fig, target, ws)
+
+    return {
+        "model": model,
+        "component": "gwe",
+        "output_file": out_path,
+        "cells": list(cells),
+        "n_times": len(alldata),
+        "has_observed": has_observed,
+    }
+
+
 def _impl_read_heads(
     model: str,
     kstpkper: tuple[int, int] | None = None,

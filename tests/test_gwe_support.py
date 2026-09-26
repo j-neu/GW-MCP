@@ -363,3 +363,60 @@ def test_read_temperature_end_to_end(tmp_path):
     assert temp["shape"] == [3, 3]
     assert temp["n_active"] == 9
     assert temp["max"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task 7: temperature plots
+# ---------------------------------------------------------------------------
+
+
+def _build_and_run_heat(tmp_path, name: str = "pt"):
+    from groundwater_mcp.tools import builder, runner
+
+    ws = tmp_path / name
+    builder._impl_create_model(name, str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation(name, 2, [0.5, 0.5], [1, 1], "moderate")
+    builder._impl_add_dis_package(name, nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package(name, 0, 1.0, None, True)
+    builder._impl_add_ic_package(name, 1.0)
+    builder._impl_add_boundary_package(
+        name, "CHD",
+        {0: [[(0, 0, 0), 1.0, 20.0], [(0, 2, 2), 0.0, 0.0]]},
+        {"auxiliary": "TEMPERATURE"}, pname="CHD",
+    )
+    builder._impl_add_oc_package(name, f"{name}.hds", f"{name}.cbc",
+                                 [("HEAD", "ALL"), ("BUDGET", "ALL")], None)
+    builder._impl_add_gwe_model(name)
+    builder._impl_add_dis_package(name, nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0,
+                                  top=1.0, botm=[0.0], component="gwe")
+    builder._impl_add_ic_package(name, 0.0, component="gwe")
+    builder._impl_add_gwe_adv_package(name, "TVD")
+    builder._impl_add_gwe_cnd_package(name, alh=0.0, ath1=0.0, ktw=48.384, kts=216.0)
+    builder._impl_add_gwe_est_package(name, porosity=0.2, heat_capacity_water=4180.0,
+                                      density_solid=2650.0, heat_capacity_solid=900.0)
+    builder._impl_add_gwe_ssm_package(name, sources=[("CHD", "AUX", "TEMPERATURE")])
+    builder._impl_add_oc_package(name, f"{name}_gwe.ucn", f"{name}_gwe.cbc",
+                                 [("TEMPERATURE", "ALL")], None, component="gwe")
+    out = runner._impl_run_simulation(name, silent=True)
+    assert out["success"] is True, out.get("components")
+    return ws
+
+
+@requires_mf6
+def test_temperature_plots(tmp_path):
+    from groundwater_mcp.tools import postprocess
+
+    ws = _build_and_run_heat(tmp_path, "pt")
+
+    m = postprocess._impl_plot_temperature_map("pt", output_file=str(ws / "tmap.png"))
+    assert m["component"] == "gwe"
+    assert Path(m["output_file"]).exists()
+
+    obs = ws / "obs.csv"
+    obs.write_text("0.0,0.0\n0.5,5.0\n1.0,8.0\n")
+    ts = postprocess._impl_plot_temperature_timeseries(
+        "pt", cells=[4], observed_csv=str(obs), output_file=str(ws / "ts.png")
+    )
+    assert Path(ts["output_file"]).exists()
+    assert ts["n_times"] == 2
+    assert ts["has_observed"] is True
