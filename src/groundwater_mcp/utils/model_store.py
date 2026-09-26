@@ -585,4 +585,3 @@ def invalidate(name: str) -> None:
     _mtimes.pop(name, None)
     _reload_flags.pop(name, None)
     _dirty.pop(name, None)
-    _component_cache.pop(name, None)

@@ -245,3 +245,68 @@ def test_chd_auxiliary_temperature(tmp_path):
     chd = model_store.get_model("auxmod", "gwf").get_package("chd")
     assert chd is not None
     assert "TEMPERATURE" in str(chd.auxiliary.array.tolist()).upper()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: run flow then heat
+# ---------------------------------------------------------------------------
+
+
+def test_run_simulation_runs_heat_after_flow(tmp_path, monkeypatch):
+    from groundwater_mcp.tools import builder, runner
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "rk"
+    builder._impl_create_model("rk", str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation("rk", 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package("rk", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package("rk", 0, 1.0, None, True)
+    builder._impl_add_ic_package("rk", 1.0)
+    builder._impl_add_oc_package("rk", "rk.hds", "rk.cbc", [("HEAD", "ALL")], None)
+    builder._impl_add_gwe_model("rk")
+    builder._impl_add_dis_package(
+        "rk", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0], component="gwe"
+    )
+
+    flow_sim = model_store.get_sim("rk")
+    heat_sim = model_store.get_component_sim("rk", "gwe")
+    flow_sim.run_simulation = lambda **kw: (True, ["flow ok"])
+    heat_sim.run_simulation = lambda **kw: (True, ["heat ok"])
+    monkeypatch.setattr(runner, "_find_mf6_binary", lambda: "mf6")
+
+    out = runner._impl_run_simulation("rk", silent=True)
+    assert out["success"] is True
+    assert [c["component"] for c in out["components"]] == ["gwe"]
+    assert out["components"][0]["success"] is True
+
+
+def test_heat_run_skipped_when_flow_fails(tmp_path, monkeypatch):
+    from groundwater_mcp.tools import builder, runner
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "rk2"
+    builder._impl_create_model("rk2", str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation("rk2", 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package("rk2", nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package("rk2", 0, 1.0, None, True)
+    builder._impl_add_ic_package("rk2", 1.0)
+    builder._impl_add_oc_package("rk2", "rk2.hds", "rk2.cbc", [("HEAD", "ALL")], None)
+    builder._impl_add_gwe_model("rk2")
+
+    flow_sim = model_store.get_sim("rk2")
+    heat_sim = model_store.get_component_sim("rk2", "gwe")
+    flow_sim.run_simulation = lambda **kw: (False, ["flow failed"])
+    ran = {"heat": False}
+
+    def _heat(**kw):
+        ran["heat"] = True
+        return True, []
+
+    heat_sim.run_simulation = _heat
+    monkeypatch.setattr(runner, "_find_mf6_binary", lambda: "mf6")
+
+    out = runner._impl_run_simulation("rk2", silent=True)
+    assert out["success"] is False
+    assert out["components"][0]["success"] is False
+    assert out["components"][0]["skipped"] == "flow run failed"
+    assert ran["heat"] is False

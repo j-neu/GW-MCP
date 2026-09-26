@@ -24,7 +24,9 @@ from groundwater_mcp.utils.components import UnknownComponentError
 from groundwater_mcp.utils.grid import get_dis
 from groundwater_mcp.utils.model_store import (
     ModelReadOnlyError,
+    component_sim_names,
     flush_model,
+    get_component_sim,
     get_gwf,
     get_model,
     get_sim,
@@ -257,10 +259,10 @@ def _impl_start_run(model: str) -> dict:
             "flushed": flushed,
             "returncode": returncode,
         }
-        result["observation_fit"] = _compute_obs_fit(model)
-        if trap:
-            result["warning"] = sto_msg
-        return result
+    result["observation_fit"] = _compute_obs_fit(model)
+    if trap:
+        result["warning"] = sto_msg
+    return result
 
     def _progress(job) -> dict:
         lst_files = list(ws.glob("*.lst"))
@@ -492,6 +494,39 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
                 # report the original failure (clone it first to auto-fix).
                 pass
 
+    # Run derived component simulations (e.g. an FMI-coupled heat model) after
+    # the flow model — heat advection reads the flow run's output. A heat run
+    # is skipped when the flow run failed.
+    component_results: list[dict] = []
+    for cname in component_sim_names(model):
+        csim = get_component_sim(model, cname)
+        if not success:
+            component_results.append(
+                {"component": cname, "success": False, "skipped": "flow run failed"}
+            )
+            continue
+        try:
+            csim.exe_name = exe
+            t0 = time.monotonic()
+            csuccess, cbuff = csim.run_simulation(silent=silent, report=True)
+            component_results.append(
+                {
+                    "component": cname,
+                    "success": csuccess,
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                }
+            )
+            if not csuccess:
+                success = False
+                if cbuff:
+                    tail = cbuff[-20:] if len(cbuff) > 20 else cbuff
+                    listing_summary = "\n".join(tail)
+        except Exception as exc:
+            component_results.append(
+                {"component": cname, "success": False, "error": str(exc)}
+            )
+            success = False
+
     # Evict from cache so post-processing tools reload from updated binary outputs
     invalidate(model)
 
@@ -514,6 +549,8 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
     # "is this any good?". Null when no targets are registered or the run did
     # not produce the CSV (e.g. convergence failure).
     result["observation_fit"] = _compute_obs_fit(model)
+    if component_results:
+        result["components"] = component_results
     if trap:
         assert sto_msg is not None
         result["warning"] = sto_msg
