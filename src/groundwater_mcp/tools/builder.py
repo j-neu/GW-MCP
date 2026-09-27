@@ -369,6 +369,26 @@ def _component_model_name(model: str, key: str, existing: set[str]) -> str:
     raise ValueError(f"Could not derive a unique component model name for '{key}'.")
 
 
+def _ims_flow_models(sim, components: dict | None) -> list[str]:
+    """Model names the flow IMS must solve.
+
+    A same-simulation explicit component (currently PRT, created by
+    ``_impl_add_component_model``) is solved by its own EMS and must **not** be
+    covered by the IMS: MF6 requires the GWF and PRT models to be solved by
+    different solutions, with the GWF IMS listed before the PRT EMS. Such a
+    component is recorded in the ``components`` metadata as a plain model name;
+    a separate-simulation component (the FMI-coupled heat model) is recorded as
+    a dict and never appears in this simulation's ``model_names``.
+    """
+    components = components or {}
+    excluded = {
+        spec
+        for key, spec in components.items()
+        if key != "gwf" and not isinstance(spec, dict)
+    }
+    return [name for name in sim.model_names if name not in excluded]
+
+
 def _mirror_grid(src_model, dst_model, component: str) -> str:
     """Create the component's grid package from the source model's grid."""
     kind = _grid_type_of(src_model)
@@ -667,6 +687,12 @@ def _ensure_flow_saving_for_prt(model: str) -> None:
     other NPF setting is lost). A ``prt_flow_saving`` meta flag lets a later
     ``add_npf_package`` re-apply the flags after it rebuilds NPF — otherwise the
     required PRT exchange flow-saving flags would be silently dropped.
+
+    The GWF model-level ``save_flows`` flag is deliberately *not* set: the NPF
+    ``save_flows``/``save_specific_discharge`` flags are sufficient for the
+    same-simulation GWF-PRT exchange. The MCP end-to-end run
+    (``test_prt_mcp_end_to_end_pathlines``) produces non-empty pathlines
+    without it.
     """
     gwf = get_model(model, "gwf")
     npf = gwf.get_package("npf")
@@ -696,7 +722,9 @@ def _impl_add_prt_model(model: str) -> dict:
     # An IMS makes prt_solve return early and the track file stays header-only.
     sim = get_sim(model)
     ems_name = f"{out['component_model']}.ems"
-    ems = mf6.ModflowEms(sim, pname=f"{out['component_model']}_ems", filename=ems_name)
+    # MF6 caps package names at 16 characters (LENPACKAGENAME), so the pname is
+    # a short fixed token while the filename stays informative.
+    ems = mf6.ModflowEms(sim, pname="prt_ems", filename=ems_name)
     sim.register_solution_package(ems, [out["component_model"]])
     out["solution"] = ems_name
     out["written"] = save_sim(model, sim)
@@ -924,6 +952,57 @@ def _impl_add_gwe_esl_package(
     return {"model": model, "package": "ESL", "written": save_sim(model, gwe.simulation)}
 
 
+def _remove_solution_package(sim, pkg) -> None:
+    """Remove a solution package without flopy's solution-group ``TypeError``.
+
+    ``MFSimulation.remove_package`` calls ``_update_solution_group`` when the
+    package is a registered solution. For a solution group that also holds an
+    explicit component EMS (GWF IMS + PRT EMS) that update mixes NumPy
+    structured records back into a plain list and raises
+    ``TypeError: Cannot compare structured or void to non-void arrays``.
+    Dropping the solution-group record here and de-registering the file first
+    makes ``remove_package`` take its ordinary (working) path.
+    """
+    recarray = sim.name_file.solutiongroup
+    for group_num in recarray.get_active_key_list():
+        data = recarray.get_data(group_num[0])
+        if data is None:
+            continue
+        remaining = [tuple(record) for record in data if record[1] != pkg.filename]
+        recarray.set_data(remaining or None, group_num[0])
+    sim._solution_files.pop(pkg.filename, None)
+    sim.remove_package(pkg)
+
+
+def _order_ims_before_ems(sim, flow_models: list[str]) -> None:
+    """List the flow IMS record ahead of any component EMS record.
+
+    MF6 rejects the same-simulation GWF-PRT exchange unless the IMS that solves
+    GWF appears in ``mfsim.nam`` before the PRT EMS, and the IMS must list only
+    the flow model(s). Registration order alone cannot guarantee this (a PRT
+    component added before ``set_simulation`` puts its EMS first), so the
+    solution group is rewritten after registration.
+    """
+    recarray = sim.name_file.solutiongroup
+    for group_num in recarray.get_active_key_list():
+        data = recarray.get_data(group_num[0])
+        if data is None:
+            continue
+        ims_records: list[tuple] = []
+        ems_records: list[tuple] = []
+        others: list[tuple] = []
+        for record in data:
+            kind = str(record[0]).lower()
+            if kind.startswith("ims"):
+                ims_records.append(tuple([record[0], record[1], *flow_models]))
+            elif kind.startswith("ems"):
+                ems_records.append(tuple(record))
+            else:
+                others.append(tuple(record))
+        if ims_records:
+            recarray.set_data(others + ims_records + ems_records, group_num[0])
+
+
 def _impl_set_simulation(
     model: str,
     nper: int,
@@ -952,11 +1031,17 @@ def _impl_set_simulation(
     meta = _read_meta(ws)
     time_units = meta.get("time_units", "DAYS")
 
-    # Remove existing TDIS/IMS if present (allow reconfiguration)
-    for pname in ("tdis", "ims"):
-        pkg = sim.get_package(pname)
-        if pkg is not None:
-            sim.remove_package(pkg)
+    # Remove existing TDIS/IMS if present (allow reconfiguration). The IMS is
+    # dropped through the helper above: flopy's Simulation.remove_package()
+    # raises when the solution group also holds a component EMS (GWF IMS + PRT
+    # EMS), and this path must work when set_simulation is re-run after
+    # add_prt_model.
+    tdis_pkg = sim.get_package("tdis")
+    if tdis_pkg is not None:
+        sim.remove_package(tdis_pkg)
+    ims_pkg = sim.get_package("ims")
+    if ims_pkg is not None:
+        _remove_solution_package(sim, ims_pkg)
 
     perioddata = [(float(perlen[i]), int(nstp[i]), 1.0) for i in range(nper)]
     tdis_kwargs: dict = {
@@ -981,7 +1066,11 @@ def _impl_set_simulation(
         # not a boolean flag.
         ims_kwargs["under_relaxation"] = str(under_relaxation)
     ims = mf6.ModflowIms(sim, **ims_kwargs)
-    sim.register_ims_package(ims, list(sim.model_names))
+    # A same-simulation explicit component (PRT) is solved by its own EMS, so
+    # the flow IMS covers only the flow model(s) and is listed before the EMS.
+    ims_models = _ims_flow_models(sim, meta.get("components"))
+    sim.register_ims_package(ims, ims_models)
+    _order_ims_before_ems(sim, ims_models)
 
     # Newton-Raphson option on the GWF model. The CSUB delay solve needs it
     # (Critical 2); setting it after construction matches how the property is

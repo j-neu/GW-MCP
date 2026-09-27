@@ -320,3 +320,93 @@ def test_add_npf_rebuild_preserves_prt_flow_saving(tmp_path):
     ).read_text().upper()
     assert "SAVE_FLOWS" in npf_text
     assert "SAVE_SPECIFIC_DISCHARGE" in npf_text
+
+
+def test_set_simulation_preserves_prt_ems(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "prtset"
+    _impl_create_model("prtset", str(ws), "METERS", "DAYS")
+    _impl_set_simulation(
+        "prtset", nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple"
+    )
+    _impl_add_dis_package("prtset", nlay=1, nrow=1, ncol=10,
+                          delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("prtset", 0, 1.0, None, True)
+    out = _impl_add_prt_model("prtset")
+
+    # Re-running set_simulation must not clobber the PRT EMS split: the flow
+    # IMS stays ahead of the PRT EMS and must not cover the PRT model, or the
+    # GWF-PRT exchange is invalid and the track CSV stays header-only.
+    _impl_set_simulation(
+        "prtset", nper=1, perlen=[1.0], nstp=[1], ims_complexity="moderate"
+    )
+    model_store.flush_model("prtset")
+
+    nam = (model_store.resolve_workspace("prtset") / "mfsim.nam").read_text()
+    solutions: list[tuple[str, list[str]]] = []
+    for line in nam.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ims6"):
+            solutions.append(("ims", stripped.split()))
+        elif stripped.startswith("ems6"):
+            solutions.append(("ems", stripped.split()))
+
+    assert [kind for kind, _ in solutions] == ["ims", "ems"], solutions
+    assert out["component_model"] not in solutions[0][1], solutions
+    assert out["component_model"] in solutions[1][1], solutions
+
+
+@requires_mf6
+def test_prt_mcp_end_to_end_pathlines(tmp_path):
+    """Build GWF+PRT through the MCP builders, run, and read real pathlines.
+
+    Everything here goes through ``_impl_*`` builders (no raw-flopy spike):
+    this proves the MCP-built input set runs end to end and that the NPF
+    ``save_flows``/``save_specific_discharge`` flags the PRT exchange needs are
+    sufficient (no GWF model-level ``save_flows`` required).
+    """
+    from groundwater_mcp.tools import builder, postprocess, runner
+
+    name = "prte2e"
+    ws = tmp_path / name
+    builder._impl_create_model(name, str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation(name, 1, [10.0], [10], "simple")
+    builder._impl_add_dis_package(name, nlay=1, nrow=1, ncol=10,
+                                  delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    builder._impl_add_npf_package(name, 0, 1.0, None, True)
+    builder._impl_add_ic_package(name, 1.0)
+    builder._impl_add_boundary_package(
+        name, "CHD",
+        {0: [[(0, 0, 0), 1.0], [(0, 0, 9), 0.0]]},
+        None, pname="CHD",
+    )
+    builder._impl_add_oc_package(
+        name, f"{name}.hds", f"{name}.cbc",
+        [("HEAD", "ALL"), ("BUDGET", "ALL")], None,
+    )
+    builder._impl_add_prt_model(name)
+    builder._impl_add_prt_mip_package(name, porosity=0.2, retfactor=1.0)
+    builder._impl_add_prt_prp_package(
+        name, release_points=[(0, (0, 0, 4), 4.5, 0.5, 0.5)], perioddata=[["all"]]
+    )
+    builder._impl_add_prt_oc_package(name)
+
+    out = runner._impl_run_simulation(name, silent=True)
+    if not out["success"]:
+        lst = ws / "mfsim.lst"
+        detail = lst.read_text(errors="replace") if lst.exists() else ""
+        raise AssertionError(f"{out}\n{detail[-2000:]}")
+
+    result = postprocess._impl_read_pathlines(name)
+    assert result["component"] == "prt"
+    assert result["n_particles"] >= 1
+    assert result["n_points"] >= 1
+
