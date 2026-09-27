@@ -82,3 +82,52 @@ def test_prt_track_csv_has_particles(tmp_path):
     # header + at least one particle record
     assert rows[0] == EXPECTED_TRACK_HEADER
     assert len(rows) >= 2, "PRT released particles but wrote no pathline rows"
+
+
+def test_add_prt_model_mirrors_grid_and_registers_exchange(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "prtadd"
+    _impl_create_model("prtadd", str(ws), "METERS", "DAYS")
+    _impl_set_simulation("prtadd", nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package("prtadd", nlay=1, nrow=1, ncol=10,
+                          delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("prtadd", 0, 1.0, None, True)
+
+    out = _impl_add_prt_model("prtadd")
+    assert out["component"] == "prt"
+    assert out["grid_type"] == "DIS"
+    assert "Gwfprt" in out["exchange"]
+
+    sim = model_store.get_sim("prtadd")
+    prt = model_store.get_model("prtadd", "prt")
+    assert isinstance(prt, mf6.ModflowPrt)
+    assert prt.get_package("dis") is not None
+    assert out["component_model"] in sim.model_names
+
+    # same-sim component recorded as a plain model name, not a dict
+    assert model_store.component_map("prtadd")["prt"] == out["component_model"]
+
+    # The same-simulation exchange is proven by the written exchange file.
+    model_store.flush_model("prtadd")
+    workspace = model_store.resolve_workspace("prtadd")
+    assert (workspace / "mfsim.gwfprt").exists()
+
+    # PRT is explicit: the GWF IMS is listed before the PRT EMS (ruling).
+    solutions = []
+    for line in (workspace / "mfsim.nam").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ims6"):
+            solutions.append(("ims", stripped))
+        elif stripped.startswith("ems6"):
+            solutions.append(("ems", stripped))
+    assert [kind for kind, _ in solutions] == ["ims", "ems"], solutions
+    assert out["component_model"] in solutions[-1][1]
+    assert out["solution"] == f"{out['component_model']}.ems"

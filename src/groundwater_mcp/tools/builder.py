@@ -660,6 +660,39 @@ def _impl_add_gwe_model(
     }
 
 
+def _ensure_flow_saving_for_prt(model: str) -> None:
+    """Ensure the GWF model exposes what the GWF-PRT exchange needs."""
+    gwf = get_model(model, "gwf")
+    npf = gwf.get_package("npf")
+    if npf is not None:
+        for attr, value in (("save_flows", True), ("save_specific_discharge", True)):
+            try:
+                setattr(npf, attr, value)
+            except Exception:
+                pass
+
+
+def _impl_add_prt_model(model: str) -> dict:
+    """Add a same-simulation PRT model with the flow grid mirrored + exchange."""
+    _require_writable(model, "add_prt_model")
+    key = "prt"
+    if key in component_map(model):
+        raise ValueError(f"Simulation '{model}' already has a '{key}' component.")
+
+    _ensure_flow_saving_for_prt(model)
+    out = _impl_add_component_model(model, key)
+
+    # PRT is an explicit model: solve it with an EMS listed after the GWF IMS.
+    # An IMS makes prt_solve return early and the track file stays header-only.
+    sim = get_sim(model)
+    ems_name = f"{out['component_model']}.ems"
+    ems = mf6.ModflowEms(sim, pname=f"{out['component_model']}_ems", filename=ems_name)
+    sim.register_solution_package(ems, [out["component_model"]])
+    out["solution"] = ems_name
+    out["written"] = save_sim(model, sim)
+    return out
+
+
 def _require_writable(model: str, tool: str) -> None:
     """Refuse a builder mutation on an adopt_model read-only model."""
     if is_readonly(model):
