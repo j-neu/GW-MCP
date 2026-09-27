@@ -280,6 +280,18 @@ def test_add_prt_prp_package_save_flows_is_noop(tmp_path):
     assert model_store.get_model("prtprpflows", "prt").get_package("prp") is not None
 
 
+@requires_mf6
+def test_plot_pathlines(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_adopt_model
+    from groundwater_mcp.tools.postprocess import _impl_plot_pathlines
+
+    ws = _build_flow_and_prt(tmp_path)
+    _impl_adopt_model("prtsim_plot", str(ws), "METERS", "DAYS")
+    out = _impl_plot_pathlines("prtsim_plot")
+    assert Path(out["output_file"]).exists()
+    assert Path(out["output_file"]).suffix == ".png"
+
+
 def test_add_npf_rebuild_preserves_prt_flow_saving(tmp_path):
     from groundwater_mcp.tools.builder import (
         _impl_add_dis_package,

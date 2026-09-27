@@ -1107,6 +1107,69 @@ def _impl_read_pathlines(model: str) -> dict:
     }
 
 
+def _impl_plot_pathlines(
+    model: str,
+    output_file: str | None = None,
+    title: str | None = None,
+    particles: list[int] | None = None,
+) -> dict:
+    """Plot PRT particle pathlines in plan view (x vs y) and save as PNG.
+
+    Reuses ``_impl_read_pathlines`` (Task 6) for the parsed track CSV, which
+    already raises ``FileNotFoundError`` naming ``run_simulation`` when the
+    track output is absent. One polyline is drawn per particle (the particle's
+    ``x``/``y`` series) over the PRT grid outline. ``particles`` optionally
+    selects a subset by index into the returned particle list.
+
+    Returns
+    -------
+    dict
+        With ``output_file`` (the PNG path), ``n_particles`` (drawn) and the
+        source ``track_csv``.
+    """
+    from flopy.plot import PlotMapView
+
+    from groundwater_mcp.utils.plotting import figure, save_figure
+
+    result = _impl_read_pathlines(model)
+    prt = get_model(model, "prt")
+    ws = resolve_workspace(model)
+
+    all_particles = result.get("particles") or []
+    if particles is None:
+        selected = all_particles
+    else:
+        selected = [all_particles[i] for i in particles]
+
+    n_drawn = 0
+    with figure(figsize=(8, 6)) as fig:
+        ax = fig.add_subplot(1, 1, 1)
+        pmv = PlotMapView(model=prt, ax=ax)
+        pmv.plot_grid(alpha=0.3, lw=0.4)
+        for entry in selected:
+            x = [float(v) for v in entry.get("x") or []]
+            y = [float(v) for v in entry.get("y") or []]
+            if len(x) < 2 or len(y) < 2:
+                continue
+            ax.plot(x, y, lw=1.0, marker="o", ms=2)
+            n_drawn += 1
+        ax.set_aspect("equal")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title(title or f"{model} — particle pathlines")
+        target = _resolve_output_path(ws, output_file, "") if output_file else None
+        out_path = save_figure(fig, target, ws)
+
+    return {
+        "model": model,
+        "component": "prt",
+        "output_file": out_path,
+        "track_csv": result.get("track_csv"),
+        "n_particles": n_drawn,
+        "n_points": result.get("n_points"),
+    }
+
+
 def _impl_read_budget(
     model: str,
     text: str | None = None,
