@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import flopy.mf6 as mf6
+import numpy as np
 import pytest
 
 from groundwater_mcp.tools.runner import _find_mf6_binary
@@ -131,6 +132,26 @@ def test_add_prt_model_mirrors_grid_and_registers_exchange(tmp_path):
     assert [kind for kind, _ in solutions] == ["ims", "ems"], solutions
     assert out["component_model"] in solutions[-1][1]
     assert out["solution"] == f"{out['component_model']}.ems"
+
+
+def test_add_prt_mip_package(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
+        _impl_add_prt_model, _impl_add_prt_mip_package,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "prtmip"
+    _impl_create_model("prtmip", str(ws), "METERS", "DAYS")
+    _impl_add_dis_package("prtmip", nlay=1, nrow=1, ncol=5,
+                          delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("prtmip", 0, 1.0, None, True)
+    _impl_add_prt_model("prtmip")
+    out = _impl_add_prt_mip_package("prtmip", porosity=0.2, retfactor=1.0)
+    assert out["package"] == "MIP"
+    mip = model_store.get_model("prtmip", "prt").get_package("mip")
+    assert mip is not None
+    assert float(np.asarray(mip.porosity.array).ravel()[0]) == pytest.approx(0.2)
 
 
 def test_add_npf_rebuild_preserves_prt_flow_saving(tmp_path):

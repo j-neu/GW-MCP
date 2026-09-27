@@ -703,6 +703,22 @@ def _impl_add_prt_model(model: str) -> dict:
     return out
 
 
+def _impl_add_prt_mip_package(
+    model: str, porosity, retfactor: float = 1.0, izone=None, save_flows: bool = False
+) -> dict:
+    """Add the PRT matrix-input (MIP) package: porosity and retardation."""
+    _require_writable(model, "add_prt_mip_package")
+    prt = get_model(model, "prt")
+    pkg = prt.get_package("mip")
+    if pkg is not None:
+        prt.remove_package(pkg)
+    kwargs: dict = {"porosity": porosity, "retfactor": retfactor}
+    if izone is not None:
+        kwargs["izone"] = izone
+    mf6.ModflowPrtmip(prt, **kwargs)
+    return {"model": model, "package": "MIP", "written": save_sim(model, prt.simulation)}
+
+
 def _require_writable(model: str, tool: str) -> None:
     """Refuse a builder mutation on an adopt_model read-only model."""
     if is_readonly(model):
