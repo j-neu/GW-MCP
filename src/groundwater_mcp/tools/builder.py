@@ -661,7 +661,13 @@ def _impl_add_gwe_model(
 
 
 def _ensure_flow_saving_for_prt(model: str) -> None:
-    """Ensure the GWF model exposes what the GWF-PRT exchange needs."""
+    """Ensure the GWF model exposes what the GWF-PRT exchange needs.
+
+    The flags are set **in place** on the existing NPF (never rebuilt, so no
+    other NPF setting is lost). A ``prt_flow_saving`` meta flag lets a later
+    ``add_npf_package`` re-apply the flags after it rebuilds NPF — otherwise the
+    required PRT exchange flow-saving flags would be silently dropped.
+    """
     gwf = get_model(model, "gwf")
     npf = gwf.get_package("npf")
     if npf is not None:
@@ -670,6 +676,10 @@ def _ensure_flow_saving_for_prt(model: str) -> None:
                 setattr(npf, attr, value)
             except Exception:
                 pass
+    ws = resolve_workspace(model)
+    meta = _read_meta(ws)
+    meta["prt_flow_saving"] = True
+    _write_meta(ws, meta)
 
 
 def _impl_add_prt_model(model: str) -> dict:
@@ -1217,6 +1227,11 @@ def _impl_add_npf_package(
         kwargs["save_specific_discharge"] = True
         kwargs["save_saturation"] = True
         kwargs["save_flows"] = True
+    if meta.get("prt_flow_saving"):
+        # A same-simulation GWF-PRT exchange needs the flow budget and specific
+        # discharge, and the flags must survive this NPF rebuild.
+        kwargs["save_flows"] = True
+        kwargs["save_specific_discharge"] = True
     _write_meta(ws, meta)
 
     mf6.ModflowGwfnpf(gwf, **kwargs)

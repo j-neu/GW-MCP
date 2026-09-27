@@ -131,3 +131,33 @@ def test_add_prt_model_mirrors_grid_and_registers_exchange(tmp_path):
     assert [kind for kind, _ in solutions] == ["ims", "ems"], solutions
     assert out["component_model"] in solutions[-1][1]
     assert out["solution"] == f"{out['component_model']}.ems"
+
+
+def test_add_npf_rebuild_preserves_prt_flow_saving(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "prtflags"
+    _impl_create_model("prtflags", str(ws), "METERS", "DAYS")
+    _impl_set_simulation("prtflags", nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package("prtflags", nlay=1, nrow=1, ncol=10,
+                          delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("prtflags", 0, 1.0, None, True)
+    _impl_add_prt_model("prtflags")
+
+    # A later NPF rebuild (e.g. to change k) must not silently drop the
+    # flow-saving flags the same-simulation GWF-PRT exchange requires.
+    _impl_add_npf_package("prtflags", 0, 2.0, None, False)
+
+    model_store.flush_model("prtflags")
+    npf_text = (
+        model_store.resolve_workspace("prtflags") / "prtflags.npf"
+    ).read_text().upper()
+    assert "SAVE_FLOWS" in npf_text
+    assert "SAVE_SPECIFIC_DISCHARGE" in npf_text
