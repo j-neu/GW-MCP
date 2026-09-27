@@ -730,7 +730,9 @@ def _impl_add_prt_prp_package(
 
     ``release_points`` is ``[(irptno, cellid, xrpt, yrpt, zrpt[, boundname])]``
     with 0-based ``irptno`` (flopy writes the 1-based MF6 value). ``perioddata``
-    is the per-period release setting, e.g. ``[["first"]]``.
+    is the per-period release setting, e.g. ``[["first"]]``. ``save_flows`` is
+    accepted for interface parity with the other PRT builders and ignored: PRP
+    has no budget, so it is not a valid MF6 option.
     """
     _require_writable(model, "add_prt_prp_package")
     prt = get_model(model, "prt")
@@ -745,8 +747,6 @@ def _impl_add_prt_prp_package(
         kwargs["perioddata"] = perioddata
     if release_times is not None:
         kwargs["releasetimes"] = release_times
-    if save_flows:
-        kwargs["save_flows"] = True
     mf6.ModflowPrtprp(prt, **kwargs)
     return {
         "model": model,
