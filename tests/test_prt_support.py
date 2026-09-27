@@ -154,6 +154,31 @@ def test_add_prt_mip_package(tmp_path):
     assert float(np.asarray(mip.porosity.array).ravel()[0]) == pytest.approx(0.2)
 
 
+def test_add_prt_prp_package(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
+        _impl_add_prt_model, _impl_add_prt_prp_package, _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "prtprp"
+    _impl_create_model("prtprp", str(ws), "METERS", "DAYS")
+    _impl_set_simulation("prtprp", nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package("prtprp", nlay=1, nrow=1, ncol=5,
+                          delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("prtprp", 0, 1.0, None, True)
+    _impl_add_prt_model("prtprp")
+    out = _impl_add_prt_prp_package(
+        "prtprp", release_points=[(0, (0, 0, 2), 2.5, 0.5, 0.5)], perioddata=[["first"]]
+    )
+    assert out["package"] == "PRP"
+    prp = model_store.get_model("prtprp", "prt").get_package("prp")
+    assert prp is not None
+    model_store.flush_model("prtprp")
+    prtprp_file = (tmp_path / "prtprp" / out["file"]).read_text()
+    assert "NRELEASEPTS  1" in prtprp_file
+
+
 def test_add_npf_rebuild_preserves_prt_flow_saving(tmp_path):
     from groundwater_mcp.tools.builder import (
         _impl_add_dis_package,

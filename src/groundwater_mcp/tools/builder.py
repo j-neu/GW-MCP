@@ -719,6 +719,43 @@ def _impl_add_prt_mip_package(
     return {"model": model, "package": "MIP", "written": save_sim(model, prt.simulation)}
 
 
+def _impl_add_prt_prp_package(
+    model: str,
+    release_points: list,
+    perioddata: list | None = None,
+    release_times: list | None = None,
+    save_flows: bool = False,
+) -> dict:
+    """Add the PRT particle-release (PRP) package.
+
+    ``release_points`` is ``[(irptno, cellid, xrpt, yrpt, zrpt[, boundname])]``
+    with 0-based ``irptno`` (flopy writes the 1-based MF6 value). ``perioddata``
+    is the per-period release setting, e.g. ``[["first"]]``.
+    """
+    _require_writable(model, "add_prt_prp_package")
+    prt = get_model(model, "prt")
+    pkg = prt.get_package("prp")
+    if pkg is not None:
+        prt.remove_package(pkg)
+    kwargs: dict = {
+        "nreleasepts": len(release_points),
+        "packagedata": release_points,
+    }
+    if perioddata is not None:
+        kwargs["perioddata"] = perioddata
+    if release_times is not None:
+        kwargs["releasetimes"] = release_times
+    if save_flows:
+        kwargs["save_flows"] = True
+    mf6.ModflowPrtprp(prt, **kwargs)
+    return {
+        "model": model,
+        "package": "PRP",
+        "file": f"{prt.name}.prp",
+        "written": save_sim(model, prt.simulation),
+    }
+
+
 def _require_writable(model: str, tool: str) -> None:
     """Refuse a builder mutation on an adopt_model read-only model."""
     if is_readonly(model):
