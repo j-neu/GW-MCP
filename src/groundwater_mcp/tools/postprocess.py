@@ -10,7 +10,7 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 
-from groundwater_mcp.utils.components import spec_for
+from groundwater_mcp.utils.components import UnknownComponentError, spec_for
 from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
 from groundwater_mcp.utils.model_store import (
     component_workspace,
@@ -940,6 +940,171 @@ def _impl_read_heads(
             )
         result["values"] = layer_heads.tolist()
     return result
+
+
+def _prt_track_csv_path(model: str) -> Path:
+    """Resolve the PRT CSV track file for *model*.
+
+    The CSV is declared on the PRT OC package (``trackcsv_filerecord``); it is
+    resolved against the model workspace so a declared subdirectory is honoured,
+    and falls back to ``<prt model name>.trk.csv`` — the default that
+    ``_impl_add_prt_oc_package`` writes when the caller declares neither track
+    file.
+
+    Raises
+    ------
+    FileNotFoundError
+        When the model has no PRT component or the track CSV has not been
+        written yet — both name ``run_simulation`` (or ``add_prt_model``) so the
+        caller knows the run is missing.
+    """
+    try:
+        prt = get_model(model, "prt")
+    except (UnknownComponentError, KeyError):
+        raise FileNotFoundError(
+            f"No PRT model found for '{model}', so no track output exists. "
+            "Add one with add_prt_model and run run_simulation first."
+        ) from None
+
+    ws = resolve_workspace(model)
+    declared = _oc_file_record(prt, "trackcsv_filerecord")
+    path = _resolve_declared_file(ws, declared)
+    if path is None:
+        fallback = ws / f"{prt.name}.trk.csv"
+        path = fallback if fallback.exists() else None
+    if path is None:
+        raise FileNotFoundError(
+            f"No PRT track CSV found for '{model}' "
+            f"(looked for {declared or f'{prt.name}.trk.csv'}). "
+            "Run run_simulation first."
+        )
+    return path
+
+
+def _pathline_column(arr: np.ndarray, name: str) -> np.ndarray | None:
+    """Return the named field of a structured track array, or None if absent."""
+    if name not in (arr.dtype.names or ()):
+        return None
+    return arr[name]
+
+
+def _impl_read_pathlines(model: str) -> dict:
+    """Read the PRT CSV track file into per-particle pathlines and stats.
+
+    The PRT track CSV (``trackcsv_filerecord``) has one row per particle per
+    event; MF6 identifies a particle by the composite key
+    ``(imdl, iprp, irpt, trelease)`` — the model, release package, release point
+    and release time — so rows are grouped on that key rather than on any single
+    column (an ``iprp`` alone is constant across the release points of one PRP
+    package). Rows are read with ``numpy.genfromtxt`` and the CSV's trailing
+    comma (an empty ``name`` field) is handled by genfromtxt's missing-value
+    parsing.
+
+    Returns per-particle ``t``/``x``/``y``/``z`` pathline arrays plus summary
+    statistics, and writes the parsed structured array to a ``.npy``
+    ``output_file`` beside the CSV, mirroring ``read_heads``.
+
+    Raises
+    ------
+    FileNotFoundError
+        When the track CSV is absent or holds no particle records (naming
+        ``run_simulation``).
+    """
+    csv_path = _prt_track_csv_path(model)
+
+    try:
+        parsed = np.genfromtxt(
+            csv_path, delimiter=",", names=True, dtype=None, encoding="utf-8"
+        )
+    except Exception as exc:  # a malformed/partial file means the run is unusable
+        raise FileNotFoundError(
+            f"Could not read the PRT track CSV {csv_path}: {exc}. "
+            "Run run_simulation first."
+        ) from exc
+
+    arr = np.atleast_1d(parsed)
+    names = list(arr.dtype.names or ())
+    if arr.size == 0 or not names:
+        raise FileNotFoundError(
+            f"PRT track CSV {csv_path} contains no particle records. "
+            "Run run_simulation first."
+        )
+
+    imdl = _pathline_column(arr, "imdl")
+    iprp = _pathline_column(arr, "iprp")
+    irpt = _pathline_column(arr, "irpt")
+    trelease = _pathline_column(arr, "trelease")
+
+    groups: dict[tuple[int, int, int, float], list[int]] = {}
+    for i in range(arr.size):
+        key = (
+            int(imdl[i]) if imdl is not None else 0,
+            int(iprp[i]) if iprp is not None else 0,
+            int(irpt[i]) if irpt is not None else 0,
+            float(trelease[i]) if trelease is not None else 0.0,
+        )
+        groups.setdefault(key, []).append(i)
+
+    status = _pathline_column(arr, "istatus")
+    reason = _pathline_column(arr, "ireason")
+    icell = _pathline_column(arr, "icell")
+    ilay = _pathline_column(arr, "ilay")
+
+    def _series(col: str, idx: list[int]) -> list[float]:
+        values = _pathline_column(arr, col)
+        return [float(values[i]) for i in idx] if values is not None else []
+
+    particles: list[dict] = []
+    for (imid, ipid, irid, trel), idx in sorted(groups.items()):
+        x = _series("x", idx)
+        y = _series("y", idx)
+        z = _series("z", idx)
+        t = _series("t", idx)
+        entry: dict = {
+            "imdl": imid,
+            "iprp": ipid,
+            "irpt": irid,
+            "trelease": trel,
+            "n_points": len(idx),
+            "t": t,
+            "x": x,
+            "y": y,
+            "z": z,
+        }
+        if x and y:
+            entry["start"] = {"t": t[0], "x": x[0], "y": y[0], "z": z[0]}
+            entry["end"] = {"t": t[-1], "x": x[-1], "y": y[-1], "z": z[-1]}
+        if status is not None:
+            entry["final_status"] = int(status[idx[-1]])
+        if reason is not None:
+            entry["final_reason"] = int(reason[idx[-1]])
+        if icell is not None:
+            entry["icell"] = [int(icell[i]) for i in idx]
+        if ilay is not None:
+            entry["ilay"] = [int(ilay[i]) for i in idx]
+        particles.append(entry)
+
+    bounds: dict[str, list[float]] = {}
+    for col in ("x", "y", "z"):
+        values = _pathline_column(arr, col)
+        if values is not None and values.size:
+            bounds[col] = [float(np.min(values)), float(np.max(values))]
+
+    npy_path = csv_path.parent / f"{model}_pathlines.npy"
+    np.save(npy_path, arr)
+
+    return {
+        "model": model,
+        "component": "prt",
+        "track_csv": str(csv_path),
+        "columns": names,
+        "n_particles": len(particles),
+        "n_points": int(arr.size),
+        "bounds": bounds,
+        "particles": particles,
+        "output_file": str(npy_path),
+        "npy_file": str(npy_path),
+    }
 
 
 def _impl_read_budget(

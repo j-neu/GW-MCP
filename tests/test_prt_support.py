@@ -85,6 +85,28 @@ def test_prt_track_csv_has_particles(tmp_path):
     assert len(rows) >= 2, "PRT released particles but wrote no pathline rows"
 
 
+@requires_mf6
+def test_read_pathlines(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_adopt_model
+    from groundwater_mcp.tools.postprocess import _impl_read_pathlines
+
+    ws = _build_flow_and_prt(tmp_path)
+    _impl_adopt_model("prtsim_ro", str(ws), "METERS", "DAYS")
+    out = _impl_read_pathlines("prtsim_ro")
+    assert out["component"] == "prt"
+    assert out["n_particles"] >= 1
+    assert out["n_points"] >= 1
+
+
+def test_read_pathlines_missing_output(tmp_path):
+    from groundwater_mcp.tools.builder import _impl_add_dis_package, _impl_create_model
+    from groundwater_mcp.tools.postprocess import _impl_read_pathlines
+    _impl_create_model("noprt", str(tmp_path / "noprt"), "METERS", "DAYS")
+    _impl_add_dis_package("noprt", nlay=1, nrow=1, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    with pytest.raises(FileNotFoundError):
+        _impl_read_pathlines("noprt")
+
+
 def test_add_prt_model_mirrors_grid_and_registers_exchange(tmp_path):
     from groundwater_mcp.tools.builder import (
         _impl_add_dis_package,
