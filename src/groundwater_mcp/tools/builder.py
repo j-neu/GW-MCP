@@ -769,10 +769,14 @@ def _impl_add_prt_oc_package(
     """Add the PRT output-control (OC) package with tracking output.
 
     Declare the track file here (not on the PRP) — MF6 aborts if the same file
-    is declared twice.
+    is declared twice. When the caller supplies neither a CSV nor a binary
+    track file, the CSV track file defaults to ``<prt model name>.trk.csv`` so
+    particle post-processing works out of the box.
     """
     _require_writable(model, "add_prt_oc_package")
     prt = get_model(model, "prt")
+    if not trackcsv_filerecord and not track_filerecord:
+        trackcsv_filerecord = f"{prt.name}.trk.csv"
     pkg = prt.get_package("oc")
     if pkg is not None:
         prt.remove_package(pkg)

@@ -197,11 +197,39 @@ def test_add_prt_oc_package(tmp_path):
     assert out["package"] == "OC"
     oc = model_store.get_model("prtoc", "prt").get_package("oc")
     assert oc is not None
-    assert (tmp_path / "prtoc" / "prtoc.trk.csv").exists() is False  # written at run time
     model_store.flush_model("prtoc")
     oc_file = (tmp_path / "prtoc" / f"{out['model_name']}.oc").read_text()
+    up = oc_file.upper()
+    assert "TRACKCSV" in up
+    assert "prtoc.trk.csv" in oc_file
+    assert "TRACK_RELEASE" in up
+    assert "TRACK_TIMESTEP" in up
+    assert "TRACK_TERMINATE" in up
+
+
+def test_add_prt_oc_package_defaults_trackcsv(tmp_path):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
+        _impl_add_prt_model, _impl_add_prt_oc_package, _impl_set_simulation,
+    )
+    from groundwater_mcp.utils import model_store
+
+    ws = tmp_path / "prtocdef"
+    _impl_create_model("prtocdef", str(ws), "METERS", "DAYS")
+    _impl_set_simulation("prtocdef", nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    _impl_add_dis_package("prtocdef", nlay=1, nrow=1, ncol=5,
+                          delr=1.0, delc=1.0, top=1.0, botm=[0.0])
+    _impl_add_npf_package("prtocdef", 0, 1.0, None, True)
+    _impl_add_prt_model("prtocdef")
+
+    # Post-processing must work out of the box: omitting both track files
+    # defaults the CSV track file to the PRT model name.
+    out = _impl_add_prt_oc_package("prtocdef")
+    assert out["package"] == "OC"
+    model_store.flush_model("prtocdef")
+    oc_file = (tmp_path / "prtocdef" / f"{out['model_name']}.oc").read_text()
     assert "TRACKCSV" in oc_file.upper()
-    assert "TRACK_TIMESTEP" in oc_file.upper()
+    assert f"{out['model_name']}.trk.csv" in oc_file
 
 
 def test_add_prt_prp_package_save_flows_is_noop(tmp_path):
