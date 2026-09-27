@@ -333,8 +333,12 @@ def save_sim(name: str, sim: mf6.MFSimulation) -> bool:
     """
     if _is_readonly(name):
         # Discard the in-memory (possibly mutated) copy so the next access
-        # reloads the authoritative on-disk state.
+        # reloads the authoritative on-disk state. The component cache is
+        # cleared too: a rejected GWE package add mutates the cached heat
+        # simulation before calling save_sim, and that mutation must not
+        # survive to be executed by a later run.
         _cache.pop(name, None)
+        _component_cache.pop(name, None)
         _dirty.pop(name, None)
         raise ModelReadOnlyError(
             f"Model '{name}' was registered with adopt_model and is read-only. "
@@ -490,8 +494,26 @@ def is_readonly(name: str) -> bool:
 
 
 def component_sim_names(name: str) -> list[str]:
-    """Return the component names that have a cached simulation, sorted."""
-    return sorted(_component_cache.get(name, {}))
+    """Return component names that have a separate simulation, sorted.
+
+    Includes components cached in memory and separate-simulation components
+    persisted in the workspace metadata whose sub-workspace still exists on
+    disk. The disk half lets ``run_simulation`` run a saved heat model after
+    ``adopt_model`` (which clears the component cache) or a process restart.
+    Never raises for an unregistered/deleted model.
+    """
+    names = set(_component_cache.get(name, {}))
+    try:
+        ws = resolve_workspace(name)
+        stored = _read_meta(ws).get("components") or {}
+    except Exception:
+        return sorted(names)
+    for cname, value in stored.items():
+        if not (isinstance(value, dict) and value.get("workspace")):
+            continue
+        if (ws / value["workspace"] / "mfsim.nam").exists():
+            names.add(cname)
+    return sorted(names)
 
 
 def invalidate_component_sim(name: str, component: str) -> None:

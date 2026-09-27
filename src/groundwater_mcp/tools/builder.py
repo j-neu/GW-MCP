@@ -212,6 +212,9 @@ def _impl_create_model(
             "MODELNAME at 16 characters. Use a shorter name."
         )
     model_dir = create_workspace(name, workspace or None)
+    # Re-creating a model resets its flow input set and metadata; drop any
+    # component simulation cached from a previous incarnation of this name.
+    clear_component_sims(name)
     sim = mf6.MFSimulation(
         sim_name="mfsim",
         version="mf6",
@@ -657,8 +660,18 @@ def _impl_add_gwe_model(
     }
 
 
+def _require_writable(model: str, tool: str) -> None:
+    """Refuse a builder mutation on an adopt_model read-only model."""
+    if is_readonly(model):
+        raise ModelReadOnlyError(
+            f"Model '{model}' was registered with adopt_model and is read-only; "
+            f"{tool} cannot modify its input set."
+        )
+
+
 def _impl_add_gwe_adv_package(model: str, scheme: str = "TVD") -> dict:
     """Add the GWE advection package (transport scheme)."""
+    _require_writable(model, "add_gwe_adv_package")
     gwe = get_model(model, "gwe")
     pkg = gwe.get_package("adv")
     if pkg is not None:
@@ -679,6 +692,7 @@ def _impl_add_gwe_cnd_package(
     kts: float | list | None = None,
 ) -> dict:
     """Add the GWE conduction/dispersion package."""
+    _require_writable(model, "add_gwe_cnd_package")
     gwe = get_model(model, "gwe")
     pkg = gwe.get_package("cnd")
     if pkg is not None:
@@ -705,6 +719,7 @@ def _impl_add_gwe_est_package(
     save_flows: bool = False,
 ) -> dict:
     """Add the GWE energy storage and transfer package."""
+    _require_writable(model, "add_gwe_est_package")
     gwe = get_model(model, "gwe")
     pkg = gwe.get_package("est")
     if pkg is not None:
@@ -724,10 +739,8 @@ def _impl_add_gwe_est_package(
 def _impl_add_gwe_ssm_package(model: str, sources: list | None = None) -> dict:
     """Add the GWE source-sink mixing package (required when the flow model has
     boundary packages). ``sources`` is [(pname, srctype, auxname)]."""
+    _require_writable(model, "add_gwe_ssm_package")
     gwe = get_model(model, "gwe")
-    pkg = gwe.get_package("ssm")
-    if pkg is not None:
-        gwe.remove_package(pkg)
     kwargs: dict = {}
     if sources:
         flow = get_model(model, "gwf")
@@ -740,6 +753,11 @@ def _impl_add_gwe_ssm_package(model: str, sources: list | None = None) -> dict:
                     f"model. Available: {sorted(flow.get_package_list())}."
                 )
         kwargs["sources"] = sources
+    # Validate before removing so a rejected call cannot silently drop a
+    # previously configured SSM from the in-memory model.
+    pkg = gwe.get_package("ssm")
+    if pkg is not None:
+        gwe.remove_package(pkg)
     mf6.ModflowGwessm(gwe, **kwargs)
     return {"model": model, "package": "SSM", "written": save_sim(model, gwe.simulation)}
 
@@ -748,6 +766,7 @@ def _impl_add_gwe_esl_package(
     model: str, stress_period_data: dict, save_flows: bool = False
 ) -> dict:
     """Add the GWE energy source loading (ESL) package."""
+    _require_writable(model, "add_gwe_esl_package")
     gwe = get_model(model, "gwe")
     pkg = gwe.get_package("esl")
     if pkg is not None:

@@ -500,9 +500,13 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
     # is skipped when the flow run failed.
     component_results: list[dict] = []
     component_listing_summary = ""
+    # Components are gated on the *flow* run only. `success` is the running
+    # aggregate (a failed component sets it False), so it must not gate the
+    # remaining components or one failure would skip all the rest.
+    flow_succeeded = success
     for cname in component_sim_names(model):
         csim = get_component_sim(model, cname)
-        if not success:
+        if not flow_succeeded:
             component_results.append(
                 {"component": cname, "success": False, "skipped": "flow run failed"}
             )
@@ -522,7 +526,9 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
                 success = False
                 if cbuff:
                     ctail = cbuff[-20:] if len(cbuff) > 20 else cbuff
-                    component_listing_summary = "\n".join(ctail)
+                    component_listing_summary += (
+                        "\n" if component_listing_summary else ""
+                    ) + "\n".join(ctail)
         except Exception as exc:
             component_results.append(
                 {"component": cname, "success": False, "error": str(exc)}

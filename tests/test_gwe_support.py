@@ -380,8 +380,8 @@ def test_read_temperature_end_to_end(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _build_and_run_heat(tmp_path, name: str = "pt"):
-    from groundwater_mcp.tools import builder, runner
+def _build_ready_heat(tmp_path, name: str):
+    from groundwater_mcp.tools import builder
 
     ws = tmp_path / name
     builder._impl_create_model(name, str(ws), "METERS", "DAYS")
@@ -407,9 +407,40 @@ def _build_and_run_heat(tmp_path, name: str = "pt"):
     builder._impl_add_gwe_ssm_package(name, sources=[("CHD", "AUX", "TEMPERATURE")])
     builder._impl_add_oc_package(name, f"{name}_gwe.ucn", f"{name}_gwe.cbc",
                                  [("TEMPERATURE", "ALL")], None, component="gwe")
+    return ws
+
+
+def _build_and_run_heat(tmp_path, name: str = "pt"):
+    from groundwater_mcp.tools import runner
+
+    ws = _build_ready_heat(tmp_path, name)
     out = runner._impl_run_simulation(name, silent=True)
     assert out["success"] is True, out.get("components")
     return ws
+
+
+@requires_mf6
+def test_run_simulation_heat_end_to_end_after_adopt(tmp_path):
+    """C1 (Critical, real MF6): a flushed, adopted flow+heat set still runs heat.
+
+    This is the adopted/process-restart path with no mocking: adopt clears the
+    in-memory component cache, so a single run_simulation must recover the heat
+    simulation from disk, run it, and produce the temperature output.
+    """
+    from groundwater_mcp.tools import builder, postprocess, runner
+    from groundwater_mcp.utils import model_store
+
+    ws = _build_ready_heat(tmp_path, "adopte2e")
+    model_store.flush_model("adopte2e")
+    model_store.invalidate("adopte2e")
+    builder._impl_adopt_model("adopte2e_ro", str(ws), "METERS", "DAYS")
+
+    out = runner._impl_run_simulation("adopte2e_ro", silent=True)
+    assert out["success"] is True, out
+    assert [c["component"] for c in out.get("components", [])] == ["gwe"]
+    temp = postprocess._impl_read_temperature("adopte2e_ro")
+    assert temp["component"] == "gwe"
+    assert temp["n_active"] == 9
 
 
 @requires_mf6
@@ -575,3 +606,145 @@ def test_heat_failure_listing_surfaced(tmp_path, monkeypatch):
     out = runner._impl_run_simulation("hf", silent=True)
     assert out["success"] is False
     assert "heat exploded" in out.get("component_listing_summary", "")
+
+
+# ---------------------------------------------------------------------------
+# Re-review fix pass 2 (Critical C1 reachability, I1 other tools, I5 ordering,
+# stale component cache on re-create, multi-component listing)
+# ---------------------------------------------------------------------------
+
+
+def test_component_sim_names_includes_disk_component_after_adopt(tmp_path):
+    """C1: a flushed heat sim must be enumerable after the cache is cleared."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = _mk_gwe(tmp_path, "adoptc")
+    model_store.invalidate("adoptc")
+    builder._impl_adopt_model("adoptc2", str(ws), "METERS", "DAYS")
+    assert model_store.component_sim_names("adoptc2") == ["gwe"]
+
+
+def test_run_simulation_runs_heat_after_adopt(tmp_path, monkeypatch):
+    """C1 (Critical): run_simulation must run a heat sim recovered from disk.
+
+    adopt_model clears the in-memory component cache, so the runner must
+    enumerate the component from the workspace metadata and reload it — the
+    old cache-only enumeration silently skipped the heat run.
+    """
+    import flopy.mf6 as mf6
+
+    from groundwater_mcp.tools import builder, runner
+    from groundwater_mcp.utils import model_store
+
+    ws = _mk_gwe(tmp_path, "adoptrun")
+    model_store.invalidate("adoptrun")
+    builder._impl_adopt_model("adoptrun2", str(ws), "METERS", "DAYS")
+    heat_model = model_store.component_map("adoptrun2")["gwe"]
+
+    runs: list[set] = []
+
+    def fake_run(self, **kw):
+        runs.append(set(self.model_names))
+        return True, ["ok"]
+
+    monkeypatch.setattr(mf6.MFSimulation, "run_simulation", fake_run)
+    monkeypatch.setattr(runner, "_find_mf6_binary", lambda: "mf6")
+
+    out = runner._impl_run_simulation("adoptrun2", silent=True)
+    assert out["success"] is True
+    assert [c["component"] for c in out.get("components", [])] == ["gwe"]
+    assert any(heat_model in names for names in runs), runs
+
+
+def _mk_gwe_with_flow_chd(tmp_path, name: str):
+    from groundwater_mcp.tools import builder
+
+    ws = tmp_path / name
+    builder._impl_create_model(name, str(ws), "METERS", "DAYS")
+    builder._impl_set_simulation(name, 1, [1.0], [1], "moderate")
+    builder._impl_add_dis_package(
+        name, nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0]
+    )
+    builder._impl_add_npf_package(name, 0, 1.0, None, True)
+    builder._impl_add_boundary_package(
+        name, "CHD", {0: [[(0, 0, 0), 1.0, 20.0]]},
+        {"auxiliary": "TEMPERATURE"}, pname="CHD",
+    )
+    builder._impl_add_oc_package(name, f"{name}.hds", f"{name}.cbc", [("HEAD", "ALL")], None)
+    builder._impl_add_gwe_model(name)
+    builder._impl_add_dis_package(
+        name, nlay=1, nrow=3, ncol=3, delr=1.0, delc=1.0, top=1.0, botm=[0.0], component="gwe"
+    )
+    builder._impl_add_gwe_ssm_package(name, sources=[("CHD", "AUX", "TEMPERATURE")])
+    return ws
+
+
+def test_ssm_rejection_preserves_existing(tmp_path):
+    """I5: a rejected SSM add must not drop the already-configured SSM."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    _mk_gwe_with_flow_chd(tmp_path, "ssmkeep")
+    assert model_store.get_model("ssmkeep", "gwe").get_package("ssm") is not None
+    with pytest.raises(ValueError, match="not a package"):
+        builder._impl_add_gwe_ssm_package(
+            "ssmkeep", sources=[("NOPE", "AUX", "TEMPERATURE")]
+        )
+    assert model_store.get_model("ssmkeep", "gwe").get_package("ssm") is not None
+
+
+def test_readonly_gwe_package_tool_leaves_no_mutation(tmp_path):
+    """I1: a rejected GWE package add on a read-only model must not stick."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = _mk_gwe(tmp_path, "ro_adv_src")
+    model_store.invalidate("ro_adv_src")
+    builder._impl_adopt_model("ro_adv", str(ws), "METERS", "DAYS")
+    assert model_store.get_model("ro_adv", "gwe").get_package("adv") is None
+    with pytest.raises(model_store.ModelReadOnlyError):
+        builder._impl_add_gwe_adv_package("ro_adv", scheme="UPSTREAM")
+    # The rejected mutation must not survive in the cached heat simulation.
+    assert model_store.get_model("ro_adv", "gwe").get_package("adv") is None
+
+
+def test_create_model_clears_stale_component_cache(tmp_path):
+    """Re-creating a model name must not keep a previous heat simulation."""
+    from groundwater_mcp.tools import builder
+    from groundwater_mcp.utils import model_store
+
+    ws = _mk_gwe(tmp_path, "recyc")
+    assert model_store.component_sim_names("recyc") == ["gwe"]
+    # Re-create in place (idempotent same-name+path): this resets the flow
+    # model and its metadata, so the old heat sim must not survive in cache.
+    builder._impl_create_model("recyc", str(ws), "METERS", "DAYS")
+    assert model_store.component_sim_names("recyc") == []
+
+
+def test_heat_failure_listing_includes_all_components(tmp_path, monkeypatch):
+    """I2: every failing component's listing must be surfaced, not just the last."""
+    from groundwater_mcp.tools import runner
+    from groundwater_mcp.utils import model_store
+
+    _mk_gwe(tmp_path, "hfmulti")
+    flow = model_store.get_sim("hfmulti")
+    flow.run_simulation = lambda **kw: (True, ["flow ok"])
+
+    class _Failing:
+        def __init__(self, tail: str):
+            self._tail = tail
+
+        def run_simulation(self, **kw):
+            return False, [self._tail]
+
+    fakes = {"gwe": _Failing("heat exploded"), "gwt": _Failing("transport exploded")}
+    monkeypatch.setattr(runner, "component_sim_names", lambda name: ["gwe", "gwt"])
+    monkeypatch.setattr(runner, "get_component_sim", lambda name, c: fakes[c])
+    monkeypatch.setattr(runner, "_find_mf6_binary", lambda: "mf6")
+
+    out = runner._impl_run_simulation("hfmulti", silent=True)
+    assert out["success"] is False
+    summary = out.get("component_listing_summary", "")
+    assert "heat exploded" in summary
+    assert "transport exploded" in summary
