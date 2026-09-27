@@ -706,7 +706,11 @@ def _impl_add_prt_model(model: str) -> dict:
 def _impl_add_prt_mip_package(
     model: str, porosity, retfactor: float = 1.0, izone=None, save_flows: bool = False
 ) -> dict:
-    """Add the PRT matrix-input (MIP) package: porosity and retardation."""
+    """Add the PRT matrix-input (MIP) package: porosity and retardation.
+
+    ``save_flows`` is accepted for interface parity with the other PRT builders
+    and ignored: MIP has no budget, so it is not a valid MF6 option.
+    """
     _require_writable(model, "add_prt_mip_package")
     prt = get_model(model, "prt")
     pkg = prt.get_package("mip")
@@ -3064,6 +3068,130 @@ def register(mcp) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_prt_model(model: str) -> dict:
+        """Add a MODFLOW 6 particle-tracking (PRT) model to the simulation.
+
+        PRT is a **same-simulation** component: the flow (GWF) grid is mirrored
+        into a ``ModflowPrt`` model and a ``GWF6-PRT6`` exchange
+        (``ModflowGwfprt``) is registered, so flow and particle tracking are
+        solved together in one run. The flow model is made PRT-ready
+        automatically (NPF ``save_flows`` and ``save_specific_discharge``).
+        Build the package set with
+        ``add_prt_mip_package`` / ``add_prt_prp_package`` /
+        ``add_prt_oc_package``, then call ``run_simulation``. PRT is an
+        explicit (forward-tracking) model solved by an **EMS** listed after the
+        GWF solver, not by the GWF IMS."""
+        try:
+            return _impl_add_prt_model(model)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PRT_BUILD_FAILED", str(exc))
+
+    @mcp.tool()
+    def add_prt_mip_package(
+        model: str,
+        porosity: float | list,
+        retfactor: float = 1.0,
+        izone: int | list | None = None,
+        save_flows: bool = False,
+    ) -> dict:
+        """Add the PRT matrix-input (MIP) package: porosity and retardation.
+
+        ``porosity`` (scalar or per-cell) drives the tracking velocity,
+        ``retfactor`` is the retardation factor (default 1.0 = none) and
+        ``izone`` is an optional integer zone array. ``save_flows`` is accepted
+        for interface parity with the other PRT builders and **ignored** — MIP
+        has no MF6 budget."""
+        try:
+            return _impl_add_prt_mip_package(
+                model, porosity, retfactor=retfactor, izone=izone, save_flows=save_flows
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_prt_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PRT_PACKAGE_FAILED", str(exc))
+
+    @mcp.tool()
+    def add_prt_prp_package(
+        model: str,
+        release_points: list,
+        perioddata: list | None = None,
+        release_times: list | None = None,
+        save_flows: bool = False,
+    ) -> dict:
+        """Add the PRT particle-release (PRP) package.
+
+        ``release_points`` is a list of ``(irptno, cellid, xrpt, yrpt,
+        zrpt[, boundname])`` records with 0-based ``irptno`` (FloPy writes the
+        1-based MF6 value). ``perioddata`` is the per-period release setting,
+        e.g. ``[["first"]]``; ``release_times`` lists explicit release times.
+        ``save_flows`` is accepted for interface parity with the other PRT
+        builders and **ignored** — PRP has no MF6 budget."""
+        try:
+            return _impl_add_prt_prp_package(
+                model,
+                release_points,
+                perioddata=perioddata,
+                release_times=release_times,
+                save_flows=save_flows,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_prt_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PRT_PACKAGE_FAILED", str(exc))
+
+    @mcp.tool()
+    def add_prt_oc_package(
+        model: str,
+        track_filerecord: str | None = None,
+        trackcsv_filerecord: str | None = None,
+        track_release: bool = True,
+        track_timestep: bool = True,
+        track_terminate: bool = True,
+        track_exit: bool = False,
+        budget_filerecord: str | None = None,
+    ) -> dict:
+        """Add the PRT output-control (OC) package with tracking output.
+
+        Declare the track file here (not on PRP — MF6 aborts if the same file
+        is declared twice). Leave both ``trackcsv_filerecord`` and
+        ``track_filerecord`` unset and the CSV track file defaults to
+        ``<prt model name>.trk.csv``, so ``read_pathlines`` /
+        ``plot_pathlines`` work without further configuration."""
+        try:
+            return _impl_add_prt_oc_package(
+                model,
+                track_filerecord=track_filerecord,
+                trackcsv_filerecord=trackcsv_filerecord,
+                track_release=track_release,
+                track_timestep=track_timestep,
+                track_terminate=track_terminate,
+                track_exit=track_exit,
+                budget_filerecord=budget_filerecord,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_prt_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PRT_PACKAGE_FAILED", str(exc))
 
     @mcp.tool()
     def summarise_model(model: str) -> dict:

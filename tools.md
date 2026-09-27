@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-74 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+89 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -167,6 +167,23 @@ runs the flow model first and the heat model second. Post-process with
 The flow model is made FMI-ready automatically (`save_flows`,
 `save_specific_discharge`, `save_saturation` on NPF); a GWE model requires an
 SSM package whenever the flow model has boundary packages.
+
+**PRT particle tracking (v0.3.0, 2026-09-27):** `add_prt_model` adds a MODFLOW 6
+particle-tracking model as a **same-simulation** component — the GWF grid is
+mirrored into a `ModflowPrt` model and a `GWF6-PRT6` exchange is registered, so
+flow and tracking are solved together in one run (PRT is an explicit model
+solved by an **EMS** listed after the GWF IMS, not by the GWF IMS). Build the
+physics with `add_prt_mip_package` (porosity, retardation), release particles
+with `add_prt_prp_package` (`release_points` plus optional
+`perioddata`/`release_times`) and declare the tracking output with
+`add_prt_oc_package`. The PRT OC `trackcsv_filerecord` defaults to
+`<prt model name>.trk.csv` when neither a CSV nor a binary track file is given,
+so post-processing works out of the box. Post-process with `read_pathlines`
+(per-particle t/x/y/z pathlines + statistics, writes a `.npy`) and
+`plot_pathlines` (plan-view PNG, optional `particles` subset). The flow model
+is made PRT-ready automatically (`save_flows` + `save_specific_discharge` on
+NPF). The `save_flows` argument on MIP and PRP is accepted for interface parity
+with the other PRT builders and ignored — neither package has an MF6 budget.
 
 `stress_period_data` maps a **0-based** stress-period index to records with **0-based** cell indices (layer, row, col for DIS; layer, node for DISV); indices are converted to 1-based when written to the package file. `save_flows` (default on) writes the SAVE FLOWS option so the package's fluxes appear in the budget file for `compute_water_balance`.
 

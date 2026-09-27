@@ -2312,3 +2312,48 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PLOT_FAILED", str(exc))
+
+    @mcp.tool()
+    def read_pathlines(model: str) -> dict:
+        """Read PRT particle pathlines from the tracking CSV output.
+
+        Returns per-particle ``t``/``x``/``y``/``z`` pathlines plus summary
+        statistics, and writes the parsed track array to a ``.npy``
+        ``output_file`` beside the CSV (mirroring ``read_heads``). Requires a
+        completed ``run_simulation``; the CSV is the track file the PRT OC
+        package declares (default ``<prt model name>.trk.csv``)."""
+        try:
+            return _impl_read_pathlines(model)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_prt_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PRT_READ_FAILED", str(exc))
+
+    @mcp.tool(structured_output=False)
+    def plot_pathlines(
+        model: str,
+        output_file: str | None = None,
+        title: str | None = None,
+        particles: list[int] | None = None,
+    ) -> dict | list:
+        """Plot PRT particle pathlines in plan view and save as PNG.
+
+        One polyline is drawn per particle over the PRT grid outline;
+        ``particles`` optionally selects a subset by index into
+        ``read_pathlines``'s particle list. Returns the PNG image natively
+        (ImageContent) together with the file path."""
+        try:
+            result = _impl_plot_pathlines(model, output_file, title, particles)
+            return [Image(path=result["output_file"]), result]
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Call add_prt_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PRT_PLOT_FAILED", str(exc))

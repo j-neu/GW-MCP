@@ -193,6 +193,20 @@ through the Flow Model Interface (`add_gwe_model`), the physics packages
 **Validation status: NOT YET RUN** — the v0.3.0 gate for GWE is the Tier-2
 `ex-gwe-radial` target through the 6d rerun loop.
 
+**PRT particle tracking (v0.3.0 scope) built 2026-09-27.** Six new tools close
+the MODFLOW 6 native particle-tracking path as a **same-simulation** GWF
+component (not a derived simulation like GWE): `add_prt_model` mirrors the flow
+grid into a `ModflowPrt` model and registers the `GWF6-PRT6` exchange in the
+*same* `mfsim.nam`, solving PRT with an **EMS** listed after the GWF IMS;
+`add_prt_mip_package` (porosity/retardation), `add_prt_prp_package` (release
+points + per-period release setting) and `add_prt_oc_package` (track/budget
+output, with the CSV track file defaulting to `<prt model name>.trk.csv`) build
+the package set; `read_pathlines` (per-particle t/x/y/z pathlines + statistics)
+and `plot_pathlines` (plan-view PNG) post-process it. → 89 tools. Spec
+`docs/superpowers/specs/2026-09-27-v0.3.0-prt-design.md`.
+**Validation status: NOT YET RUN** — the v0.3.0 gate for PRT is the closed-book
+`ex-prt-mp7-p01` (MODPATH 7 p01) target through the 6d rerun loop.
+
 **CSUB (v0.3.0 scope) landed 2026-09-19.** Four new tools close the MODFLOW 6
 subsidence path: `add_csub_package` (11-field interbed `packagedata` with
 delay/no-delay `cdelay`, `ndelaycells`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr`,

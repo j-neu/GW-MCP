@@ -573,8 +573,7 @@ below.
   mirrored into a component and its exchange registered (`utils/components.py`, `model_store.get_model`,
   internal `add_component_model`). Ships no user-facing tool → no rerun gate. **Landed 2026-09-25.**
 - [x] **GWE** (sub-project 2) — energy (heat) transport + temperature post-processing. Spec `docs/superpowers/specs/2026-09-25-v0.3.0-gwe-design.md`, plan `docs/superpowers/plans/2026-09-25-v0.3.0-gwe.md`. FMI-coupled derived heat simulation; tools `add_gwe_model`, `add_gwe_adv/cnd/est/ssm/esl_package`, `read_temperature`, `plot_temperature_map`, `plot_temperature_timeseries` (+ `component="gwe"` on grid/IC/OC). **Built 2026-09-25** (9 new tools, 74→83; suite green). **Closed-book ex-gwe-radial validation still pending** — required before v0.3.0 ships.
-- [ ] **PRT** (sub-project 3) — MF6-native particle tracking + pathline post-processing; build +
-  closed-book validation required.
+- [x] **PRT** (sub-project 3) — MF6-native particle tracking + pathline post-processing. Spec `docs/superpowers/specs/2026-09-27-v0.3.0-prt-design.md`, plan `docs/superpowers/plans/2026-09-27-v0.3.0-prt.md`. Same-simulation GWF-PRT component (grid mirrored, `GWF6-PRT6` exchange, solved by an EMS after the GWF IMS); tools `add_prt_model`, `add_prt_mip_package`, `add_prt_prp_package`, `add_prt_oc_package`, `read_pathlines`, `plot_pathlines`. **Built 2026-09-27** (6 new tools, 83→89; suite green). **Closed-book `ex-prt-mp7-p01` validation still pending** — required before v0.3.0 ships.
 - [ ] **MT3D-USGS** (sub-project 4) — legacy solute-transport post-processing (read transport output,
   plot plumes); build + closed-book validation required.
 - [ ] **MODPATH** (sub-project 5) — legacy particle tracking (pathlines); in scope, build + validate.
