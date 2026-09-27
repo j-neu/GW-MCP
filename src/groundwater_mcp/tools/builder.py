@@ -756,6 +756,50 @@ def _impl_add_prt_prp_package(
     }
 
 
+def _impl_add_prt_oc_package(
+    model: str,
+    track_filerecord: str | None = None,
+    trackcsv_filerecord: str | None = None,
+    track_release: bool = True,
+    track_timestep: bool = True,
+    track_terminate: bool = True,
+    track_exit: bool = False,
+    budget_filerecord: str | None = None,
+) -> dict:
+    """Add the PRT output-control (OC) package with tracking output.
+
+    Declare the track file here (not on the PRP) — MF6 aborts if the same file
+    is declared twice.
+    """
+    _require_writable(model, "add_prt_oc_package")
+    prt = get_model(model, "prt")
+    pkg = prt.get_package("oc")
+    if pkg is not None:
+        prt.remove_package(pkg)
+    kwargs: dict = {}
+    if trackcsv_filerecord:
+        kwargs["trackcsv_filerecord"] = trackcsv_filerecord
+    if track_filerecord:
+        kwargs["track_filerecord"] = track_filerecord
+    if budget_filerecord:
+        kwargs["budget_filerecord"] = budget_filerecord
+    if track_release:
+        kwargs["track_release"] = True
+    if track_timestep:
+        kwargs["track_timestep"] = True
+    if track_terminate:
+        kwargs["track_terminate"] = True
+    if track_exit:
+        kwargs["track_exit"] = True
+    mf6.ModflowPrtoc(prt, **kwargs)
+    return {
+        "model": model,
+        "package": "OC",
+        "model_name": prt.name,
+        "written": save_sim(model, prt.simulation),
+    }
+
+
 def _require_writable(model: str, tool: str) -> None:
     """Refuse a builder mutation on an adopt_model read-only model."""
     if is_readonly(model):
