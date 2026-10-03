@@ -865,6 +865,119 @@ def _impl_plot_temperature_timeseries(
     }
 
 
+def _find_ucn_file(model: str, workspace: Path, ucn_file: str | None) -> Path:
+    """Locate the MT3D-USGS concentration (.UCN) file."""
+    if ucn_file:
+        p = Path(ucn_file)
+        cand = p if p.is_absolute() else workspace / p
+        if not cand.exists():
+            raise FileNotFoundError(f"Concentration file not found: {cand}")
+        return cand
+    declared = (read_meta(model).get("legacy") or {}).get("ucn_file")
+    if declared:
+        cand = workspace / declared
+        if cand.exists():
+            return cand
+    matches: list[Path] = []
+    for ext in ("*.ucn", "*.UCN"):
+        matches.extend(workspace.rglob(ext))
+    matches = sorted(set(matches))
+    if not matches:
+        raise FileNotFoundError(
+            f"No .ucn concentration file found in {workspace}. "
+            "Point ucn_file at the MT3D-USGS concentration output."
+        )
+    return matches[0]
+
+
+def _open_ucn(path: Path):
+    """Open a binary MT3D concentration file, trying each precision."""
+    last: Exception | None = None
+    for precision in ("auto", "single", "double"):
+        try:
+            return fu.UcnFile(str(path), precision=precision)
+        except Exception as exc:  # noqa: BLE001 - try the next precision
+            last = exc
+    raise ValueError(f"Could not read MT3D-USGS concentration file {path}: {last}")
+
+
+def _impl_read_concentration(
+    model: str,
+    ucn_file: str | None = None,
+    kstpkper: tuple[int, int] | None = None,
+    layer: int | None = 0,
+    include_values: bool = False,
+    max_cells: int = 10000,
+    row_slice: list[int] | None = None,
+    col_slice: list[int] | None = None,
+) -> dict:
+    """Read concentration from a legacy MT3D-USGS .UCN output file.
+
+    Returns statistics plus an ``output_file`` (.npy) of the selected layer (or
+    all layers when ``layer=None``). ``kstpkper`` is 0-based and defaults to the
+    last record."""
+    from groundwater_mcp.utils import legacy_transport
+
+    legacy = legacy_transport.get_legacy_model(model)
+    ws = legacy.workspace
+    path = _find_ucn_file(model, ws, ucn_file)
+    ucn = _open_ucn(path)
+
+    kstpkper_list = ucn.get_kstpkper()
+    if not kstpkper_list:
+        raise ValueError("Concentration file contains no data.")
+    target = tuple(kstpkper) if kstpkper is not None else kstpkper_list[-1]
+    if target not in kstpkper_list:
+        raise ValueError(f"kstpkper {target} not found. Available: {kstpkper_list}")
+
+    conc = np.asarray(ucn.get_data(kstpkper=target))
+    if conc.ndim == 2:
+        conc = conc[np.newaxis, :, :]
+    nlay, _nrow, _ncol = conc.shape
+
+    if layer is not None:
+        if not (0 <= layer < nlay):
+            raise ValueError(
+                f"layer {layer} out of range: model has nlay={nlay} "
+                f"(valid: 0..{nlay - 1})."
+            )
+        arr = conc[layer]
+    else:
+        arr = conc
+
+    if row_slice is not None:
+        arr = arr[..., slice(*row_slice), :] if arr.ndim == 3 else arr[slice(*row_slice), :]
+    if col_slice is not None:
+        arr = arr[..., :, slice(*col_slice)] if arr.ndim == 3 else arr[:, slice(*col_slice)]
+
+    stats = _array_stats(arr)
+    times = list(ucn.get_times())
+    idx = kstpkper_list.index(target)
+    result: dict = {
+        "model": model,
+        "type": "mt3d-usgs",
+        "kstpkper": [int(v) for v in target],
+        "totim": float(times[idx]) if idx < len(times) else None,
+        "layer": layer,
+        "shape": list(arr.shape),
+        "n_times": len(kstpkper_list),
+        **stats,
+    }
+    npy = ws / f"{model}_conc_l{layer if layer is not None else 'all'}_k{target[0]}_{target[1]}.npy"
+    np.save(npy, arr)
+    result["output_file"] = str(npy)
+
+    if include_values:
+        if arr.size > max_cells:
+            return _err(
+                "PAYLOAD_TOO_LARGE",
+                f"{arr.size} cells exceed max_cells={max_cells}.",
+                "Use include_values=False and load the array from output_file.",
+            )
+        result["values"] = arr.tolist()
+    return result
+
+
 def _impl_read_heads(
     model: str,
     kstpkper: tuple[int, int] | None = None,
@@ -1941,6 +2054,37 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("READ_HEADS_FAILED", str(exc))
+
+    @mcp.tool()
+    def read_concentration(
+        model: str,
+        ucn_file: str | None = None,
+        kstpkper: tuple[int, int] | None = None,
+        layer: int | None = 0,
+        include_values: bool = False,
+        max_cells: int = 10000,
+        row_slice: list[int] | None = None,
+        col_slice: list[int] | None = None,
+    ) -> dict:
+        """Read concentration from a legacy MT3D-USGS .UCN output file.
+
+        ``kstpkper`` is 0-based (default: last record); ``layer`` is 0-based
+        (None returns all layers). Returns statistics plus an output_file (.npy);
+        include_values=True returns raw values within max_cells."""
+        try:
+            return _impl_read_concentration(
+                model, ucn_file, kstpkper, layer, include_values, max_cells,
+                row_slice, col_slice,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc),
+                        "Call adopt_mt3d_usgs_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("READ_CONCENTRATION_FAILED", str(exc))
 
     @mcp.tool()
     def read_budget(

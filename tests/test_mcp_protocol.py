@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 90
+_EXPECTED_TOOL_COUNT = 91
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -111,6 +111,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
     "environment": ["check_environment"],
     "postprocess": [
         "read_heads",
+        "read_concentration",
         "read_budget",
         "compute_drawdown",
         "compute_water_balance",

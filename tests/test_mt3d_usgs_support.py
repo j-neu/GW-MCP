@@ -199,3 +199,68 @@ def test_adopt_mt3d_usgs_conflicts_with_mf6_name(tmp_path: Path):
     _impl_create_model("m5", str(ws), "METERS", "DAYS")
     with pytest.raises(ValueError, match="MODFLOW 6"):
         _impl_adopt_mt3d_usgs_model("m5", str(ws))
+
+
+def _adopt(tmp_path: Path, name: str = "m6", nlay: int = 1) -> tuple[str, Path]:
+    from groundwater_mcp.tools.builder import _impl_adopt_mt3d_usgs_model
+
+    ws = tmp_path / name
+    ws.mkdir()
+    _build_legacy_model(ws, nlay=nlay)
+    return _impl_adopt_mt3d_usgs_model(name, str(ws))["model"], ws
+
+
+def test_read_concentration(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+
+    name, ws = _adopt(tmp_path)
+    arr0 = np.arange(12.0).reshape(1, 3, 4)
+    arr1 = arr0 + 100.0
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, arr0), (1, 2, 2.0, arr1)])
+
+    out = _impl_read_concentration(name)
+    assert out["kstpkper"] == [0, 1]          # default = last record
+    assert out["shape"] == [3, 4]
+    assert out["max"] == 111.0
+    assert out["n_times"] == 2
+    assert Path(out["output_file"]).exists()
+
+    first = _impl_read_concentration(name, kstpkper=(0, 0))
+    assert first["totim"] == 1.0
+    assert first["max"] == 11.0
+
+    vals = _impl_read_concentration(name, kstpkper=(0, 0), include_values=True)
+    assert np.asarray(vals["values"]).shape == (3, 4)
+
+
+def test_read_concentration_errors(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+
+    name, ws = _adopt(tmp_path, "m7")
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.ones((1, 3, 4)))])
+
+    with pytest.raises(ValueError, match="not found"):
+        _impl_read_concentration(name, kstpkper=(5, 5))
+    with pytest.raises(ValueError, match="layer"):
+        _impl_read_concentration(name, layer=9)
+
+
+def test_read_concentration_missing_ucn(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+
+    name, _ = _adopt(tmp_path, "m8")
+    with pytest.raises(FileNotFoundError):
+        _impl_read_concentration(name)
+
+
+def test_read_concentration_double_precision(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+
+    name, ws = _adopt(tmp_path, "m10")
+    _write_ucn(
+        ws / "MT3D001.UCN",
+        [(1, 1, 1.0, np.full((1, 3, 4), 2.5))],
+        precision="double",
+    )
+    out = _impl_read_concentration(name)
+    assert out["max"] == 2.5
