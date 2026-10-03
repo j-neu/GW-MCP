@@ -179,6 +179,7 @@ def test_adopt_mt3d_usgs_tool(tmp_path: Path):
     assert out["read_only"] is True
 
     meta = read_meta("m4")
+    assert meta["time_units"] == "DAYS"
     assert meta["legacy"]["flow_nam"] == "legacy.nam"
     assert meta["legacy"]["transport_nam"] == "legacy_mt3d.nam"
     assert resolve_workspace("m4") == ws

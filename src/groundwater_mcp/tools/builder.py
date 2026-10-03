@@ -95,6 +95,16 @@ _SECONDS_PER_TIME_UNIT: dict[str, float] = {
     "YEARS": 31536000.0,
 }
 
+# MODFLOW-2005 DIS ITMUNI integer code → time-unit label.
+_ITMUNI_LABELS: dict[int, str] = {
+    0: "UNDEFINED",
+    1: "SECONDS",
+    2: "MINUTES",
+    3: "HOURS",
+    4: "DAYS",
+    5: "YEARS",
+}
+
 # CSUB water specific weight (gammaw) and water compressibility (beta) defaults
 # per model length unit. The SI pair is 9806.65 N/m3 and 4.6512e-10 1/Pa; the
 # US-customary pair is 62.48 lb/ft3 and 2.227e-8 ft2/lb — the values the CSUB
@@ -336,7 +346,9 @@ def _impl_adopt_mt3d_usgs_model(
     )
     flow = legacy.flow_model
     dis = getattr(flow, "dis")
-    time_units = getattr(getattr(flow, "dis", None), "itmuni", None) or time_units
+    code = getattr(getattr(flow, "dis", None), "itmuni", None)
+    if code is not None:
+        time_units = _ITMUNI_LABELS.get(int(code), time_units)
     packages = sorted(
         legacy_transport.read_nam_packages(model_dir / legacy.transport_nam)
     )
