@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 89
+_EXPECTED_TOOL_COUNT = 90
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -79,6 +79,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
     "builder": [
         "create_model",
         "adopt_model",
+        "adopt_mt3d_usgs_model",
         "set_simulation",
         "set_model_crs",
         "add_dis_package",

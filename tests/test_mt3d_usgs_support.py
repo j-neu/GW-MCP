@@ -158,3 +158,43 @@ def test_model_store_guard_rejects_legacy_name(tmp_path: Path):
     legacy_transport.adopt_legacy_mt3d_usgs("m3", ws)
     with pytest.raises(ValueError, match="legacy MT3D-USGS"):
         model_store.get_sim("m3")
+
+
+def test_adopt_mt3d_usgs_tool(tmp_path: Path):
+    from groundwater_mcp.tools.builder import _impl_adopt_mt3d_usgs_model
+    from groundwater_mcp.utils.model_store import read_meta
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    ws = tmp_path / "legacy"
+    ws.mkdir()
+    _build_legacy_model(ws)
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.ones((1, 3, 4)))])
+
+    out = _impl_adopt_mt3d_usgs_model("m4", str(ws), "METERS", "DAYS")
+    assert out["type"] == "mt3d-usgs"
+    assert out["flow_version"] == "mf2005"
+    assert out["grid"] == {"nlay": 1, "nrow": 3, "ncol": 4}
+    assert "BTN" in out["transport_packages"]
+    assert out["ucn_file"] == "MT3D001.UCN"
+    assert out["read_only"] is True
+
+    meta = read_meta("m4")
+    assert meta["legacy"]["flow_nam"] == "legacy.nam"
+    assert meta["legacy"]["transport_nam"] == "legacy_mt3d.nam"
+    assert resolve_workspace("m4") == ws
+
+
+def test_adopt_mt3d_usgs_conflicts_with_mf6_name(tmp_path: Path):
+    from groundwater_mcp.tools.builder import (
+        _impl_adopt_mt3d_usgs_model,
+        _impl_create_model,
+    )
+
+    ws = tmp_path / "legacy"
+    ws.mkdir()
+    _build_legacy_model(ws)
+    # Register the same path/name as an MF6 model first; the legacy adopt must
+    # refuse to overwrite it.
+    _impl_create_model("m5", str(ws), "METERS", "DAYS")
+    with pytest.raises(ValueError, match="MODFLOW 6"):
+        _impl_adopt_mt3d_usgs_model("m5", str(ws))

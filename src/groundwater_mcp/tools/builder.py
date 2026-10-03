@@ -309,6 +309,79 @@ def _impl_adopt_model(
     return result
 
 
+def _impl_adopt_mt3d_usgs_model(
+    name: str,
+    workspace: str,
+    units: str = "METERS",
+    time_units: str = "DAYS",
+    flow_nam: str | None = None,
+    transport_nam: str | None = None,
+    allow_modify: bool = False,
+) -> dict:
+    """Register an existing MODFLOW-2005 + MT3D-USGS model for read-only
+    concentration post-processing."""
+    from groundwater_mcp.utils import legacy_transport
+
+    model_dir = create_workspace(name, workspace or None)
+    existing = _read_meta(model_dir)
+    if existing.get("components"):
+        raise ValueError(
+            f"'{name}' is already registered as a MODFLOW 6 model. "
+            "Choose a different name for the legacy MT3D-USGS model."
+        )
+
+    legacy = legacy_transport.adopt_legacy_mt3d_usgs(
+        name, model_dir, flow_nam=flow_nam, transport_nam=transport_nam,
+        allow_modify=allow_modify,
+    )
+    flow = legacy.flow_model
+    dis = getattr(flow, "dis")
+    time_units = getattr(getattr(flow, "dis", None), "itmuni", None) or time_units
+    packages = sorted(
+        legacy_transport.read_nam_packages(model_dir / legacy.transport_nam)
+    )
+    ucn = None
+    for ext in ("*.ucn", "*.UCN"):
+        hits = sorted(model_dir.rglob(ext))
+        if hits:
+            ucn = hits[0].name
+            break
+
+    meta = _read_meta(model_dir)
+    meta.update({
+        "name": name,
+        "units": str(units).upper(),
+        "time_units": str(time_units).upper(),
+        "adopted": True,
+        "allow_modify": bool(allow_modify),
+        "legacy": {
+            "type": "mt3d-usgs",
+            "flow_version": "mf2005",
+            "flow_nam": legacy.flow_nam,
+            "transport_nam": legacy.transport_nam,
+            "transport_packages": packages,
+            "ucn_file": ucn,
+        },
+    })
+    _write_meta(model_dir, meta)
+
+    return {
+        "model": name,
+        "workspace": str(model_dir),
+        "type": "mt3d-usgs",
+        "flow_version": "mf2005",
+        "grid": {
+            "nlay": int(dis.nlay),
+            "nrow": int(dis.nrow),
+            "ncol": int(dis.ncol),
+        },
+        "transport_packages": packages,
+        "ucn_file": ucn,
+        "adopted": True,
+        "read_only": not allow_modify,
+    }
+
+
 def _grid_kind_map() -> dict[type, str]:
     """Map every registered grid package class to its kind ('dis'/...)."""
     from groundwater_mcp.utils.components import all_components
@@ -2596,6 +2669,38 @@ def register(mcp) -> None:
             )
         except Exception as exc:
             return _err("ADOPT_FAILED", str(exc))
+
+    @mcp.tool()
+    def adopt_mt3d_usgs_model(
+        name: str,
+        workspace: str = "",
+        units: str = "METERS",
+        time_units: str = "DAYS",
+        flow_nam: str | None = None,
+        transport_nam: str | None = None,
+        allow_modify: bool = False,
+    ) -> dict:
+        """Adopt an existing MODFLOW-2005 + MT3D-USGS model directory for
+        read-only concentration post-processing.
+
+        Reads the legacy flow and transport name files (auto-discovered by
+        package type unless flow_nam/transport_nam are given) and registers the
+        model so read_concentration / plot_concentration_map can operate on it.
+        Legacy input files are never modified."""
+        try:
+            return _impl_adopt_mt3d_usgs_model(
+                name, workspace, units, time_units, flow_nam, transport_nam,
+                allow_modify,
+            )
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except FileNotFoundError as exc:
+            return _err(
+                "OUTPUT_FILE_MISSING", str(exc),
+                "Point workspace at a MODFLOW-2005 + MT3D-USGS model directory.",
+            )
+        except Exception as exc:
+            return _err("ADOPT_MT3D_USGS_FAILED", str(exc))
 
     @mcp.tool()
     def set_simulation(
