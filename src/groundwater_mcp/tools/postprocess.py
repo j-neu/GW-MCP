@@ -786,6 +786,49 @@ def _impl_plot_temperature_map(
     }
 
 
+def _impl_plot_concentration_map(
+    model: str,
+    kstpkper: tuple[int, int] | None = None,
+    layer: int = 0,
+    output_file: str | None = None,
+    title: str | None = None,
+    cmap: str = "jet",
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> dict:
+    """Plot a plan view of MT3D-USGS concentration for one time/layer as PNG."""
+    from flopy.plot import PlotMapView
+
+    from groundwater_mcp.utils import legacy_transport
+    from groundwater_mcp.utils.plotting import figure, save_figure
+
+    legacy = legacy_transport.get_legacy_model(model)
+    result = _impl_read_concentration(model, kstpkper=kstpkper, layer=layer)
+    arr = np.load(result["output_file"])
+    ws = legacy.workspace
+
+    with figure(figsize=(8, 6)) as fig:
+        ax = fig.add_subplot(1, 1, 1)
+        pmv = PlotMapView(model=legacy.flow_model, ax=ax, layer=layer)
+        cb = pmv.plot_array(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+        fig.colorbar(cb, ax=ax, shrink=0.7, label="Concentration")
+        ax.set_aspect("equal")
+        ax.set_title(title or f"{model} concentration")
+        target = _resolve_output_path(ws, output_file, "") if output_file else None
+        out_path = save_figure(fig, target, ws)
+
+    return {
+        "model": model,
+        "type": "mt3d-usgs",
+        "output_file": out_path,
+        "kstpkper": result.get("kstpkper"),
+        "layer": layer,
+        "shape": result.get("shape"),
+        "min": result.get("min"),
+        "max": result.get("max"),
+    }
+
+
 def _impl_plot_temperature_timeseries(
     model: str,
     cells: list[int],
@@ -2381,6 +2424,36 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PLOT_FAILED", str(exc))
+
+    @mcp.tool(structured_output=False)
+    def plot_concentration_map(
+        model: str,
+        kstpkper: tuple[int, int] | None = None,
+        layer: int = 0,
+        output_file: str | None = None,
+        title: str | None = None,
+        cmap: str = "jet",
+        vmin: float | None = None,
+        vmax: float | None = None,
+    ) -> dict | list:
+        """Plot a plan view of legacy MT3D-USGS concentration and save as PNG.
+
+        Returns the PNG image natively (ImageContent) together with the file
+        path."""
+        try:
+            result = _impl_plot_concentration_map(
+                model, kstpkper, layer, output_file, title, cmap, vmin, vmax,
+            )
+            return [Image(path=result["output_file"]), result]
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc),
+                        "Call adopt_mt3d_usgs_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PLOT_CONCENTRATION_FAILED", str(exc))
 
     @mcp.tool()
     def read_temperature(

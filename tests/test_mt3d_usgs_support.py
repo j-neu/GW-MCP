@@ -264,3 +264,17 @@ def test_read_concentration_double_precision(tmp_path: Path):
     )
     out = _impl_read_concentration(name)
     assert out["max"] == 2.5
+
+
+def test_plot_concentration_map(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_plot_concentration_map
+
+    name, ws = _adopt(tmp_path, "m9")
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.arange(12.0).reshape(1, 3, 4))])
+
+    out = _impl_plot_concentration_map(name, output_file="plume.png")
+    assert out["type"] == "mt3d-usgs"
+    assert out["shape"] == [3, 4]
+    assert out["max"] == 11.0
+    png = Path(out["output_file"])
+    assert png.exists() and png.suffix == ".png" and png.stat().st_size > 0
