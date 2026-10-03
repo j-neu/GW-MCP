@@ -1,6 +1,6 @@
 # groundwater-mcp — Tool Reference
 
-89 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
+92 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates. All tools are registered with the MCP server and callable by any compatible AI client.
 
 ---
 
@@ -101,6 +101,7 @@ Create and configure MODFLOW 6 GWF models using FloPy. All tools operate on a na
 |---|---|---|
 | `create_model` | `name: str`, `workspace: str`, `units: str = "METERS"`, `time_units: str = "DAYS"` | Confirmation with workspace path |
 | `adopt_model` | `name: str`, `workspace: str`, `units: str = "METERS"`, `time_units: str = "DAYS"`, `allow_modify: bool = False` | Confirmation with workspace path + adopted model names + read-only status |
+| `adopt_mt3d_usgs_model` | `name: str`, `workspace: str = ""`, `units: str = "METERS"`, `time_units: str = "DAYS"`, `flow_nam: str \| None`, `transport_nam: str \| None`, `allow_modify: bool = False` | Confirmation: workspace path, `type: "mt3d-usgs"`, flow version, grid dimensions, discovered transport packages, `.UCN` file, read-only status |
 | `set_simulation` | `model: str`, `nper: int`, `perlen: list[float]`, `nstp: list[int]`, `ims_complexity: "simple" \| "moderate" \| "complex"` | Confirmation |
 | `set_model_crs` | `model: str`, `crs: str`, `xorigin: float \| None`, `yorigin: float \| None`, `angrot: float \| None` | Confirmation with the set CRS/offsets (7e-B11.1) |
 
@@ -184,6 +185,23 @@ so post-processing works out of the box. Post-process with `read_pathlines`
 is made PRT-ready automatically (`save_flows` + `save_specific_discharge` on
 NPF). The `save_flows` argument on MIP and PRP is accepted for interface parity
 with the other PRT builders and ignored — neither package has an MF6 budget.
+
+**MT3D-USGS legacy post-processing (v0.3.0, 2026-10-03):** read-only
+post-processing of an existing **MODFLOW-2005 + MT3D-USGS** run. There is no
+MT3D-USGS builder and no legacy binary execution: `adopt_mt3d_usgs_model`
+registers an existing model directory (discovering the flow/transport `.nam`
+files by package set unless `flow_nam`/`transport_nam` are given) inside a
+dedicated legacy subsystem (`utils/legacy_transport.py`) and reads the grid
+from the flow model's structured DIS; legacy input files are never written.
+Post-process with `read_concentration` (opens the binary `.UCN` via
+`flopy.utils.UcnFile`, selects a 0-based `kstpkper` — default the last record —
+and layer (0-based, or all layers with `layer=None`), validates the shape
+against the grid, writes a `.npy` in the workspace and returns `MIN`/`MAX`/`MEAN`
+plus `n_times`) and `plot_concentration_map` (plan-view plume PNG, returned
+natively, with optional `cmap`/`vmin`/`vmax` and a colour bar). An MF6 tool
+handed a legacy model name fails with a clear "use the transport tools" error
+rather than an opaque key error. The v0.3.0 release gate is the closed-book
+**GMS "MT3D-USGS Keating"** validation, still pending.
 
 `stress_period_data` maps a **0-based** stress-period index to records with **0-based** cell indices (layer, row, col for DIS; layer, node for DISV); indices are converted to 1-based when written to the package file. `save_flows` (default on) writes the SAVE FLOWS option so the package's fluxes appear in the budget file for `compute_water_balance`.
 
@@ -370,6 +388,7 @@ Read binary output files and compute derived quantities.
 | Tool | Inputs | Returns |
 |---|---|---|
 | `read_heads` | `model: str`, `kstpkper: tuple[int,int] \| None`, `layer: int = 0`, `include_values: bool = False`, `max_cells: int = 10000`, `row_slice: list[int] \| None`, `col_slice: list[int] \| None`, `decimate: int \| None` | Statistics + `output_file` (`.npy`) — values only under `include_values` within `max_cells`, else `PAYLOAD_TOO_LARGE` (7e-A1) |
+| `read_concentration` | `model: str`, `ucn_file: str \| None`, `kstpkper: tuple[int,int] \| None`, `layer: int \| None = 0`, `include_values: bool = False`, `max_cells: int = 10000`, `row_slice: list[int] \| None`, `col_slice: list[int] \| None` | Statistics (`MIN`/`MAX`/`MEAN`) + `output_file` (`.npy`) from a legacy MT3D-USGS `.UCN`; `kstpkper`/`layer` 0-based (`kstpkper=None` = last record, `layer=None` = all layers); values under `include_values` within `max_cells`, else `PAYLOAD_TOO_LARGE` |
 
 `read_heads` no longer returns the full array by default (a regional layer was
 ~38 MB of JSON). Default returns min/max/mean/`n_active` plus `output_file`, a
@@ -391,6 +410,7 @@ Layer indices are validated against the model's `nlay` (7f-D3): `layer < 0` or `
 | `plot_subsidence` | `model: str`, `observed_csv: str \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + `{ model, output_file, n_times, has_observed, observed_csv, observed_axis }` — cumulative subsidence vs model time, with an optional observed overlay placed on the same axis (`observed_axis` = `"model-time"`/`"row-index"`) |
 | `plot_heads_map` | `model: str`, `layer: int = 0`, `kstpkper: tuple \| None`, `contour_intervals: int = 10`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
 | `plot_cross_section` | `model: str`, `line: dict`, `kstpkper: tuple \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
+| `plot_concentration_map` | `model: str`, `kstpkper: tuple \| None`, `layer: int = 0`, `output_file: str \| None`, `title: str \| None`, `cmap: str = "jet"`, `vmin: float \| None`, `vmax: float \| None` | The plan-view legacy MT3D-USGS concentration PNG returned natively (ImageContent) + `{ model, output_file, layer, kstpkper, shape, min, max }` |
 
 `plot_heads_map` / `plot_cross_section` / `plot_subsidence` return the PNG natively
 as an MCP image content block together with the saved file path (7f-I1) — the

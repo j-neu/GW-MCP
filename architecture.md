@@ -6,7 +6,7 @@ An open-source Python MCP server for AI-assisted groundwater modelling with MODF
 
 ## Overview
 
-The server exposes 89 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 92 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -54,7 +54,7 @@ Wraps FloPy's MODFLOW 6 GWF API to create and configure models programmatically 
 Invokes the MODFLOW 6 binary via FloPy's `run_model()`, streams stdout/stderr, and returns structured convergence status. Also runs FloPy's pre-run model checker.
 
 ### post-processing
-Reads binary output files (`.hds`, `.cbb`) via `flopy.utils`, computes derived quantities (drawdown, water balance, CSUB compaction/subsidence), and generates plan-view, cross-section and subsidence time-series plots as PNG files.
+Reads binary output files (`.hds`, `.cbb`) via `flopy.utils`, computes derived quantities (drawdown, water balance, CSUB compaction/subsidence), and generates plan-view, cross-section and subsidence time-series plots as PNG files. A read-only legacy subsystem additionally reads and plots MT3D-USGS `.UCN` concentration output.
 
 ### calibration
 Uses pyEMU to set up and run PEST++ (PESTPP-IES and PESTPP-GLM) for parameter estimation and uncertainty analysis. Invoked as a subprocess with file-based I/O. Returns phi progress, residual statistics, and predictive uncertainty bounds.
@@ -77,6 +77,8 @@ GWE heat transport (v0.3.0, 2026-09-25): a registered model can own a **second, 
 
 PRT particle tracking (v0.3.0, 2026-09-27): unlike GWE, PRT is a **same-simulation** component. `add_prt_model` wraps the internal `add_component_model(model, "prt")`, so the GWF grid is mirrored into a `ModflowPrt` model and a `GWF6-PRT6` exchange (`ModflowGwfprt`) is registered in the *same* simulation, and the flow model is made PRT-ready in place (NPF `save_flows` + `save_specific_discharge`, re-applied after a later `add_npf_package` via the `prt_flow_saving` meta flag). PRT is an explicit (forward-tracking) model, so `run_simulation` solves it with an **EMS** registered *after* the GWF IMS — an IMS makes `prt_solve` return early and leaves the track file header-only. Packages: `add_prt_mip_package` (porosity/retardation), `add_prt_prp_package` (release points + per-period release setting) and `add_prt_oc_package` (track/budget output; the CSV track file defaults to `<prt model name>.trk.csv` when none is given). Post-processing: `read_pathlines` (parses the track CSV into per-particle pathlines + statistics and writes a `.npy`) and `plot_pathlines` (plan-view PNG of the pathlines over the PRT grid). DISU grids are rejected (`INVALID_INPUT`) because PRT has no DISU grid class to mirror.
 
+MT3D-USGS legacy post-processing (v0.3.0, 2026-10-03): read-only post-processing of an existing **MODFLOW-2005 + MT3D-USGS** run lives in a dedicated legacy subsystem, `utils/legacy_transport.py`, so the MF6-typed core (`model_store`, `components`, `grid`, `runner`) is otherwise untouched. `adopt_mt3d_usgs_model` loads the legacy flow model (`flopy.modflow.Modflow.load(..., version="mf2005")`) and transport model (`flopy.mt3d.Mt3dms.load(..., version="mt3d-usgs")`) from an on-disk directory, discovers the `.nam` files by package set (or takes explicit `flow_nam`/`transport_nam`), reads the grid from the flow model's structured DIS, and records a `legacy` block in `.gwmcp_meta.json`; the module keeps its own in-memory cache, never writes legacy input, and `model_store` gains only a guard so an MF6 tool handed a legacy name fails with a clear "use the transport tools" error. `read_concentration` opens the binary `.UCN` (`flopy.utils.UcnFile`), selects a 0-based `kstpkper` (default the last record) and layer (0-based, or all layers), validates the shape against the grid, writes a `.npy`, and returns statistics; `plot_concentration_map` reads via `read_concentration` and renders a plan-view plume PNG with `PlotMapView`. This is **read + plot only** — the MCP does not build MT3D-USGS input or run the legacy binary. The v0.3.0 release gate is the closed-book GMS "MT3D-USGS Keating" validation, still pending.
+
 ---
 
 ## File structure
@@ -98,7 +100,8 @@ groundwater-mcp/
 │           ├── workspace.py    ← model directory management
 │           ├── plotting.py     ← shared matplotlib helpers
 │           ├── components.py   ← component registry for multi-model simulations
-│           └── spatial.py      ← shared raster/vector helpers (rasterio, geopandas)
+│           ├── spatial.py      ← shared raster/vector helpers (rasterio, geopandas)
+│           └── legacy_transport.py ← legacy MODFLOW-2005 + MT3D-USGS read-only cache
 ├── scripts/
 │   └── build_index.py          ← indexes docs at install time
 ├── tests/

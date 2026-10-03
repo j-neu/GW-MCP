@@ -25,7 +25,7 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (89 total, plus 2 MCP prompts and 3 MCP resource templates)
+## Tools (92 total, plus 2 MCP prompts and 3 MCP resource templates)
 
 | Module | Tools |
 |---|---|
@@ -47,6 +47,8 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 **GWE heat transport** (2026-09-25) is built: `add_gwe_model` creates a heat simulation coupled to a completed flow run through MF6's Flow Model Interface, with `add_gwe_adv/cnd/est/ssm/esl_package` for the physics, `read_temperature` and `plot_temperature_*` for post-processing, and `run_simulation` running flow then heat. The ex-gwe-radial closed-book validation is the remaining v0.3.0 gate for GWE.
 
 **PRT particle tracking** (2026-09-27) is built: `add_prt_model` adds a MODFLOW 6 PRT model as a **same-simulation** component (the GWF grid is mirrored and a `GWF6-PRT6` exchange registered), with `add_prt_mip/prp/oc_package` for the physics, release schedule and track output, and `read_pathlines` / `plot_pathlines` for post-processing. The `ex-prt-mp7-p01` closed-book validation is the remaining v0.3.0 gate for PRT.
+
+**MT3D-USGS legacy post-processing** (2026-10-03) is built: `adopt_mt3d_usgs_model` registers an existing MODFLOW-2005 + MT3D-USGS model directory (the grid is read from the flow model's DIS), and `read_concentration` / `plot_concentration_map` read the binary `.UCN` concentration output and render a plan-view plume. This is **read + plot only** — the MCP does not author MT3D-USGS input or run the legacy binary. The closed-book **GMS "MT3D-USGS Keating"** validation is the remaining v0.3.0 gate for MT3D-USGS.
 
 See [TOOLS.md](TOOLS.md) for full input/output documentation.
 

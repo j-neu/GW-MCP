@@ -207,6 +207,21 @@ and `plot_pathlines` (plan-view PNG) post-process it. → 89 tools. Spec
 **Validation status: NOT YET RUN** — the v0.3.0 gate for PRT is the closed-book
 `ex-prt-mp7-p01` (MODPATH 7 p01) target through the 6d rerun loop.
 
+**MT3D-USGS legacy post-processing (v0.3.0 scope) built 2026-10-03.** Three new
+tools add **read-only** post-processing of an existing MODFLOW-2005 +
+MT3D-USGS run, in a dedicated legacy subsystem (`utils/legacy_transport.py`):
+`adopt_mt3d_usgs_model` registers an on-disk model directory (flow/transport
+`.nam` files discovered by package set, grid read from the flow model's
+structured DIS), `read_concentration` opens the binary `.UCN`
+(`flopy.utils.UcnFile`) and returns statistics plus a `.npy` for a 0-based
+`kstpkper`/`layer`, and `plot_concentration_map` renders a plan-view plume PNG.
+The MCP does not author MT3D-USGS input or run the legacy binary, and MT3D-MS
+is not covered. → 92 tools. Spec
+`docs/superpowers/specs/2026-10-03-v0.3.0-mt3d-usgs-design.md`.
+**Validation status: NOT YET RUN** — the v0.3.0 gate is the closed-book GMS
+"MT3D-USGS Keating" target through the 6d rerun loop (owner decision
+2026-10-03).
+
 **CSUB (v0.3.0 scope) landed 2026-09-19.** Four new tools close the MODFLOW 6
 subsidence path: `add_csub_package` (11-field interbed `packagedata` with
 delay/no-delay `cdelay`, `ndelaycells`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr`,
@@ -271,6 +286,7 @@ stall, avoided via the synchronous runner.)
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
 |---|---|---|---|---|
 | .hds / .cbb readers | covered | `read_heads`, `read_budget` | | |
+| MT3D-USGS (legacy) concentration | partial | `adopt_mt3d_usgs_model`, `read_concentration`, `plot_concentration_map` | GMS MT3D-USGS Keating | **Read + plot only**: adopt an existing MODFLOW-2005 + MT3D-USGS directory (grid from the flow model's structured DIS) and read/plot the binary `.UCN`; the MCP does not author MT3D-USGS input or run the legacy binary, and MT3D-MS is not covered. Closed-book GMS "MT3D-USGS Keating" validation pending — the v0.3.0 release gate (owner decision 2026-10-03) |
 | Plots | covered | `plot_heads_map`, `plot_cross_section` | | FloPy PlotMapView / PlotCrossSection |
 | Water balance | covered | `compute_water_balance` | | Budget aggregation by boundary type |
 | Drawdown | covered | `compute_drawdown` | | |
@@ -322,12 +338,13 @@ No capability-coverage rows changed except OBS (partial → covered).
 |---|---|---|
 | MODFLOW-2005 / NWT / USG | legacy-out-of-scope | v0.2.0+ candidate |
 | SEAWAT | legacy-out-of-scope | — |
-| MT3D-MS / MT3D-USGS | legacy-out-of-scope | **v0.3.0 sub-project 4** (owner decision 2026-09-25; build + closed-book validation required) |
+| MT3D-MS | legacy-out-of-scope | MT3D-USGS **read + plot** moved to the post-processing row above (v0.3.0 sub-project 4, owner decision 2026-09-25; closed-book validation still required) |
 | MODPATH | legacy-out-of-scope | **v0.3.0 sub-project 5** (in scope, owner decision 2026-09-25) |
 
 ## Coverage summary
 
-- covered: 17 rows · partial: 0 · gap: 10 (MAW, UZF, LAK, GNC, MVR,
+- covered: 17 rows · partial: 1 (MT3D-USGS legacy concentration — read + plot
+  only) · gap: 10 (MAW, UZF, LAK, GNC, MVR,
   GWT, SWT, GWF-GWT coupling, pestpp-sen, pestpp-pareto/swp) · legacy-out-of-scope: 4
   (UCODE SVD estimation and UCODE linear/MCMC uncertainty rows removed
   2026-08-17 — UCODE is no longer part of the project's calibration scope)
@@ -335,6 +352,9 @@ No capability-coverage rows changed except OBS (partial → covered).
   (v0.3.0 capability; validation via 6d playbook Target 9 **PASSED 2026-09-24,
   owner tick 2026-09-25** — rerun-7 + rerun-8 were two consecutive green closed-book
   runs, the last set-and-forget; the v0.3.0 gate condition is met)
+  · MT3D-USGS read + plot added as a **partial** post-processing row on
+  2026-10-03 (v0.3.0 sub-project 4; MT3D-MS stays legacy-out-of-scope; closed-book
+  GMS "MT3D-USGS Keating" validation still pending)
 - Round-1 red flags (see `discovery/catalog.md` "Round-1 red flags"): SWT has
   no MF6 SWT6 package (variable density via GWT hydraulic-head formulation);
   GNC coverage is thin (2 testmodels + 1 flopy notebook). Every GAP row now has
