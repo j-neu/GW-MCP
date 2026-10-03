@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 def _build_legacy_model(
@@ -118,3 +119,42 @@ def test_legacy_round_trip(tmp_path: Path):
         pmv.plot_array(np.asarray(data)[0], cmap="jet")
         out = save_figure(fig, ws / "plume.png", ws)
     assert Path(out).exists()
+
+
+def test_adopt_legacy_model(tmp_path: Path):
+    from groundwater_mcp.utils import legacy_transport
+
+    ws = tmp_path / "legacy"
+    ws.mkdir()
+    _build_legacy_model(ws)
+    legacy = legacy_transport.adopt_legacy_mt3d_usgs("m1", ws)
+    assert legacy.flow_nam == "legacy.nam"
+    assert legacy.transport_nam == "legacy_mt3d.nam"
+    assert legacy.version == "mt3d-usgs"
+    assert (legacy.flow_model.dis.nlay, legacy.flow_model.dis.nrow,
+            legacy.flow_model.dis.ncol) == (1, 3, 4)
+    assert legacy_transport.is_legacy("m1")
+    assert legacy_transport.get_legacy_model("m1") is legacy
+
+
+def test_adopt_legacy_ambiguous_nam(tmp_path: Path):
+    from groundwater_mcp.utils import legacy_transport
+
+    ws = tmp_path / "legacy"
+    ws.mkdir()
+    _build_legacy_model(ws)
+    # A second flow nam makes discovery ambiguous.
+    (ws / "second.nam").write_text("DIS  second.dis\nBAS6 second.ba6\n")
+    with pytest.raises(ValueError):
+        legacy_transport.adopt_legacy_mt3d_usgs("m2", ws)
+
+
+def test_model_store_guard_rejects_legacy_name(tmp_path: Path):
+    from groundwater_mcp.utils import legacy_transport, model_store
+
+    ws = tmp_path / "legacy"
+    ws.mkdir()
+    _build_legacy_model(ws)
+    legacy_transport.adopt_legacy_mt3d_usgs("m3", ws)
+    with pytest.raises(ValueError, match="legacy MT3D-USGS"):
+        model_store.get_sim("m3")

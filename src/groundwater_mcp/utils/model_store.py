@@ -305,6 +305,13 @@ def get_sim(name: str) -> mf6.MFSimulation:
     current; otherwise the simulation is reloaded from disk and the reload is
     flagged for ``consume_reload_flag`` so the calling tool can report it.
     """
+    from groundwater_mcp.utils import legacy_transport
+
+    if legacy_transport.is_legacy(name):
+        raise ValueError(
+            f"'{name}' is a legacy MT3D-USGS model, not a MODFLOW 6 model. "
+            "Use read_concentration / plot_concentration_map."
+        )
     ws = resolve_workspace(name)
     if name in _cache:
         if _files_changed(name):
@@ -598,6 +605,13 @@ def get_model(name: str, component: str = "gwf") -> mf6.MFModel:
     the model named ``name``, falling back to the first model in the
     simulation when the GWF name differs (adopted models).
     """
+    from groundwater_mcp.utils import legacy_transport
+
+    if legacy_transport.is_legacy(name):
+        raise ValueError(
+            f"'{name}' is a legacy MT3D-USGS model, not a MODFLOW 6 model. "
+            "Use read_concentration / plot_concentration_map."
+        )
     sim = get_sim(name)
     key = component.lower()
     workspace = component_workspace(name, key)

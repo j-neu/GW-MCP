@@ -32,13 +32,15 @@ def patch_workspace_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 @pytest.fixture(autouse=True)
 def clear_model_cache() -> None:
     """Clear the in-process simulation cache before and after each test."""
-    from groundwater_mcp.utils import model_store
+    from groundwater_mcp.utils import legacy_transport, model_store
 
+    legacy_transport.clear()
     model_store._cache.clear()
     model_store._mtimes.clear()
     model_store._reload_flags.clear()
     model_store._dirty.clear()
     yield
+    legacy_transport.clear()
     model_store._cache.clear()
     model_store._mtimes.clear()
     model_store._reload_flags.clear()
