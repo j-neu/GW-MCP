@@ -278,3 +278,117 @@ def test_plot_concentration_map(tmp_path: Path):
     assert out["max"] == 11.0
     png = Path(out["output_file"])
     assert png.exists() and png.suffix == ".png" and png.stat().st_size > 0
+
+
+def test_adopt_partial_nam_disambiguation(tmp_path: Path):
+    from groundwater_mcp.utils import legacy_transport
+
+    ws = tmp_path / "legacy"
+    ws.mkdir()
+    _build_legacy_model(ws)
+    # A second flow nam makes full discovery ambiguous.
+    (ws / "second.nam").write_text("DIS  second.dis\nBAS6 second.ba6\n")
+
+    # Supplying flow_nam excludes that candidate, so the single remaining
+    # transport nam is discovered and the adopt succeeds.
+    legacy = legacy_transport.adopt_legacy_mt3d_usgs(
+        "m11", ws, flow_nam="legacy.nam"
+    )
+    assert legacy.flow_nam == "legacy.nam"
+    assert legacy.transport_nam == "legacy_mt3d.nam"
+
+    # With neither supplied, the two flow candidates stay ambiguous.
+    with pytest.raises(ValueError):
+        legacy_transport.adopt_legacy_mt3d_usgs("m12", ws)
+
+
+def test_read_concentration_shape_mismatch(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+
+    name, ws = _adopt(tmp_path, "m13")
+    # .UCN nrow/ncol (2, 5) disagree with the adopted flow grid (3, 4).
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.ones((1, 2, 5)))])
+    with pytest.raises(ValueError, match="does not match"):
+        _impl_read_concentration(name)
+
+
+def test_create_model_rejects_legacy_name(tmp_path: Path):
+    from groundwater_mcp.tools.builder import _impl_create_model
+    from groundwater_mcp.utils import legacy_transport
+
+    name, ws = _adopt(tmp_path, "m14")
+    assert legacy_transport.is_legacy(name)
+    with pytest.raises(ValueError, match="legacy MT3D-USGS"):
+        _impl_create_model(name, str(ws), "METERS", "DAYS")
+
+
+def test_delete_model_frees_legacy_name(tmp_path: Path):
+    from groundwater_mcp.tools.builder import (
+        _impl_create_model,
+        _impl_delete_model,
+    )
+    from groundwater_mcp.utils import legacy_transport
+
+    name, ws = _adopt(tmp_path, "m15")
+    assert legacy_transport.is_legacy(name)
+    _impl_delete_model(name)
+    assert not legacy_transport.is_legacy(name)
+    out = _impl_create_model(name, str(ws), "METERS", "DAYS")
+    assert out["model"] == name
+
+
+def test_read_concentration_reloads_from_meta(tmp_path: Path):
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+    from groundwater_mcp.utils import legacy_transport
+
+    name, ws = _adopt(tmp_path, "m16")
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.arange(12.0).reshape(1, 3, 4))])
+
+    # Simulate a server restart: the in-memory cache is empty, so the model
+    # must be reloaded from .gwmcp_meta.json.
+    legacy_transport.clear()
+    out = _impl_read_concentration(name)
+    assert out["max"] == 11.0
+
+
+def test_adopt_ucn_in_subdirectory(tmp_path: Path):
+    from groundwater_mcp.tools.builder import _impl_adopt_mt3d_usgs_model
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+    from groundwater_mcp.utils.model_store import read_meta
+
+    name = "m17"
+    ws = tmp_path / name
+    ws.mkdir()
+    _build_legacy_model(ws)
+    sub = ws / "outputs"
+    sub.mkdir()
+    _write_ucn(sub / "MT3D001.UCN", [(1, 1, 1.0, np.arange(12.0).reshape(1, 3, 4))])
+
+    out = _impl_adopt_mt3d_usgs_model(name, str(ws))
+    assert out["ucn_file"] == "outputs/MT3D001.UCN"
+    assert read_meta(name)["legacy"]["ucn_file"] == "outputs/MT3D001.UCN"
+
+    # _find_ucn_file's declared branch (workspace / declared) resolves it.
+    res = _impl_read_concentration(name)
+    assert res["max"] == 11.0
+
+
+def test_read_concentration_closes_ucn_handle(tmp_path: Path):
+    import gc
+    import warnings
+
+    from groundwater_mcp.tools.postprocess import _impl_read_concentration
+
+    name, ws = _adopt(tmp_path, "m18")
+    _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.ones((1, 3, 4)))])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        _impl_read_concentration(name)
+        gc.collect()
+    leaked = [
+        w for w in caught
+        if issubclass(w.category, ResourceWarning)
+        and "MT3D001.UCN" in str(w.message)
+    ]
+    assert not leaked
+

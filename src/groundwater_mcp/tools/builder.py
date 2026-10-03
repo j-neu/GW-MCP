@@ -221,6 +221,13 @@ def _impl_create_model(
             f"Model name '{name}' is {len(name)} characters; MODFLOW 6 caps "
             "MODELNAME at 16 characters. Use a shorter name."
         )
+    from groundwater_mcp.utils import legacy_transport
+
+    if legacy_transport.is_legacy(name):
+        raise ValueError(
+            f"'{name}' is already registered as a legacy MT3D-USGS model; "
+            "choose another name or delete_model it first."
+        )
     model_dir = create_workspace(name, workspace or None)
     # Re-creating a model resets its flow input set and metadata; drop any
     # component simulation cached from a previous incarnation of this name.
@@ -277,6 +284,13 @@ def _impl_adopt_model(
         raise ValueError(
             f"Model name '{name}' is {len(name)} characters; MODFLOW 6 caps "
             "MODELNAME at 16 characters. Use a shorter name."
+        )
+    from groundwater_mcp.utils import legacy_transport
+
+    if legacy_transport.is_legacy(name):
+        raise ValueError(
+            f"'{name}' is already registered as a legacy MT3D-USGS model; "
+            "choose another name or delete_model it first."
         )
     model_dir = create_workspace(name, workspace or None)
     sim_nam = model_dir / "mfsim.nam"
@@ -356,7 +370,7 @@ def _impl_adopt_mt3d_usgs_model(
     for ext in ("*.ucn", "*.UCN"):
         hits = sorted(model_dir.rglob(ext))
         if hits:
-            ucn = hits[0].name
+            ucn = hits[0].relative_to(model_dir).as_posix()
             break
 
     meta = _read_meta(model_dir)
@@ -2606,9 +2620,12 @@ def _impl_list_models() -> dict:
 
 def _impl_delete_model(model: str, remove_files: bool = False) -> dict:
     """Unregister a model; optionally delete its workspace (7e-B4.1)."""
+    from groundwater_mcp.utils import legacy_transport
+
     delete_workspace(model, remove_files=remove_files)
     clear_component_sims(model)
     invalidate(model)
+    legacy_transport.evict(model)
     return {
         "model": model,
         "removed": True,

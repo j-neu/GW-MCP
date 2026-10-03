@@ -37,6 +37,11 @@ def clear() -> None:
     _LEGACY_CACHE.clear()
 
 
+def evict(name: str) -> None:
+    """Drop *name* from the in-memory legacy cache (delete_model hook)."""
+    _LEGACY_CACHE.pop(name, None)
+
+
 def read_nam_packages(nam: Path) -> set[str]:
     """Return the package tokens listed in a MODFLOW/MT3D name file."""
     pkgs: set[str] = set()
@@ -52,7 +57,16 @@ def read_nam_packages(nam: Path) -> set[str]:
     return pkgs
 
 
-def _discover_nam_files(workspace: Path) -> tuple[Path, Path]:
+def _classify_nam_files(
+    workspace: Path, exclude: set[Path] | None = None
+) -> tuple[list[Path], list[Path]]:
+    """Classify the ``.nam`` files in *workspace* into flow/transport candidates.
+
+    Paths in *exclude* (already resolved by the caller) are ignored, so an
+    explicitly supplied name file does not count as an ambiguity. Raises
+    ``FileNotFoundError`` when the workspace holds no ``.nam`` file at all.
+    """
+    excluded = {p.resolve() for p in (exclude or set())}
     nams = sorted(
         p for p in workspace.iterdir()
         if p.is_file() and p.suffix.lower() == ".nam"
@@ -65,18 +79,14 @@ def _discover_nam_files(workspace: Path) -> tuple[Path, Path]:
     flow: list[Path] = []
     transport: list[Path] = []
     for nam in nams:
+        if nam.resolve() in excluded:
+            continue
         pkgs = read_nam_packages(nam)
         if pkgs & _TRANSPORT_PACKAGES:
             transport.append(nam)
         elif pkgs & _FLOW_PACKAGES:
             flow.append(nam)
-    if len(flow) == 1 and len(transport) == 1:
-        return flow[0], transport[0]
-    raise ValueError(
-        f"Could not identify exactly one MODFLOW-2005 name file and one MT3D "
-        f"name file in {workspace}. Found flow={[p.name for p in flow]}, "
-        f"transport={[p.name for p in transport]}. Pass flow_nam/transport_nam."
-    )
+    return flow, transport
 
 
 def _resolve(workspace: Path, nam: str | Path | None) -> Path | None:
@@ -94,14 +104,28 @@ def adopt_legacy_mt3d_usgs(
     allow_modify: bool = False,
 ) -> LegacyTransportModel:
     ws = Path(workspace)
-    if flow_nam is None or transport_nam is None:
-        d_flow, d_transport = _discover_nam_files(ws)
-        if flow_nam is None:
-            flow_nam = d_flow.name
-        if transport_nam is None:
-            transport_nam = d_transport.name
-
     flow_path = _resolve(ws, flow_nam)
+    trans_path = _resolve(ws, transport_nam)
+
+    if flow_path is None or trans_path is None:
+        exclude = {p for p in (flow_path, trans_path) if p is not None}
+        d_flow, d_transport = _classify_nam_files(ws, exclude)
+        if flow_path is None:
+            if len(d_flow) != 1:
+                raise ValueError(
+                    f"Could not identify exactly one MODFLOW-2005 name file in "
+                    f"{ws}. Found flow={[p.name for p in d_flow]}. Pass flow_nam."
+                )
+            flow_path = d_flow[0]
+        if trans_path is None:
+            if len(d_transport) != 1:
+                raise ValueError(
+                    f"Could not identify exactly one MT3D name file in {ws}. "
+                    f"Found transport={[p.name for p in d_transport]}. "
+                    "Pass transport_nam."
+                )
+            trans_path = d_transport[0]
+
     assert flow_path is not None
     if not flow_path.exists():
         raise FileNotFoundError(f"MODFLOW-2005 name file not found: {flow_path}")
@@ -116,7 +140,6 @@ def adopt_legacy_mt3d_usgs(
             "model; DISU/DISV flow grids are not supported."
         )
 
-    trans_path = _resolve(ws, transport_nam)
     assert trans_path is not None
     if not trans_path.exists():
         raise FileNotFoundError(f"MT3D name file not found: {trans_path}")

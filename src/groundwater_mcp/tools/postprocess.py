@@ -965,60 +965,76 @@ def _impl_read_concentration(
     ws = legacy.workspace
     path = _find_ucn_file(model, ws, ucn_file)
     ucn = _open_ucn(path)
-
-    kstpkper_list = ucn.get_kstpkper()
-    if not kstpkper_list:
-        raise ValueError("Concentration file contains no data.")
-    target = tuple(kstpkper) if kstpkper is not None else kstpkper_list[-1]
-    if target not in kstpkper_list:
-        raise ValueError(f"kstpkper {target} not found. Available: {kstpkper_list}")
-
-    conc = np.asarray(ucn.get_data(kstpkper=target))
-    if conc.ndim == 2:
-        conc = conc[np.newaxis, :, :]
-    nlay, _nrow, _ncol = conc.shape
-
-    if layer is not None:
-        if not (0 <= layer < nlay):
+    try:
+        kstpkper_list = ucn.get_kstpkper()
+        if not kstpkper_list:
+            raise ValueError("Concentration file contains no data.")
+        target = tuple(kstpkper) if kstpkper is not None else kstpkper_list[-1]
+        if target not in kstpkper_list:
             raise ValueError(
-                f"layer {layer} out of range: model has nlay={nlay} "
-                f"(valid: 0..{nlay - 1})."
+                f"kstpkper {target} not found. Available: {kstpkper_list}"
             )
-        arr = conc[layer]
-    else:
-        arr = conc
 
-    if row_slice is not None:
-        arr = arr[..., slice(*row_slice), :] if arr.ndim == 3 else arr[slice(*row_slice), :]
-    if col_slice is not None:
-        arr = arr[..., :, slice(*col_slice)] if arr.ndim == 3 else arr[:, slice(*col_slice)]
+        conc = np.asarray(ucn.get_data(kstpkper=target))
+        if conc.ndim == 2:
+            conc = conc[np.newaxis, :, :]
+        nlay, _nrow, _ncol = conc.shape
 
-    stats = _array_stats(arr)
-    times = list(ucn.get_times())
-    idx = kstpkper_list.index(target)
-    result: dict = {
-        "model": model,
-        "type": "mt3d-usgs",
-        "kstpkper": [int(v) for v in target],
-        "totim": float(times[idx]) if idx < len(times) else None,
-        "layer": layer,
-        "shape": list(arr.shape),
-        "n_times": len(kstpkper_list),
-        **stats,
-    }
-    npy = ws / f"{model}_conc_l{layer if layer is not None else 'all'}_k{target[0]}_{target[1]}.npy"
-    np.save(npy, arr)
-    result["output_file"] = str(npy)
-
-    if include_values:
-        if arr.size > max_cells:
-            return _err(
-                "PAYLOAD_TOO_LARGE",
-                f"{arr.size} cells exceed max_cells={max_cells}.",
-                "Use include_values=False and load the array from output_file.",
+        flow_dis = getattr(legacy.flow_model, "dis")
+        grid_shape = (int(flow_dis.nlay), int(flow_dis.nrow), int(flow_dis.ncol))
+        if tuple(conc.shape) != grid_shape:
+            raise ValueError(
+                f"Concentration array shape {tuple(conc.shape)} does not match "
+                f"the adopted flow grid (nlay, nrow, ncol)={grid_shape}."
             )
-        result["values"] = arr.tolist()
-    return result
+
+        if layer is not None:
+            if not (0 <= layer < nlay):
+                raise ValueError(
+                    f"layer {layer} out of range: model has nlay={nlay} "
+                    f"(valid: 0..{nlay - 1})."
+                )
+            arr = conc[layer]
+        else:
+            arr = conc
+
+        if row_slice is not None:
+            arr = arr[..., slice(*row_slice), :] if arr.ndim == 3 else arr[slice(*row_slice), :]
+        if col_slice is not None:
+            arr = arr[..., :, slice(*col_slice)] if arr.ndim == 3 else arr[:, slice(*col_slice)]
+
+        stats = _array_stats(arr)
+        times = list(ucn.get_times())
+        idx = kstpkper_list.index(target)
+        result: dict = {
+            "model": model,
+            "type": "mt3d-usgs",
+            "kstpkper": [int(v) for v in target],
+            "totim": float(times[idx]) if idx < len(times) else None,
+            "layer": layer,
+            "shape": list(arr.shape),
+            "n_times": len(kstpkper_list),
+            **stats,
+        }
+        npy = (
+            ws
+            / f"{model}_conc_l{layer if layer is not None else 'all'}"
+            f"_k{target[0]}_{target[1]}.npy"
+        )
+        np.save(npy, arr)
+        result["output_file"] = str(npy)
+
+        if include_values:
+            if arr.size > max_cells:
+                return _err(
+                    "PAYLOAD_TOO_LARGE",
+                    f"{arr.size} cells exceed max_cells={max_cells}.",
+                    "Use include_values=False and load the array from output_file.",
+                )
+            result["values"] = arr.tolist()
+        return result
+    finally:
+        ucn.close()
 
 
 def _impl_read_heads(
