@@ -576,13 +576,13 @@ def test_run_pestpp_glm_binary_not_found_raises(pst_model, monkeypatch):
 
 
 def test_run_pestpp_glm_returns_expected_keys(pst_model, monkeypatch):
-    """Monkeypatch subprocess.run to simulate a successful GLM run."""
+    """Patch the blocking PEST++ runner to simulate a successful GLM run."""
     import groundwater_mcp.tools.calibration as cal_module
 
     monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-glm")
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        cal_module,
+        "_run_pestpp_blocking",
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="done", stderr=""),
     )
 
@@ -598,8 +598,8 @@ def test_run_pestpp_glm_converged_on_returncode_zero(pst_model, monkeypatch):
 
     monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-glm")
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        cal_module,
+        "_run_pestpp_blocking",
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
     )
 
@@ -613,8 +613,8 @@ def test_run_pestpp_glm_not_converged_on_nonzero_returncode(pst_model, monkeypat
 
     monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-glm")
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        cal_module,
+        "_run_pestpp_blocking",
         lambda *a, **kw: subprocess.CompletedProcess(a, 1, stdout="", stderr="error"),
     )
 
@@ -645,8 +645,8 @@ def test_run_pestpp_glm_reads_iobj(pst_model, monkeypatch):
     )
 
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        cal_module,
+        "_run_pestpp_blocking",
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
     )
 
@@ -665,8 +665,8 @@ def test_run_pestpp_ies_returns_expected_keys(pst_model, monkeypatch):
 
     monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-ies")
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        cal_module,
+        "_run_pestpp_blocking",
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
     )
 
@@ -693,8 +693,8 @@ def test_run_pestpp_ies_writes_num_reals_to_pst(pst_model, monkeypatch):
 
     monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-ies")
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        cal_module,
+        "_run_pestpp_blocking",
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
     )
 

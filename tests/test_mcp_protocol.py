@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 109
+_EXPECTED_TOOL_COUNT = 110
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -109,6 +109,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "start_task",
         "get_job_status",
         "cancel_job",
+        "release_workspace_lock",
     ],
     "environment": ["check_environment"],
     "postprocess": [

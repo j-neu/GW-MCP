@@ -10,15 +10,27 @@ terminates the underlying process.
 Status transitions: ``running`` → ``succeeded`` | ``failed`` | ``cancelled``.
 The worker thread only moves a still-``running`` job forward, so a
 cancellation is never overwritten by a late success.
+
+Workspace claims (R3.3): at most one MF6/PEST++ process runs in a model
+workspace at a time. Two pestpp instances in one workspace overwrite each
+other's run files (observed as a stall at "loading parcov" after a timed-out
+``start_calibration`` was retried). ``claim_workspace`` refuses a second
+process in this server, and a lock file carrying the process PID refuses one
+while an orphan from an earlier server session is still alive.
 """
 
 from __future__ import annotations
 
+import atexit
+import json
+import os
+import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 # Seconds without a change in a running job's progress before get_status flags
@@ -55,6 +67,8 @@ class Job:
     result: dict | None = None
     error: str | None = None
     stall_after_s: float = STALL_AFTER_S
+    workspace: Path | None = None
+    claim_token: str | None = None
     last_progress_key: str | None = field(default=None, repr=False)
     last_progress_change: float = field(default=0.0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -72,6 +86,165 @@ def _new_job_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+# ---------------------------------------------------------------------------
+# Workspace claims (R3.3)
+# ---------------------------------------------------------------------------
+
+LOCK_FILE = ".gwmcp_process.lock"
+
+
+class WorkspaceBusyError(RuntimeError):
+    """Another MF6/PEST++ process already runs in the workspace."""
+
+
+# resolved workspace path -> {"token", "holder", "job_id"}
+_claims: dict[str, dict] = {}
+_claims_guard = threading.Lock()
+
+
+def _key(ws: Path | str) -> str:
+    return str(Path(ws).resolve())
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Return True when a process with ``pid`` is still running."""
+    if pid is None or int(pid) <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = wintypes.DWORD()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_lock(ws: Path | str) -> dict | None:
+    path = Path(ws) / LOCK_FILE
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def claim_workspace(ws: Path | str, holder: str) -> str:
+    """Reserve ``ws`` for one process; return the claim token.
+
+    Raises :class:`WorkspaceBusyError` when this server already runs a process
+    there, or when the workspace lock file names a process that is still alive
+    (an orphan from an earlier server session). A lock file whose process has
+    exited is stale and is removed.
+    """
+    key = _key(ws)
+    with _claims_guard:
+        held = _claims.get(key)
+        if held is not None:
+            job = f" (job {held['job_id']})" if held.get("job_id") else ""
+            raise WorkspaceBusyError(
+                f"A {held['holder']} process is already running in this "
+                f"workspace{job}. Wait for it (get_job_status) or stop it "
+                "(cancel_job) before starting another; two MF6/PEST++ processes "
+                "in one workspace overwrite each other's files."
+            )
+        lock = _read_lock(ws)
+        if lock is not None:
+            pid = lock.get("pid")
+            if pid_alive(pid):
+                raise WorkspaceBusyError(
+                    f"A {lock.get('holder', 'MF6/PEST++')} process (pid {pid}) "
+                    "left by an earlier server session is still running in this "
+                    "workspace. Call release_workspace_lock(model) to terminate "
+                    "it, then retry."
+                )
+            (Path(ws) / LOCK_FILE).unlink(missing_ok=True)
+        token = uuid.uuid4().hex
+        _claims[key] = {"token": token, "holder": holder, "job_id": None}
+        return token
+
+
+def attach_pid(ws: Path | str, pid: int | None, job_id: str | None = None) -> None:
+    """Record the claimed workspace's process PID (and job id) in its lock file."""
+    key = _key(ws)
+    with _claims_guard:
+        held = _claims.get(key)
+        if held is None:
+            return
+        if job_id is not None:
+            held["job_id"] = job_id
+        holder = held["holder"]
+    if pid is not None:
+        try:
+            (Path(ws) / LOCK_FILE).write_text(
+                json.dumps({"pid": int(pid), "holder": holder, "server_pid": os.getpid()})
+            )
+        except OSError:
+            pass
+
+
+def release_workspace(ws: Path | str, token: str | None = None) -> None:
+    """Drop the claim on ``ws`` (only when ``token`` matches, if given)."""
+    key = _key(ws)
+    with _claims_guard:
+        held = _claims.get(key)
+        if held is None or (token is not None and held["token"] != token):
+            return
+        del _claims[key]
+    (Path(ws) / LOCK_FILE).unlink(missing_ok=True)
+
+
+class _PidHandle:
+    """Minimal process handle for a PID this server did not spawn."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def kill(self) -> None:
+        import signal
+
+        os.kill(self.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def force_release_workspace(ws: Path | str) -> dict:
+    """Terminate the process tree named in the lock file and clear the lock.
+
+    For a process orphaned by an earlier server session. Processes this server
+    started are refused: stop those with ``cancel_job`` so their job state and
+    input restore stay consistent.
+    """
+    key = _key(ws)
+    with _claims_guard:
+        held = _claims.get(key)
+    if held is not None:
+        raise WorkspaceBusyError(
+            f"The workspace is held by this server's job {held.get('job_id')}; "
+            "stop it with cancel_job instead."
+        )
+    lock = _read_lock(ws)
+    terminated = None
+    if lock:
+        pid = lock.get("pid")
+        if pid is not None and pid_alive(pid):
+            _terminate_process_tree(_PidHandle(int(pid)))
+            terminated = int(pid)
+    (Path(ws) / LOCK_FILE).unlink(missing_ok=True)
+    return {"workspace": str(ws), "terminated_pid": terminated, "lock_cleared": lock is not None}
+
+
 def submit(
     model: str,
     kind: str,
@@ -79,6 +252,8 @@ def submit(
     process: Any = None,
     progress_fn: Callable[[Job], dict] | None = None,
     on_cancel: Callable[[Job], Any] | None = None,
+    workspace: Path | str | None = None,
+    claim_token: str | None = None,
 ) -> Job:
     """Start a background job and return its handle.
 
@@ -100,6 +275,9 @@ def submit(
         tree, to undo any workspace mutation a killed process left behind
         (e.g. deleting a substitute input file). Exceptions are reported in the
         ``cancel`` result, not raised, so cancellation always succeeds.
+    workspace, claim_token:
+        The workspace claimed with :func:`claim_workspace` for this job's
+        process; the claim is released when the job finishes or is cancelled.
 
     Returns
     -------
@@ -114,8 +292,12 @@ def submit(
         process=process,
         progress_fn=progress_fn,
         on_cancel=on_cancel,
+        workspace=Path(workspace) if workspace is not None else None,
+        claim_token=claim_token,
     )
     _jobs[job.job_id] = job
+    if job.workspace is not None and claim_token is not None:
+        attach_pid(job.workspace, getattr(process, "pid", None), job.job_id)
 
     def _run() -> None:
         try:
@@ -133,6 +315,8 @@ def submit(
             with job._lock:
                 job.finished_at = time.monotonic()
                 job.target = None
+            if job.workspace is not None and job.claim_token is not None:
+                release_workspace(job.workspace, job.claim_token)
 
     threading.Thread(target=_run, daemon=True).start()
     return job
@@ -265,4 +449,24 @@ def cancel(job_id: str) -> dict:
             job.on_cancel(job)
         except Exception as exc:  # noqa: BLE001 — cancellation must still succeed
             result["restore_error"] = str(exc)
+    if job.workspace is not None and job.claim_token is not None:
+        release_workspace(job.workspace, job.claim_token)
     return result
+
+
+def terminate_running_jobs() -> None:
+    """Cancel every running job, terminating its process tree.
+
+    Registered with ``atexit`` so a server shutdown does not leave a pestpp /
+    mf6 tree running and file-locking a workspace (the orphaned ``pestpp-da``
+    left spinning at 100 % CPU in the 6d reruns).
+    """
+    for job_id, job in list(_jobs.items()):
+        if job.status == STATUS_RUNNING:
+            try:
+                cancel(job_id)
+            except Exception:
+                pass
+
+
+atexit.register(terminate_running_jobs)

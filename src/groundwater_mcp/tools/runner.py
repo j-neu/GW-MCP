@@ -355,11 +355,13 @@ def _run_process(args: list[str], cwd: str):
     A module-level seam so tests can substitute a fake process; production
     behaviour is a plain ``subprocess.Popen`` with combined output. The
     process is spawned in its own process group/session so ``cancel_job`` can
-    terminate the whole tree (grandchildren included) on any platform.
+    terminate the whole tree (grandchildren included) on any platform. Its
+    stdin is detached from the server's MCP stdio pipe (R3.3).
     """
     return subprocess.Popen(
         args,
         cwd=cwd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -433,19 +435,25 @@ def _impl_start_run(model: str) -> dict:
     ``result`` matches ``run_simulation``'s shape (success, convergence,
     elapsed_s, listing_summary, observation_fit).
     """
-    # Flush staged changes so the binary reads the current input set (7f-E1.2).
-    flushed = flush_model(model)
-    sim = get_sim(model)
-    exe = _find_mf6_binary()
     ws = resolve_workspace(model)
+    token = jobs.claim_workspace(ws, "mf6")
+    try:
+        # Flush staged changes so the binary reads the current input set (7f-E1.2).
+        flushed = flush_model(model)
+        sim = get_sim(model)
+        exe = _find_mf6_binary()
 
-    mnames = list(sim.model_names)
-    gwf = sim.get_model(model) if model in mnames else None
-    if gwf is None and mnames:
-        gwf = sim.get_model(mnames[0])
-    trap, sto_msg = _transient_like_without_sto(sim, gwf) if gwf is not None else (False, "")
-
-    proc = _run_process([exe], str(ws))
+        mnames = list(sim.model_names)
+        gwf = sim.get_model(model) if model in mnames else None
+        if gwf is None and mnames:
+            gwf = sim.get_model(mnames[0])
+        trap, sto_msg = (
+            _transient_like_without_sto(sim, gwf) if gwf is not None else (False, "")
+        )
+        proc = _run_process([exe], str(ws))
+    except BaseException:
+        jobs.release_workspace(ws, token)
+        raise
     lines: deque[str] = deque(maxlen=5000)
 
     def _worker(job) -> dict:
@@ -484,7 +492,15 @@ def _impl_start_run(model: str) -> dict:
         except Exception:
             return {}
 
-    job = jobs.submit(model, "mf6", _worker, process=proc, progress_fn=_progress)
+    job = jobs.submit(
+        model,
+        "mf6",
+        _worker,
+        process=proc,
+        progress_fn=_progress,
+        workspace=ws,
+        claim_token=token,
+    )
     return {
         "model": model,
         "job_id": job.job_id,
@@ -587,6 +603,17 @@ def _impl_get_job_status(job_id: str) -> dict:
 def _impl_cancel_job(job_id: str) -> dict:
     """Cancel a running background job and terminate its process."""
     return jobs.cancel(job_id)
+
+
+def _impl_release_workspace_lock(model: str) -> dict:
+    """Terminate an orphaned MF6/PEST++ process tree and clear the lock (R3.3).
+
+    For a process left running by an earlier server session (the workspace
+    lock file records its PID). A process this server started is refused:
+    stop it with ``cancel_job`` so its inputs are restored.
+    """
+    ws = resolve_workspace(model)
+    return {"model": model, **jobs.force_release_workspace(ws)}
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +771,11 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
     reported in ``auto_fix_applied`` and the model files reflect the final
     successful configuration.
     """
+    # Refuse before touching any file while another MF6/PEST++ process runs in
+    # the workspace (R3.3).
+    ws = resolve_workspace(model)
+    jobs.release_workspace(ws, jobs.claim_workspace(ws, "mf6"))
+
     # Flush staged changes so the binary reads the current input set (7f-E1.2).
     flushed = flush_model(model)
     sim = get_sim(model)
@@ -755,16 +787,17 @@ def _impl_run_simulation(model: str, silent: bool = False, auto_fix: bool = Fals
         gwf = sim.get_model(mnames[0])
     trap, sto_msg = _transient_like_without_sto(sim, gwf) if gwf is not None else (False, "")
 
-    ws = resolve_workspace(model)
-
     def _run_once() -> tuple[bool, list, float]:
         sim.set_sim_path(str(ws))
         sim.exe_name = exe
         t0 = time.monotonic()
+        token = jobs.claim_workspace(ws, "mf6")
         try:
             success, buff = sim.run_simulation(silent=silent, report=True)
         except Exception as exc:
             raise RuntimeError(f"MODFLOW 6 run failed: {exc}") from exc
+        finally:
+            jobs.release_workspace(ws, token)
         return success, buff, time.monotonic() - t0
 
     success, buff, elapsed = _run_once()
@@ -1453,6 +1486,13 @@ def register(mcp: FastMCP) -> None:
         changes in auto_fix_applied."""
         try:
             return _impl_run_simulation(model, silent, auto_fix)
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
+            )
         except UnknownComponentError as exc:
             return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
@@ -1547,6 +1587,13 @@ def register(mcp: FastMCP) -> None:
         observation_fit."""
         try:
             return _impl_start_run(model)
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
+            )
         except UnknownComponentError as exc:
             return _err("INVALID_INPUT", str(exc))
         except KeyError as exc:
@@ -1620,3 +1667,22 @@ def register(mcp: FastMCP) -> None:
             )
         except Exception as exc:
             return _err("JOB_CANCEL_FAILED", str(exc))
+
+    @mcp.tool()
+    def release_workspace_lock(model: str) -> dict:
+        """Terminate an orphaned MF6/PEST++ process tree left in a model
+        workspace by an earlier server session, and clear the workspace lock.
+
+        Only one MF6/PEST++ process runs per workspace; a start refused with
+        WORKSPACE_BUSY that names a pid from an earlier session is cleared with
+        this tool. A job this server is running is refused: use cancel_job.
+        Returns terminated_pid (None when the recorded process had already
+        exited) and lock_cleared."""
+        try:
+            return _impl_release_workspace_lock(model)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except jobs.WorkspaceBusyError as exc:
+            return _err("WORKSPACE_BUSY", str(exc), "Stop the job with cancel_job.")
+        except Exception as exc:
+            return _err("RELEASE_FAILED", str(exc))

@@ -38,6 +38,19 @@ release.
   observation constraints) via pestpp-opt.
 - **`start_task`:** runs heavy tools (check_model, raster assignment, DA setup, ...) as
   background jobs, one per model at a time.
+- **Pilot-point K calibration:** `setup_calibration(scope="pilot_points")`
+  places pilot points on a lattice or at given coordinates, interpolates
+  log10 K multipliers to every cell by ordinary kriging, and writes the
+  variogram's prior covariance as the PST `parcov` so pestpp-ies draws a
+  spatially correlated prior. A synthetic two-zone test recovers the
+  west/east K contrast (23.5 / 2.1 m/d against a 20 / 2 truth).
+- **One MF6/PEST++ process per workspace:** runs and calibrations claim the
+  workspace and a second start returns `WORKSPACE_BUSY` (a retried call after
+  a client timeout used to start a second pestpp). The process PID goes in a
+  workspace lock file, so an orphan from an earlier server session is
+  detected; `release_workspace_lock` terminates it. Running jobs are
+  terminated on server shutdown, and children are spawned with stdin detached
+  from the MCP stdio pipe.
 - **`apply_calibration_result`:** writes the calibrated parameters of a GLM/IES
   run (including zone multipliers) back into the model, so the calibrated
   field can be run, plotted and exported.

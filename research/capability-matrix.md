@@ -107,6 +107,12 @@ values become dimensionless multiplier parameters applied by a generated
 forward wrapper (`k = base_k × multiplier[zone]`). Calibration of zoned-field
 regional models no longer requires uniform per-layer K replacement. No
 capability-coverage rows changed.
+
+**Pilot points (2026-10-16, R3.5):** `setup_calibration` gained
+`scope="pilot_points"` — log10 K multipliers at pilot points (lattice or
+explicit, DIS/DISV) interpolated by ordinary kriging, with the variogram's
+prior covariance set as the PST `parcov`. Workspace claims (R3.3) add
+`release_workspace_lock` (110 tools). No capability-coverage rows changed.
 **7f-I (2026-08-17): surface-area cuts.** `plot_heads_map`/`plot_cross_section`
 return the PNG natively (ImageContent) and `view_image` is removed;
 `sentence-transformers` moved to the optional `semantic` extra with a Whoosh

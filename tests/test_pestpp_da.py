@@ -78,11 +78,11 @@ def test_run_pestpp_da_injects_options(tmp_path, monkeypatch):
         stdout = "da ok"
         stderr = ""
 
-    def fake_run(cmd, cwd=None, capture_output=True, text=True):
+    def fake_run(cmd, ws):
         seen["cmd"] = cmd
         return _Result()
 
-    monkeypatch.setattr(cal.subprocess, "run", fake_run)
+    monkeypatch.setattr(cal, "_run_pestpp_blocking", fake_run)
 
     result = _impl_run_pestpp_da(
         name,
@@ -115,7 +115,7 @@ def test_run_pestpp_da_noptmax_is_not_ensemble_size(tmp_path, monkeypatch):
         stdout = ""
         stderr = ""
 
-    monkeypatch.setattr(cal.subprocess, "run", lambda *a, **k: _Result())
+    monkeypatch.setattr(cal, "_run_pestpp_blocking", lambda *a, **k: _Result())
 
     _impl_run_pestpp_da(name, str(pst_file), num_reals=25)
 
@@ -144,7 +144,7 @@ def test_run_pestpp_da_omitted_num_reals_preserves_pst_ensemble(tmp_path, monkey
         stdout = ""
         stderr = ""
 
-    monkeypatch.setattr(cal.subprocess, "run", lambda *a, **k: _Result())
+    monkeypatch.setattr(cal, "_run_pestpp_blocking", lambda *a, **k: _Result())
 
     result = _impl_run_pestpp_da(name, str(pst_file))
 

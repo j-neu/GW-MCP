@@ -473,11 +473,14 @@ def _run_process(args: list[str], cwd: str):
     A module-level seam so tests can substitute a fake process; production
     behaviour is a plain ``subprocess.Popen`` with combined output. The
     process is spawned in its own process group/session so ``cancel_job`` can
-    terminate the whole tree (grandchildren included) on any platform.
+    terminate the whole tree (grandchildren included) on any platform. Its
+    stdin is detached: the server's own stdin is the MCP stdio pipe, and a
+    pestpp/wrapper/mf6 chain must never inherit (or read from) it (R3.3).
     """
     return subprocess.Popen(
         args,
         cwd=cwd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -486,6 +489,34 @@ def _run_process(args: list[str], cwd: str):
         start_new_session=os.name != "nt",
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
+
+
+def _run_pestpp_blocking(args: list[str], ws: Path) -> subprocess.CompletedProcess:
+    """Run a PEST++ executable to completion under a workspace claim (R3.3).
+
+    The synchronous ``run_pestpp_*`` tools use this instead of a bare
+    ``subprocess.run``: the workspace is claimed first (refusing to start next
+    to a running background job or a live orphan), the PID is recorded in the
+    workspace lock file, stdin is detached from the server's MCP stdio pipe,
+    and the claim is always released.
+    """
+    token = jobs.claim_workspace(ws, Path(args[0]).stem)
+    try:
+        proc = subprocess.Popen(
+            args,
+            cwd=str(ws),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        jobs.attach_pid(ws, proc.pid)
+        stdout, stderr = proc.communicate()
+        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    finally:
+        jobs.release_workspace(ws, token)
 
 
 def _workspace_gwf_name(model: str, ws: Path) -> str:
@@ -601,14 +632,38 @@ def _impl_start_calibration(
     ws = resolve_workspace(model)
     pst_path = _resolve_pst_path(model, pst_file)
     base_name = pst_path.stem
+    exe = _find_pestpp_binary(
+        {"glm": "pestpp-glm", "ies": "pestpp-ies", "da": "pestpp-da"}[method]
+    )
 
+    # One process per workspace (R3.3): a retried call after a client timeout
+    # must not start a second pestpp next to the first.
+    token = jobs.claim_workspace(ws, f"pestpp-{method}")
+    try:
+        return _start_calibration_claimed(
+            model, ws, pst_path, base_name, exe, method, num_reals, num_workers, token
+        )
+    except BaseException:
+        jobs.release_workspace(ws, token)
+        raise
+
+
+def _start_calibration_claimed(
+    model: str,
+    ws: Path,
+    pst_path: Path,
+    base_name: str,
+    exe: str,
+    method: str,
+    num_reals: int | None,
+    num_workers: int,
+    token: str,
+) -> dict:
+    """Body of :func:`_impl_start_calibration` once the workspace is claimed."""
     # Flush staged model changes so the forward model reads the current input
     # set (7f-E1.2).
     flush_model(model)
 
-    exe = _find_pestpp_binary(
-        {"glm": "pestpp-glm", "ies": "pestpp-ies", "da": "pestpp-da"}[method]
-    )
     noptmax: int | None = None
     effective_reals: int | None = None
     if method in ("ies", "da"):
@@ -689,6 +744,8 @@ def _impl_start_calibration(
         process=proc,
         progress_fn=lambda _j: _pestpp_progress(ws, base_name, method),
         on_cancel=lambda _job: _restore_calibration_inputs(model),
+        workspace=ws,
+        claim_token=token,
     )
     return {
         "model": model,
@@ -1345,6 +1402,58 @@ def _maybe_apply_zone_multipliers(model: str, target: Path) -> None:
     zone = ws / f"{gwf.name}_k_zone.dat"
     if target.name == f"{gwf.name}_k_mult.dat" and base.exists() and zone.exists():
         _apply_k_multipliers(base, zone, target, ws / f"{gwf.name}_k.dat")
+    factors = ws / f"{gwf.name}_k_pp_factors.dat"
+    if target.name == f"{gwf.name}_k_pp.dat" and base.exists() and factors.exists():
+        _apply_pilot_point_multipliers(base, factors, target, ws / f"{gwf.name}_k.dat")
+
+
+# ---------------------------------------------------------------------------
+# Pilot points (R3.5)
+# ---------------------------------------------------------------------------
+
+# Variogram types accepted in a pilot-point spec -> pyemu variogram class name.
+_PP_VARIOGRAMS = {"exp": "ExpVario", "gauss": "GauVario", "sph": "SphVario"}
+
+
+def _write_pp_factors(path: Path, factors: dict[int, list[tuple[int, float]]]) -> None:
+    """Write kriging factors, one line per cell: ``cell n i1 w1 i2 w2 ...``.
+
+    ``cell`` is the flat model-cell index and ``i`` the 0-based line of the
+    pilot-point value file. Plain text so the stdlib-only forward wrapper can
+    read it.
+    """
+    with open(path, "w") as fh:
+        for cell in sorted(factors):
+            pairs = factors[cell]
+            body = " ".join(f"{i} {w:.12g}" for i, w in pairs)
+            fh.write(f"{cell} {len(pairs)} {body}\n")
+
+
+def _apply_pilot_point_multipliers(base_path, factors_path, pp_path, out_path) -> np.ndarray:
+    """Write ``k = base_k x 10 ** sum_i(w_i log10 pp_i)`` to ``out_path``.
+
+    Interpolation is in log10 space, so with ordinary-kriging weights (which sum
+    to one) equal multipliers reproduce that multiplier everywhere. Cells
+    without factors (outside every pilot-point layer, or inactive) keep their
+    base value. Mirrors the forward wrapper's arithmetic exactly.
+    """
+    base = np.loadtxt(base_path, dtype=float).reshape(-1)
+    pp = np.atleast_1d(np.loadtxt(pp_path, dtype=float)).reshape(-1)
+    if np.any(pp <= 0):
+        raise ValueError("pilot-point multipliers must be positive.")
+    logs = np.log10(pp)
+    mult = np.ones_like(base)
+    for line in Path(factors_path).read_text().splitlines():
+        tok = line.split()
+        if not tok:
+            continue
+        cell, n = int(tok[0]), int(tok[1])
+        idx = np.array([int(t) for t in tok[2 : 2 + 2 * n : 2]])
+        w = np.array([float(t) for t in tok[3 : 3 + 2 * n : 2]])
+        mult[cell] = 10.0 ** float(np.dot(w, logs[idx]))
+    k = base * mult
+    np.savetxt(out_path, k, fmt="%.10g")
+    return k
 
 
 def _grid_info(gwf) -> dict:
@@ -1649,6 +1758,244 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
         "zone_map": zone_map,
         "zones": zones_out,
         "parameters": parameters,
+    }
+
+
+def _normalise_pilot_point_parameterisation(model: str, parameterisation: dict) -> dict:
+    """Validate a pilot-point K spec and compute its kriging factors (R3.5).
+
+    One spec per layer, each ``{"target": "npf:k", "scope": "pilot_points",
+    "layer": L, "spacing": d}`` (a regular lattice of points ``d`` model length
+    units apart, offset half a spacing from the grid edge, kept where it falls
+    on an active cell) or ``"points": [[x, y], ...]`` in model coordinates.
+    Pilot-point values are multipliers on the base K (``initial`` 1.0 = the
+    base field, log-transformed, bounds ``initial x lower_factor/upper_factor``,
+    default 0.1/10).
+
+    ``variogram`` is ``{"type": "exp"|"gauss"|"sph", "a": range,
+    "contribution": sill, "nugget": 0, "anisotropy": 1, "bearing": 0}`` in log10
+    multiplier space. ``a`` defaults to 2.5 x the point spacing (or the mean
+    nearest-neighbour distance of explicit points) and ``contribution`` to
+    ``((log10 upper_factor - log10 lower_factor) / 4) ** 2``, the prior whose
+    +/-2 sigma spans the bounds. ``max_points`` (default 20) caps the points
+    used per cell.
+
+    Returns ``{grid, k_base, points, parameters, factors, covariance}`` where
+    ``factors`` maps flat cell index -> ``[(point index, weight), ...]`` and
+    ``covariance`` is the block-diagonal (per layer) prior as a pyemu ``Cov``.
+    """
+    import contextlib
+
+    if not isinstance(parameterisation, dict) or not parameterisation:
+        raise ValueError("parameterisation must name at least one pilot-point spec.")
+    gwf = get_gwf(model)
+    npf = gwf.get_package("npf")
+    if npf is None:
+        raise ValueError("No NPF package found; run add_npf_package before parameterising k.")
+    grid = _grid_info(gwf)
+    if grid["type"] == "DISU":
+        raise ValueError(
+            "Pilot points need a layered DIS or DISV grid; this model is DISU. "
+            "Use scope='zones' or 'multiplier'."
+        )
+    nlay, per_layer = int(grid["nlay"]), int(grid["per_layer"])
+    mg = gwf.modelgrid
+    xc = np.asarray(mg.xcellcenters, dtype=float).reshape(-1)
+    yc = np.asarray(mg.ycellcenters, dtype=float).reshape(-1)
+    active = _active_cell_mask(gwf, int(grid["ncell"]))
+    k_base = np.asarray(npf.k.array, dtype=float).reshape(-1)
+    xmin, xmax, ymin, ymax = (float(v) for v in mg.extent)
+
+    def _local_cell(x: float, y: float) -> int | None:
+        try:
+            hit = mg.intersect(x, y, forgive=True)
+        except Exception:
+            return None
+        if grid["type"] == "DIS":
+            row, col = hit
+            if row is None or col is None or np.isnan(row) or np.isnan(col):
+                return None
+            return int(row) * int(grid["ncol"]) + int(col)
+        if hit is None or (isinstance(hit, float) and np.isnan(hit)):
+            return None
+        return int(hit)
+
+    specs: list[tuple[str, dict, int]] = []
+    for name, spec in parameterisation.items():
+        key = str(name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits and underscores."
+            )
+        if not isinstance(spec, dict):
+            raise ValueError(f"Parameter '{key}' must be a spec dict.")
+        if spec.get("scope") != "pilot_points":
+            raise ValueError(
+                "Pilot-point parameterisation cannot be combined with scope "
+                f"'{spec.get('scope')}' (parameter '{key}'); use "
+                "scope='pilot_points' for every parameter."
+            )
+        if spec.get("target") != "npf:k":
+            raise ValueError(
+                f"Pilot points support target 'npf:k' only; got '{spec.get('target')}'."
+            )
+        if spec.get("layer") is None:
+            raise ValueError(f"Parameter '{key}' scope=pilot_points requires 'layer'.")
+        layer = int(spec["layer"])
+        if not (0 <= layer < nlay):
+            raise ValueError(f"Parameter '{key}' layer {layer} out of range (nlay={nlay}).")
+        specs.append((key, spec, layer))
+    if len({s[2] for s in specs}) != len(specs):
+        raise ValueError("Each layer may appear in at most one pilot-point spec.")
+
+    points: list[dict] = []
+    parameters: list[dict] = []
+    factors: dict[int, list[tuple[int, float]]] = {}
+    blocks: list[np.ndarray] = []
+    for key, spec, layer in sorted(specs, key=lambda s: s[2]):
+        offset = layer * per_layer
+        layer_active = active[offset : offset + per_layer]
+
+        if spec.get("points") is not None:
+            coords = [(float(p[0]), float(p[1])) for p in spec["points"]]
+            for x, y in coords:
+                cell = _local_cell(x, y)
+                if cell is None or not layer_active[cell]:
+                    raise ValueError(
+                        f"Pilot point ({x}, {y}) of '{key}' is outside the active "
+                        f"grid of layer {layer}."
+                    )
+            spacing = None
+        else:
+            if spec.get("spacing") is None:
+                raise ValueError(
+                    f"Parameter '{key}' needs 'spacing' (model length units) or "
+                    "explicit 'points'."
+                )
+            spacing = float(spec["spacing"])
+            if not np.isfinite(spacing) or spacing <= 0:
+                raise ValueError(f"Parameter '{key}' spacing must be positive.")
+            coords = []
+            for y in np.arange(ymin + spacing / 2.0, ymax, spacing)[::-1]:
+                for x in np.arange(xmin + spacing / 2.0, xmax, spacing):
+                    cell = _local_cell(float(x), float(y))
+                    if cell is not None and layer_active[cell]:
+                        coords.append((round(float(x), 9), round(float(y), 9)))
+        if not coords:
+            raise ValueError(
+                f"No pilot points of '{key}' fall on an active cell of layer {layer}; "
+                "use a smaller spacing or explicit points."
+            )
+
+        initial = float(spec.get("initial", 1.0))
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"Parameter '{key}' initial multiplier must be positive.")
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+            )
+
+        vario = dict(spec.get("variogram") or {})
+        vtype = str(vario.get("type", "exp")).lower()
+        if vtype not in _PP_VARIOGRAMS:
+            raise ValueError(
+                f"Parameter '{key}' variogram type '{vtype}' is not supported; "
+                f"use one of {sorted(_PP_VARIOGRAMS)}."
+            )
+        xy = np.array(coords)
+        if "a" in vario:
+            a = float(vario["a"])
+        elif spacing is not None:
+            a = 2.5 * spacing
+        elif len(coords) > 1:
+            d = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+            np.fill_diagonal(d, np.inf)
+            a = 2.5 * float(d.min(axis=1).mean())
+        else:
+            a = max(xmax - xmin, ymax - ymin) / 3.0
+        sill = float(
+            vario.get(
+                "contribution",
+                ((np.log10(upper_factor) - np.log10(lower_factor)) / 4.0) ** 2,
+            )
+        )
+        if a <= 0 or sill <= 0:
+            raise ValueError(
+                f"Parameter '{key}' variogram 'a' and 'contribution' must be positive."
+            )
+        variogram = getattr(pyemu.geostats, _PP_VARIOGRAMS[vtype])(
+            contribution=sill,
+            a=a,
+            anisotropy=float(vario.get("anisotropy", 1.0)),
+            bearing=float(vario.get("bearing", 0.0)),
+        )
+        geostruct = pyemu.geostats.GeoStruct(
+            variograms=[variogram], nugget=float(vario.get("nugget", 0.0))
+        )
+
+        first = len(points)
+        names = []
+        for i, (x, y) in enumerate(coords, start=1):
+            pname = f"{key}_p{i}"
+            if len(pname) > 12:
+                raise ValueError(
+                    f"Pilot-point parameter name '{pname}' is {len(pname)} characters; "
+                    "PEST caps parameter names at 12. Use a shorter prefix."
+                )
+            names.append(pname)
+            points.append({"name": pname, "x": x, "y": y, "layer": layer})
+            parameters.append(
+                {
+                    "name": pname,
+                    "group": key,
+                    "target": "npf:k",
+                    "scope": "pilot_points",
+                    "layer": layer,
+                    "initial": initial,
+                    "lower_bound": initial * lower_factor,
+                    "upper_bound": initial * upper_factor,
+                    "partrans": "log",
+                }
+            )
+        index_of = {n: first + j for j, n in enumerate(names)}
+
+        pp_df = pd.DataFrame({"name": names, "x": xy[:, 0], "y": xy[:, 1], "zone": 1})
+        pp_df.index = pp_df["name"]
+        cells = np.flatnonzero(layer_active)
+        # pyemu reports progress on stdout, which is the MCP stdio channel.
+        with contextlib.redirect_stdout(sys.stderr):
+            fac = pyemu.geostats.OrdinaryKrige(geostruct, pp_df).calc_factors(
+                xc[cells],
+                yc[cells],
+                maxpts_interp=int(spec.get("max_points", 20)),
+            )
+            cov = geostruct.covariance_matrix(xy[:, 0], xy[:, 1], names=names)
+        for local, inames, ifacts in zip(cells, fac["inames"], fac["ifacts"]):
+            pairs = [
+                (index_of[str(n)], float(w))
+                for n, w in zip(list(inames), list(ifacts))
+                if str(n) in index_of
+            ]
+            if pairs:
+                factors[offset + int(local)] = pairs
+        blocks.append(np.asarray(cov.as_2d, dtype=float))
+
+    size = sum(b.shape[0] for b in blocks)
+    full = np.zeros((size, size))
+    at = 0
+    for b in blocks:
+        full[at : at + b.shape[0], at : at + b.shape[0]] = b
+        at += b.shape[0]
+    covariance = pyemu.Cov(x=full, names=[p["name"] for p in points])
+    return {
+        "grid": grid,
+        "k_base": k_base,
+        "points": points,
+        "parameters": parameters,
+        "factors": factors,
+        "covariance": covariance,
     }
 
 
@@ -2726,7 +3073,9 @@ def _derived_wrapper_source(model: str) -> tuple[str, str]:
     return "import csv\nimport datetime\n", f"DERIVED = {specs!r}\n" + _DERIVED_WRAPPER_BODY
 
 
-def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
+def _generate_forward_wrapper(
+    model: str, multiply_k: bool = False, pilot_points: bool = False
+) -> dict:
     """Generate a Python forward-run wrapper at a space-free path (7e-A2.4).
 
     PEST++ on Windows cannot execute ``.bat``/``.cmd`` wrappers (it hangs
@@ -2888,6 +3237,53 @@ def _generate_forward_wrapper(model: str, multiply_k: bool = False) -> dict:
             "    for i, value in enumerate(base):\n"
             "        z = zone[i] if i < len(zone) else 0\n"
             "        factor = mult[z - 1] if z > 0 else 1.0\n"
+            "        fh.write('%.10g\\n' % (value * factor))\n"
+            "_trace('k_written')\n"
+            "_trace('mf6_start')\n"
+            + mf6_run
+            + "_trace('mf6_done rc=%d' % proc.returncode)\n"
+            + _tail("proc.returncode")
+        )
+    elif pilot_points:
+        # Stdlib-only like the multiplier flavour: k = base_k x 10 ** (sum of
+        # kriging weight x log10 pilot-point value) per cell (R3.5), the same
+        # arithmetic as _apply_pilot_point_multipliers.
+        gwf_name = get_gwf(model).name
+        wrapper_path.write_text(
+            "import math\n"
+            "import os\n"
+            "import subprocess\n"
+            "import sys\n"
+            "import time\n"
+            "\n"
+            f"WS = {str(ws)!r}\n"
+            f"MF6 = {mf6_exe!r}\n"
+            + derived_imports
+            + trace_def
+            + f"BASE = os.path.join(WS, {gwf_name + '_k_base.dat'!r})\n"
+            f"FACTORS = os.path.join(WS, {gwf_name + '_k_pp_factors.dat'!r})\n"
+            f"PP = os.path.join(WS, {gwf_name + '_k_pp.dat'!r})\n"
+            f"KFILE = os.path.join(WS, {gwf_name + '_k.dat'!r})\n"
+            "\n"
+            "_trace('start ' + _ctx())\n"
+            "os.chdir(WS)\n"
+            "with open(BASE) as fh:\n"
+            "    base = [float(tok) for tok in fh.read().split()]\n"
+            "with open(PP) as fh:\n"
+            "    logs = [math.log10(float(tok)) for tok in fh.read().split()]\n"
+            "mult = [1.0] * len(base)\n"
+            "with open(FACTORS) as fh:\n"
+            "    for line in fh:\n"
+            "        tok = line.split()\n"
+            "        if not tok:\n"
+            "            continue\n"
+            "        n = int(tok[1])\n"
+            "        s = 0.0\n"
+            "        for j in range(n):\n"
+            "            s += float(tok[3 + 2 * j]) * logs[int(tok[2 + 2 * j])]\n"
+            "        mult[int(tok[0])] = 10.0 ** s\n"
+            "with open(KFILE, 'w') as fh:\n"
+            "    for value, factor in zip(base, mult):\n"
             "        fh.write('%.10g\\n' % (value * factor))\n"
             "_trace('k_written')\n"
             "_trace('mf6_start')\n"
@@ -4352,6 +4748,124 @@ def _impl_setup_calibration_zoned(
     return result
 
 
+def _impl_setup_calibration_pilot_points(
+    model: str,
+    parameterisation: dict,
+    obs_source: str = "model",
+    noptmax: int = 10,
+) -> dict:
+    """Emit a pilot-point PEST interface for NPF k (scope="pilot_points", R3.5).
+
+    Writes the base K field, the kriging factors and a one-value-per-point
+    multiplier file (templated, one token per pilot point), rewires NPF k to an
+    external file, and forces a forward wrapper that rebuilds
+    ``k = base_k x 10 ** sum(w log10 pp)`` before each run. The geostatistical
+    prior covariance of the pilot points is written as ``<model>_pp_prior.jcb``
+    and set as the PST's ``parcov``, so pestpp-ies draws its prior ensemble
+    from it and pestpp-glm uses it as the prior parameter covariance.
+    """
+    ws = resolve_workspace(model)
+    _restore_or_snapshot_k_base(model)
+    norm = _normalise_pilot_point_parameterisation(model, parameterisation)
+    gwf_name = get_gwf(model).name
+
+    if obs_source != "model":
+        raise ValueError(
+            f"setup_calibration supports obs_source='model', got '{obs_source}'."
+        )
+    obs_meta = read_meta(model).get("observations")
+    if not obs_meta or not obs_meta.get("sites"):
+        raise ValueError(
+            "obs_source='model' requires observation targets registered via "
+            "import_obs_from_csv. No 'observations' entry found in "
+            ".gwmcp_meta.json for this model."
+        )
+
+    base_name = f"{gwf_name}_k_base.dat"
+    factors_name = f"{gwf_name}_k_pp_factors.dat"
+    pp_name = f"{gwf_name}_k_pp.dat"
+    k_name = f"{gwf_name}_k.dat"
+    cov_name = f"{model}_pp_prior.jcb"
+
+    np.savetxt(ws / base_name, norm["k_base"], fmt="%.10g")
+    _write_pp_factors(ws / factors_name, norm["factors"])
+    _impl_rewire_npf_k_external(model, filename=k_name)
+    tpl = _impl_generate_zone_mult_tpl(model, norm["points"], pp_name)
+    tpl_path = Path(tpl["tpl_path"])
+
+    ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
+    wrapper = _generate_forward_wrapper(model, pilot_points=True)
+    norm["covariance"].to_binary(str(ws / cov_name))
+
+    par_data = {
+        p["name"]: {
+            "parval1": p["initial"],
+            "parlbnd": p["lower_bound"],
+            "parubnd": p["upper_bound"],
+            "partrans": p["partrans"],
+            "pargp": p["group"],
+        }
+        for p in norm["parameters"]
+    }
+    pestpp_options: dict = {
+        "noptmax": int(noptmax),
+        "model_command": wrapper["model_command"],
+        "parcov": cov_name,
+    }
+    if output_files:
+        pestpp_options["output_files"] = output_files
+    setup = _impl_setup_pest_control(
+        model=model,
+        obs_data=obs_data,
+        par_data=par_data,
+        template_files=[str(tpl_path)],
+        instruction_files=ins_paths,
+        obs_source="explicit",
+        pestpp_options=pestpp_options,
+        _suppress_command_warning=True,
+    )
+    if setup.get("error"):
+        return setup
+
+    initial_values = {p["name"]: p["initial"] for p in norm["parameters"]}
+    _tpl_substitute(tpl_path, Path(tpl["target"]), initial_values)
+    _apply_pilot_point_multipliers(
+        ws / base_name, ws / factors_name, Path(tpl["target"]), ws / k_name
+    )
+
+    result: dict = {
+        "model": model,
+        "pst_file": setup["pst_file"],
+        "template_file": str(tpl_path),
+        "target_file": tpl["target"],
+        "instruction_file": ins_paths[0],
+        "external_array": str(ws / k_name),
+        "factors_file": str(ws / factors_name),
+        "prior_covariance_file": str(ws / cov_name),
+        "forward_wrapper": wrapper["wrapper_path"],
+        "n_observations": setup["n_observations"],
+        "n_adjustable_parameters": setup["n_adjustable_parameters"],
+        "n_total_parameters": setup["n_total_parameters"],
+        "pilot_points": norm["points"],
+        "n_cells_interpolated": len(norm["factors"]),
+        "grid": norm["grid"],
+        "model_command": setup["model_command"],
+        "next_steps": (
+            "Run pestpp-ies (run_pestpp_ies / start_calibration method='ies'), "
+            "which draws its prior from the pilot-point covariance, or "
+            "pestpp-glm; then summarise_calibration and apply_calibration_result."
+        ),
+    }
+    if len(norm["parameters"]) > len(obs_data):
+        result["note"] = (
+            f"{len(norm['parameters'])} pilot points vs {len(obs_data)} observations: "
+            "the problem is under-determined, which pilot points usually are. "
+            "pestpp-ies with the geostatistical prior handles this; for pestpp-glm "
+            "consider regularisation."
+        )
+    return result
+
+
 def _impl_setup_calibration(
     model: str,
     parameterisation: dict,
@@ -4443,6 +4957,20 @@ def _impl_setup_calibration(
                 "'all'/'layer'/'cells'; use scope='zones' for every parameter."
             )
         return _impl_setup_calibration_zoned(model, parameterisation, obs_source, noptmax)
+    pp_specs = [
+        n
+        for n, s in parameterisation.items()
+        if isinstance(s, dict) and s.get("scope") == "pilot_points"
+    ]
+    if pp_specs:
+        if len(pp_specs) != len(parameterisation):
+            raise ValueError(
+                "Pilot-point parameterisation cannot be combined with other "
+                "scopes; use scope='pilot_points' for every parameter."
+            )
+        return _impl_setup_calibration_pilot_points(
+            model, parameterisation, obs_source, noptmax
+        )
     if not parameterisation:
         raise ValueError("parameterisation must name at least one parameter.")
     ws = resolve_workspace(model)
@@ -5801,12 +6329,7 @@ def _impl_run_pestpp_glm(
     # set (7f-E1.2).
     flush_model(model)
 
-    result = subprocess.run(
-        [exe, pst_path.name],
-        cwd=str(ws),
-        capture_output=True,
-        text=True,
-    )
+    result = _run_pestpp_blocking([exe, pst_path.name], ws)
 
     base_name = pst_path.stem
     # GLM writes its iteration history to <case>.iobj, not .phi.actual.csv
@@ -5898,12 +6421,7 @@ def _impl_run_pestpp_da(
     effective_reals = pst.pestpp_options.get("da_num_reals")
     effective_reals = int(effective_reals) if effective_reals is not None else None
 
-    result = subprocess.run(
-        [exe, pst_path.name],
-        cwd=str(ws),
-        capture_output=True,
-        text=True,
-    )
+    result = _run_pestpp_blocking([exe, pst_path.name], ws)
 
     base_name = pst_path.stem
     phi_csv = ws / f"{base_name}.phi.actual.csv"
@@ -5971,12 +6489,7 @@ def _impl_run_pestpp_ies(
     pst.pestpp_options["ies_num_reals"] = num_reals
     pst.write(str(pst_path))
 
-    result = subprocess.run(
-        [exe, pst_path.name],
-        cwd=str(ws),
-        capture_output=True,
-        text=True,
-    )
+    result = _run_pestpp_blocking([exe, pst_path.name], ws)
 
     base_name = pst_path.stem
     phi_csv = ws / f"{base_name}.phi.actual.csv"
@@ -6065,9 +6578,7 @@ def _impl_run_pestpp_sen(
     sen_pst = ws / f"{src_pst.stem}_sen.pst"
     pst.write(str(sen_pst))
 
-    proc = subprocess.run(
-        [exe, sen_pst.name], cwd=str(ws), capture_output=True, text=True
-    )
+    proc = _run_pestpp_blocking([exe, sen_pst.name], ws)
     if method == "sobol":
         si_file = ws / f"{sen_pst.stem}.sobol.si.csv"
         sti_file = ws / f"{sen_pst.stem}.sobol.sti.csv"
@@ -6236,9 +6747,7 @@ def _impl_run_pestpp_sweep(
     pst.pestpp_options["sweep_output_csv_file"] = out_name
     swp_pst = ws / f"{src_pst.stem}_swp.pst"
     pst.write(str(swp_pst))
-    proc = subprocess.run(
-        [exe, swp_pst.name], cwd=str(ws), capture_output=True, text=True
-    )
+    proc = _run_pestpp_blocking([exe, swp_pst.name], ws)
     out_path = ws / out_name
     if proc.returncode != 0 or not out_path.exists():
         raise RuntimeError(
@@ -6371,9 +6880,7 @@ def _impl_run_pestpp_opt(
     opt_pst = ws / f"{src_pst.stem}_opt.pst"
     pst.write(str(opt_pst))
 
-    proc = subprocess.run(
-        [exe, opt_pst.name], cwd=str(ws), capture_output=True, text=True
-    )
+    proc = _run_pestpp_blocking([exe, opt_pst.name], ws)
     par_file = ws / f"{opt_pst.stem}.par"
     res_file = ws / f"{opt_pst.stem}.1.sim.rei"
     if proc.returncode != 0 or not par_file.exists():
@@ -6961,6 +7468,20 @@ def register(mcp: FastMCP) -> None:
         before each run, preserving the base K pattern. One zones spec per
         layer; zones specs cannot be mixed with all/layer/cells.
 
+        scope may also be "pilot_points" (target "npf:k", with "layer": N and
+        either "spacing": d — a lattice d model-length-units apart, kept on
+        active cells — or "points": [[x, y], ...]). Each pilot point is a
+        log-transformed K multiplier (initial 1.0 = the base field, bounds
+        0.1-10); ordinary-kriging factors are computed once and the forward
+        wrapper interpolates log10 multipliers to every cell of the layer.
+        Optional "variogram": {"type": "exp"|"gauss"|"sph", "a": range,
+        "contribution": sill, "nugget", "anisotropy", "bearing"} (defaults:
+        exp, a = 2.5 x spacing, sill from the bounds) and "max_points" (20).
+        The variogram's prior covariance is written to <model>_pp_prior.jcb
+        and set as the PST's parcov, so pestpp-ies draws a spatially
+        correlated prior. One spec per layer; not mixable with other scopes;
+        DIS and DISV grids.
+
         This call: (1) externalises each target to an OPEN/CLOSE file,
         (2) generates a wide-token template (>= 15 chars) per target,
         (3) generates the instruction file from the model's OBS CSV header,
@@ -7203,6 +7724,13 @@ def register(mcp: FastMCP) -> None:
             return _impl_start_calibration(
                 model, pst_file, method, num_reals, num_workers
             )
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:
@@ -7230,6 +7758,13 @@ def register(mcp: FastMCP) -> None:
         """Run PESTPP-GLM (gradient-based parameter estimation) and return convergence results."""
         try:
             return _impl_run_pestpp_glm(model, pst_file, num_workers)
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except RuntimeError as exc:
@@ -7250,6 +7785,13 @@ def register(mcp: FastMCP) -> None:
         """Run PESTPP-IES (iterative ensemble smoother) and return ensemble phi statistics."""
         try:
             return _impl_run_pestpp_ies(model, pst_file, num_reals, num_workers)
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except RuntimeError as exc:
@@ -7285,6 +7827,13 @@ def register(mcp: FastMCP) -> None:
         try:
             return _impl_run_pestpp_da(
                 model, pst_file, num_reals, num_workers, da_options, noptmax
+            )
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -7330,6 +7879,13 @@ def register(mcp: FastMCP) -> None:
             return _impl_run_pestpp_sen(
                 model, pst_file, method, morris_r, morris_p, sobol_samples
             )
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:
@@ -7362,6 +7918,13 @@ def register(mcp: FastMCP) -> None:
         try:
             return _impl_run_pestpp_sweep(
                 model, pst_file, num_samples, seed, parameter_csv
+            )
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -7402,6 +7965,13 @@ def register(mcp: FastMCP) -> None:
         try:
             return _impl_run_pestpp_opt(
                 model, pst_file, objective, decision_parameters, constraints, direction
+            )
+        except jobs.WorkspaceBusyError as exc:
+            return _err(
+                "WORKSPACE_BUSY",
+                str(exc),
+                "One MF6/PEST++ process per workspace: wait (get_job_status), "
+                "stop it (cancel_job), or release an orphan (release_workspace_lock).",
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

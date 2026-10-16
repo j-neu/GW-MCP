@@ -374,6 +374,7 @@ models cannot be auto-fixed in place (clone them first).
 | `start_task` | `model: str`, `task: str`, `arguments: dict | None` | `{ model, job_id, kind: "task:<task>", status: "running" }` — runs a heavy tool in the background for models where the call would outlast the client timeout. `task` is one of `check_model`, `export_model_spec`, `setup_da_control`, `assign_k_from_raster`, `assign_k_from_zones`, `assign_top_from_raster`, `assign_array_from_raster`, `import_obs_from_csv`, `flush_model`; `arguments` are that tool's keyword arguments without `model`, validated against its signature before the job starts (`INVALID_INPUT`). Tasks on the same model run one at a time. Poll with `get_job_status`; the finished result is the tool's normal result, failures appear as the job error |
 | `get_job_status` | `job_id: str` | `{ job_id, model, kind, status, elapsed_s, progress \| null, result \| null, error \| null }` |
 | `cancel_job` | `job_id: str` | `{ job_id, status: "cancelled" }` (or the job's terminal status if already finished) |
+| `release_workspace_lock` | `model: str` | `{ model, workspace, terminated_pid \| null, lock_cleared }` — terminates the MF6/PEST++ process tree an earlier server session left in the workspace (its PID is in the workspace lock file) and clears the lock. A job this server runs is refused with `WORKSPACE_BUSY`; use `cancel_job` |
 | `get_run_log` | `model: str`, `tail: int = 100`, `component: str = "gwf"` | Last N lines of the MODFLOW listing file (.lst); a non-gwf component prefers its own `<model>.lst`, else mfsim.lst |
 
 ### diagnose_convergence (7e-C1)
@@ -472,6 +473,20 @@ transitions: `running` → `succeeded` | `failed` | `cancelled`.
   `<gwf>.csub_packagedata.dat`) from their base snapshots, so a killed forward
   run cannot leave the model unloadable (`Unable to open file
   ...csub_cg_theta.dat`, 6d Target 9 rerun-1).
+- **One process per workspace (R3.3).** `start_run`, `start_calibration`,
+  `run_simulation` and every synchronous `run_pestpp_*` tool claim the model
+  workspace before touching it; a second start while one runs returns
+  `WORKSPACE_BUSY` naming the running job. This is what stops a call retried
+  after a client timeout from starting a second pestpp next to the first (the
+  two collided at "loading parcov" in the 6d reruns). The running process's
+  PID is written to `.gwmcp_process.lock` in the workspace, so a process
+  orphaned by an earlier server session also blocks the workspace until it
+  exits or `release_workspace_lock(model)` terminates it; a lock whose process
+  has exited is cleared automatically. On server shutdown every running job's
+  process tree is terminated.
+- MF6 and PEST++ are spawned with stdin detached (`DEVNULL`). The server's own
+  stdin is the MCP stdio pipe, and the forward-run wrapper trace had recorded
+  `stdin=fifo` in the pestpp chain; no child may inherit or read it.
 
 ---
 
@@ -682,6 +697,44 @@ MODFLOW 6 run — so the base spatial pattern is preserved and only the zone
 magnitudes are calibrated. `check_parameter_sensitivity` re-applies the
 multipliers before its direct runs. The result adds a `zones` block (name,
 layer, base_k, n_cells, bounds) and `grid`.
+
+**Pilot points (scope="pilot_points", R3.5):** `{"kpp": {"target": "npf:k",
+"scope": "pilot_points", "layer": 0, "spacing": 300.0}}` places pilot points on
+a regular lattice `spacing` model length units apart (offset half a spacing
+from the grid's lower-left corner, kept only where they fall on an active
+cell), or at explicit `"points": [[x, y], ...]` in model coordinates (an
+inactive or off-grid point is an error). Each point is a log-transformed K
+**multiplier** `<prefix>_p<i>` (`initial` 1.0 = the base field, bounds
+`lower_factor`/`upper_factor`, default 0.1/10). Ordinary-kriging factors
+(pyEMU) are computed once at setup for every active cell of the layer, and the
+stdlib-only forward wrapper rebuilds `k = base_k × 10^(Σ wᵢ·log10 ppᵢ)` before
+each run, so a constant multiplier reproduces itself exactly and the base
+pattern is kept.
+
+`variogram` is `{"type": "exp" | "gauss" | "sph", "a", "contribution",
+"nugget", "anisotropy", "bearing"}` in log10-multiplier space; `a` defaults to
+2.5 × spacing (or 2.5 × the mean nearest-neighbour distance of explicit
+points) and `contribution` to `((log10 upper − log10 lower)/4)²`, the prior
+whose ±2σ spans the bounds. `max_points` (default 20) caps the points used per
+cell. The pilot points' prior covariance (block-diagonal across layers) is
+written to `<model>_pp_prior.jcb` and set as the PST's `parcov`: pestpp-ies
+draws a spatially correlated prior from it (neighbouring points 300 m apart
+under a 900 m range correlate at about 0.7 in the test prior, against about 0
+without it), and pestpp-glm uses it as the prior parameter covariance. One
+spec per layer, DIS or DISV grids, not mixable with other scopes. Files:
+`<gwf>_k_base.dat`, `<gwf>_k_pp_factors.dat` (`cell n i1 w1 ...`),
+`<gwf>_k_pp.dat(.tpl)`. `apply_calibration_result` and
+`check_parameter_sensitivity` rebuild K from the pilot points. The result adds
+`pilot_points` (name, x, y, layer), `factors_file`, `prior_covariance_file` and
+`n_cells_interpolated`, plus a `note` when there are more pilot points than
+observations.
+
+Verified on a synthetic two-zone aquifer (truth K 20 m/d west, 2 m/d east;
+16 head observations; start uniform 6 m/d; 9 pilot points; pestpp-glm,
+`noptmax=6`): phi fell from 868 to 4.8 and the recovered field averaged
+23.5 m/d west and 2.1 m/d east. The kriging factors are computed in Python
+per cell, so setup time grows with the layer's active cell count; on regional
+grids use a coarse spacing.
 
 **Single-factor K multiplier (scope="multiplier", `setup_da_control` only):**
 one dimensionless parameter multiplies the **whole existing** `npf:k` array
