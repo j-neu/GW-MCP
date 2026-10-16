@@ -440,7 +440,9 @@ def test_da_completes_in_space_containing_workspace(tmp_path):
         # generates a wrapper; the run below is then the assertion.
         assert "gwmcp_run_" in command[0], command
     else:
-        assert command == [_find_mf6_binary()], command
+        from tests._cmdpath import same_path
+
+        assert same_path(command[0], _find_mf6_binary(), pst_file.parent), command
         assert "gwmcp_run_" not in command[0], command
         assert " " not in command[0], command
 

@@ -368,7 +368,7 @@ def _run_process(args: list[str], cwd: str):
         encoding="utf-8",
         errors="replace",
         start_new_session=os.name != "nt",
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
 
 

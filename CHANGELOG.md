@@ -100,6 +100,15 @@ release.
   table to an `output_file` ending in `.csv` instead of failing.
 - CI's Python matrix now actually selects the interpreter (`UV_PYTHON`) and
   includes 3.13.
+- **PEST++ on Linux/macOS:** every calibration failed there. Two causes:
+  - the default forward command was pyEMU's `model.bat` placeholder, because
+    the MF6 default was only set on Windows;
+  - pestpp drops the leading `/` of an absolute command path before running it.
+
+  Commands now use the MF6 binary on every platform, with workspace-relative
+  paths on POSIX, including caller-supplied `model_command`s.
+- Raster sampling failed with rasterio < 1.5 (the newest available on
+  Python 3.11), which has no `CRS.equals`.
 
 - `import_obs_from_csv` rejects sites more than about a cell outside the grid
   (`allow_outside=True` snaps them) instead of snapping every far-away site to

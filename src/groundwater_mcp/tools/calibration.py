@@ -487,7 +487,7 @@ def _run_process(args: list[str], cwd: str):
         encoding="utf-8",
         errors="replace",
         start_new_session=os.name != "nt",
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
 
 
@@ -2389,6 +2389,21 @@ def _impl_generate_ins_from_obs_csv(
     return {"ins_path": ins_path, "obs_names": obs_names}
 
 
+def _pestpp_command_path(path: str | Path, ws: Path) -> str:
+    """A path as it must appear in a PEST++ model command run from *ws*.
+
+    On Linux/macOS pestpp 5.2 drops the leading ``/`` of an absolute command
+    path before ``execv`` (``/root/bin/mf6`` runs as ``root/bin/mf6`` and
+    fails), so absolute paths are given relative to the workspace, which is
+    pestpp's working directory for the forward run. Windows paths are
+    returned unchanged.
+    """
+    p = str(path)
+    if os.name == "nt" or not os.path.isabs(p):
+        return p
+    return os.path.relpath(p, str(ws))
+
+
 def _space_free_interpreter() -> str | None:
     """Return a Python interpreter whose path contains no spaces, if any.
 
@@ -3320,7 +3335,8 @@ def _generate_forward_wrapper(
     # BOTH wrapper flavours are stdlib-only, so the space-free base interpreter
     # is always a valid choice (6d rerun-6: the numpy-importing multiplier
     # wrapper forced this venv's space-containing interpreter and deadlocked).
-    interpreter = _space_free_interpreter() or sys.executable
+    interpreter = _pestpp_command_path(_space_free_interpreter() or sys.executable, ws)
+    cmd_target = _pestpp_command_path(cmd_target, ws)
     # A quoted "exe path" ensures CreateProcess splits the command correctly.
     if " " in interpreter:
         model_command = [f'"{interpreter}" {cmd_target}']
@@ -5859,7 +5875,7 @@ def _impl_setup_da_control(
         pst.model_command = list(wrapper["model_command"])
     else:
         try:
-            pst.model_command = [_find_mf6_binary()]
+            pst.model_command = [_pestpp_command_path(_find_mf6_binary(), ws)]
         except RuntimeError:
             pass  # keep pyemu's default; only needed for an actual run
 
@@ -6123,17 +6139,44 @@ def _impl_setup_pest_control(
     if cmd_line is None:
         cmd_line = pestpp_options.pop("model_command", None)
     if cmd_line is not None:
-        if isinstance(cmd_line, str):
-            pst.model_command = [cmd_line]
-        else:
-            pst.model_command = list(cmd_line)
-    elif platform.system() == "Windows":
-        # Default forward command: run MF6 directly.  A bare `model.bat`
-        # fails under NoDefaultCurrentDirectoryInExePath=1, and `cmd /c`
-        # is path-normalised by pestpp into `cmd \c` (invalid).
+        commands = [cmd_line] if isinstance(cmd_line, str) else list(cmd_line)
+        if os.name != "nt":
+            # pestpp on POSIX drops the leading "/" of an absolute command, so
+            # an absolute (optionally quoted) executable becomes workspace-
+            # relative; the rest of the command line is kept verbatim.
+            ws_cmd = resolve_workspace(model)
+            fixed = []
+            for cmd in commands:
+                text = str(cmd).strip()
+                if text.startswith(('"', "'")) and text[0] in text[1:]:
+                    end = text.index(text[0], 1)
+                    exe, rest = text[1:end], text[end + 1 :]
+                else:
+                    exe, _, rest = text.partition(" ")
+                    rest = (" " + rest) if rest else ""
+                if os.path.isabs(exe):
+                    fixed.append(_pestpp_command_path(exe, ws_cmd) + rest)
+                else:
+                    fixed.append(text)
+            commands = fixed
+        pst.model_command = commands
+    else:
+        # Default forward command: run MF6 directly, on every platform.
+        # pyemu's placeholder `model.bat` cannot run on Linux/macOS at all
+        # (execv fails, so every PEST++ run died there), and on Windows a
+        # bare `model.bat` fails under NoDefaultCurrentDirectoryInExePath=1
+        # while `cmd /c` is path-normalised by pestpp into `cmd \c`.
         try:
             mf6_exe = _find_mf6_binary()
-            pst.model_command = [f'"{mf6_exe}"']
+            if platform.system() == "Windows":
+                pst.model_command = [f'"{mf6_exe}"']
+            else:
+                # pestpp splits the command on spaces and execv's it, so no
+                # quotes; a binary path with a space gets the wrapper instead
+                # (_needs_forward_wrapper).
+                pst.model_command = [
+                    _pestpp_command_path(mf6_exe, resolve_workspace(model))
+                ]
         except RuntimeError:
             pass  # keep pyemu's default model.bat
 

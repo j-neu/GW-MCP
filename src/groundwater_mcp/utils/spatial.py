@@ -101,7 +101,9 @@ def sample_raster_at_points(
             from pyproj import Transformer
 
             in_crs = CRS.from_user_input(src_crs)
-            if not in_crs.equals(raster_crs):
+            # `!=` rather than `.equals()`: rasterio < 1.5 (the newest on
+            # Python 3.11) has no CRS.equals; equality compares equivalence.
+            if in_crs != raster_crs:
                 transformer = Transformer.from_crs(in_crs, raster_crs, always_xy=True)
                 x, y = transformer.transform(x, y)
 

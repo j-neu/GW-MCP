@@ -356,7 +356,9 @@ def test_mcp_only_sequential_da_run_multiplier_space_workspace(tmp_path):
     assert " " not in first_token, command
     space_free = _space_free_interpreter()
     if space_free is not None:
-        assert first_token == space_free, command
+        from tests._cmdpath import same_path
+
+        assert same_path(first_token, space_free, ws), command
 
     run = _call("run_pestpp_da", {"model": name, "pst_file": pst_file})
     assert run["converged"], run

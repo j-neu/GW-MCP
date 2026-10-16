@@ -453,8 +453,11 @@ def test_generate_forward_wrapper_space_free_and_runs(tmp_path):
 
     # The PST can use this command (space-free interpreter + space-free wrapper
     # path, so nothing on the command line needs quoting).
+    from tests._cmdpath import same_path
+
     assert "gwmcp_run_" in result["model_command"][0]
-    assert str(wrapper) in result["model_command"][0]
+    assert same_path(result["model_command"][0].split()[-1], wrapper, ws_dir), result
+
 
 
 def test_generate_forward_wrapper_detaches_mf6_stdio(tmp_path, monkeypatch):
@@ -510,16 +513,18 @@ def test_generate_forward_wrapper_command_executes_with_spaced_mf6(tmp_path, mon
     # exists: the wrapper is stdlib-only, so the base interpreter is used and no
     # quoting of a space-containing exe path is needed. (The single space that
     # separates the interpreter from the wrapper script is structural.)
+    from tests._cmdpath import resolve_token, same_path
+
     wrapper = Path(result["wrapper_path"])
+    ws_dir = resolve_workspace(name)
     args = [tok.strip('"') for tok in shlex.split(command, posix=False)]
     assert all(" " not in tok for tok in args), args
-    assert Path(args[0]).exists(), args
-    assert args[1] in (wrapper.name, str(wrapper)), args
+    assert Path(resolve_token(args[0], ws_dir)).exists(), args
+    assert args[1] == wrapper.name or same_path(args[1], wrapper, ws_dir), args
     space_free = _space_free_interpreter()
     if space_free is not None:
-        assert args[0] == space_free, args
+        assert same_path(args[0], space_free, ws_dir), args
 
-    ws_dir = resolve_workspace(name)
     proc = subprocess.run(args, cwd=str(ws_dir), capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert list(ws_dir.glob("*.hds")), "expected the wrapper command to run the model"

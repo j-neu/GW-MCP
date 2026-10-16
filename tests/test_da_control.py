@@ -1060,8 +1060,11 @@ def test_setup_da_control_space_workspace_uses_space_free_command(tmp_path):
     assert "error" not in res, res
     assert not _needs_forward_wrapper(name), "workspace space alone must not need a wrapper"
 
+    from tests._cmdpath import same_path
+
     command = pyemu.Pst(res["pst_file"]).model_command
-    assert command == [_find_mf6_binary()], command
+    assert len(command) == 1, command
+    assert same_path(command[0], _find_mf6_binary(), resolve_workspace(name)), command
     assert " " not in command[0], command
     assert "gwmcp_run_" not in command[0], command
 
@@ -1166,8 +1169,10 @@ def test_multiplier_forward_command_is_space_free_and_stdlib_only(tmp_path):
 
     command = pyemu.Pst(res["pst_file"]).model_command
     assert len(command) == 1, command
+    from tests._cmdpath import same_path
+
     first_token = command[0].split()[0]
-    assert first_token == space_free, command
+    assert same_path(first_token, space_free, resolve_workspace(name)), command
     assert " " not in first_token, command
 
     # the space-free interpreter (no numpy) can actually run the wrapper
