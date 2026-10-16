@@ -214,6 +214,44 @@ def test_river_conductance_derived_from_bed_properties(tmp_path):
         assert cond == pytest.approx(500.0, abs=1.0)
 
 
+def test_river_reaches_go_to_the_requested_layer_and_skip_inactive_cells(tmp_path):
+    """R4.1 backlog: reaches could only go to layer 0 and were written onto
+    inactive cells."""
+    from groundwater_mcp.tools.parameterise import _impl_import_river_from_shapefile
+    from groundwater_mcp.utils.model_store import flush_model, invalidate
+
+    name = "riv_layer"
+    _impl_create_model(name, str(tmp_path / name), "METERS", "DAYS")
+    _impl_set_simulation(name, nper=1, perlen=[1.0], nstp=[1], ims_complexity="simple")
+    idomain = np.ones((2, 5, 5), dtype=int)
+    idomain[1, 2, 0] = 0  # first reach cell inactive in layer 1
+    _impl_add_dis_package(name, 2, 5, 5, 100.0, 100.0, 10.0, [0.0, -10.0], idomain=idomain.tolist())
+    shp = _write_line_shapefile(tmp_path)
+    result = _impl_import_river_from_shapefile(
+        model=name, shapefile=shp, package="RIV", bed_k=1.0, bed_thickness=2.0,
+        channel_width=10.0, layer=1,
+    )
+    assert "error" not in result, result
+    assert result["layer"] == 1
+    assert result["reaches_inactive_skipped"] == 1
+    flush_model(name)
+    invalidate(name)
+    cells = [tuple(r["cellid"]) for r in np.asarray(get_gwf(name).riv.stress_period_data.array[0])]
+    assert cells and all(c[0] == 1 for c in cells)
+    assert (1, 2, 0) not in cells
+
+
+def test_river_layer_out_of_range_is_rejected(tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_river_from_shapefile
+
+    name = _small_base_model(tmp_path, "riv_badlayer")
+    with pytest.raises(ValueError, match="layer"):
+        _impl_import_river_from_shapefile(
+            model=name, shapefile=_write_line_shapefile(tmp_path), package="RIV",
+            bed_k=1.0, bed_thickness=2.0, channel_width=10.0, layer=3,
+        )
+
+
 def test_river_without_conductance_source_errors(tmp_path):
     from groundwater_mcp.tools.parameterise import _impl_import_river_from_shapefile
 

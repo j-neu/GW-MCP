@@ -1144,6 +1144,7 @@ def _impl_read_heads(
     row_slice: list[int] | None = None,
     col_slice: list[int] | None = None,
     decimate: int | None = None,
+    output_file: str | None = None,
 ) -> dict:
     """Read head values from the binary .hds output file.
 
@@ -1152,7 +1153,9 @@ def _impl_read_heads(
     response small on regional grids (7e-A1). ``include_values=True`` returns
     the raw values when the cell count is within ``max_cells`` (else
     PAYLOAD_TOO_LARGE). ``row_slice``/``col_slice`` (``[start, stop]``) and
-    ``decimate`` subset the array before any of the above.
+    ``decimate`` subset the array before any of the above. ``output_file``
+    names the ``.npy``: absolute paths are honoured, relative ones resolve
+    inside the workspace, and ``.npy`` is appended when missing.
     """
     _validate_layer(model, layer)
     ws = resolve_workspace(model)
@@ -1195,7 +1198,15 @@ def _impl_read_heads(
         result["warning"] = warning
 
     # Always write the array to a .npy so large grids can be pulled from disk.
-    npy_path = ws / f"{model}_heads_l{layer}_k{target[0]}_{target[1]}.npy"
+    if output_file:
+        npy_path = Path(output_file)
+        if not npy_path.is_absolute():
+            npy_path = ws / npy_path
+        if npy_path.suffix.lower() != ".npy":
+            npy_path = npy_path.with_name(npy_path.name + ".npy")
+        npy_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        npy_path = ws / f"{model}_heads_l{layer}_k{target[0]}_{target[1]}.npy"
     np.save(npy_path, layer_heads)
     result["output_file"] = str(npy_path)
 
@@ -2252,11 +2263,18 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
          "simulated": r["simulated"], "residual": r["residual"]}
         for r in rows
     ]
-    residuals_csv = ws / f"{model}_obs_residuals.csv"
+    # output_file names the scatter plot, or the residual table when it ends
+    # in .csv (a .csv used to be handed to matplotlib and fail).
+    csv_target = output_file if output_file and output_file.lower().endswith(".csv") else None
+    plot_target = None if csv_target else output_file
+    residuals_csv = Path(csv_target) if csv_target else Path(f"{model}_obs_residuals.csv")
+    if not residuals_csv.is_absolute():
+        residuals_csv = ws / residuals_csv
+    residuals_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(residuals).to_csv(residuals_csv, index=False)
 
     # Scatter plot: observed vs simulated with a 1:1 reference line
-    plot_path = ws / (output_file or f"{model}_obs_fit.png")
+    plot_path = ws / (plot_target or f"{model}_obs_fit.png")
     with figure() as fig:
         ax = fig.add_subplot(1, 1, 1)
         ax.scatter(obs_arr, sim_arr, s=30, alpha=0.7)
@@ -2304,6 +2322,7 @@ def register(mcp: FastMCP) -> None:
         row_slice: list[int] | None = None,
         col_slice: list[int] | None = None,
         decimate: int | None = None,
+        output_file: str | None = None,
     ) -> dict:
         """Read head values from the binary .hds output file for a given time
         step and layer.
@@ -2311,10 +2330,19 @@ def register(mcp: FastMCP) -> None:
         Returns statistics plus an output_file (.npy of the layer array) by
         default; include_values=True returns raw values within max_cells.
         row_slice/col_slice ([start, stop]) and decimate subset the grid
-        (7e-A1)."""
+        (7e-A1). output_file names the .npy (absolute honoured, relative =
+        inside the workspace; default <model>_heads_l<layer>_k<kstp>_<kper>.npy)."""
         try:
             return _impl_read_heads(
-                model, kstpkper, layer, include_values, max_cells, row_slice, col_slice, decimate
+                model,
+                kstpkper,
+                layer,
+                include_values,
+                max_cells,
+                row_slice,
+                col_slice,
+                decimate,
+                output_file,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -2547,7 +2575,9 @@ def register(mcp: FastMCP) -> None:
         Each site's observed value is the mean of its registered records; the
         simulated value is the model's obs-CSV value at the final output time
         (steady-state appropriate). Requires import_obs_from_csv then
-        run_simulation."""
+        run_simulation. output_file names the scatter plot (.png etc.), or
+        the residual table when it ends in .csv; relative paths resolve inside
+        the workspace."""
         try:
             return _impl_compare_to_observed(model, output_file)
         except KeyError as exc:

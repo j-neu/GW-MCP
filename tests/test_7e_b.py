@@ -387,6 +387,23 @@ def test_import_grid_disv_layer_surfaces_rejected(tmp_path, model_name):
     assert data["code"] == "INVALID_INPUT"
 
 
+def test_import_grid_dis_wrong_surface_count_rejected(tmp_path, model_name):
+    """R4.1 backlog: a DIS layer_surfaces list that is not nlay + 1 long was
+    silently ignored and the grid got flat default layers."""
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+
+    poly = Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000)])
+    shp = tmp_path / "catchment.gpkg"
+    gpd.GeoDataFrame(geometry=[poly], crs="EPSG:32755").to_file(shp, driver="GPKG")
+    _impl_create_model(model_name, str(tmp_path / model_name), "METERS", "DAYS")
+    _impl_set_simulation(model_name, 1, [1.0], [1], "simple")
+    with pytest.raises(ValueError, match="nlay \\+ 1"):
+        _impl_import_grid_from_shapefile(
+            model_name, str(shp), 1, ["dem.tif"], "dis", None, 200.0
+        )
+
+
 # ---------------------------------------------------------------------------
 # B8 — array-based RCHA/EVTA packages
 # ---------------------------------------------------------------------------

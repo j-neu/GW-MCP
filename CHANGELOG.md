@@ -50,7 +50,8 @@ release.
   workspace lock file, so an orphan from an earlier server session is
   detected; `release_workspace_lock` terminates it. Running jobs are
   terminated on server shutdown, and children are spawned with stdin detached
-  from the MCP stdio pipe.
+  from the MCP stdio pipe. The intermittent background-calibration stall
+  itself is not root-caused; this prevents the collision and orphan cases.
 - **`apply_calibration_result`:** writes the calibrated parameters of a GLM/IES
   run (including zone multipliers) back into the model, so the calibrated
   field can be run, plotted and exported.
@@ -89,6 +90,16 @@ release.
   even for a read-only adopted source.
 
 ### Fixed — silent wrong answers now fail loudly
+
+- `import_grid_from_shapefile` rejects a `layer_surfaces` list that is not
+  `nlay + 1` long; it used to ignore it and build flat default layers.
+- `import_river_from_shapefile` takes a `layer` and skips reaches on inactive
+  cells (reported as `reaches_inactive_skipped`) instead of writing every reach
+  to layer 0.
+- `read_heads` honours `output_file`; `compare_to_observed` writes the residual
+  table to an `output_file` ending in `.csv` instead of failing.
+- CI's Python matrix now actually selects the interpreter (`UV_PYTHON`) and
+  includes 3.13.
 
 - `import_obs_from_csv` rejects sites more than about a cell outside the grid
   (`allow_outside=True` snaps them) instead of snapping every far-away site to

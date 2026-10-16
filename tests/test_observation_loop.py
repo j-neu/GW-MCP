@@ -366,6 +366,13 @@ def test_compare_to_observed_rmse_matches_hand_computed(tmp_path, obs_csv_at_cen
     result = _impl_compare_to_observed(name)
     assert "error" not in result
 
+    # output_file ending in .csv names the residual table, not the plot
+    csv_out = tmp_path / "fit" / "residuals.csv"
+    as_csv = _impl_compare_to_observed(name, output_file=str(csv_out))
+    assert "error" not in as_csv, as_csv
+    assert as_csv["residuals_csv"] == str(csv_out) and csv_out.exists()
+    assert as_csv["scatter_plot"].endswith(".png")
+
     sim = _impl_read_simulated_observations(name)["sites"]
     observed = np.array([55.0, 54.0, 53.0, 52.0, 51.0])
     simulated = np.array([sim[f"S{i + 1:02d}"] for i in range(5)])

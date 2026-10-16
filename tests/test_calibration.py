@@ -655,6 +655,33 @@ def test_run_pestpp_glm_reads_iobj(pst_model, monkeypatch):
     assert result["final_phi"] == pytest.approx(150.001)
 
 
+def test_run_pestpp_glm_reads_a_real_iobj(pst_model, monkeypatch):
+    """7e-B1.3: the GLM readers against a captured real pestpp-glm 5.2.16
+    ``.iobj`` (tests/fixtures/glm_real), not a hand-shaped one."""
+    import shutil
+
+    import groundwater_mcp.tools.calibration as cal_module
+
+    real = Path(__file__).parent / "fixtures" / "glm_real" / "real_glm.iobj"
+    model, pst_file = pst_model
+    ws = resolve_workspace(model)
+    shutil.copyfile(real, ws / f"{Path(pst_file).stem}.iobj")
+
+    progress, final = cal_module._read_iobj_phi(real)
+    assert [p["phi"] for p in progress] == pytest.approx([868.046, 26.8523, 8.1846, 6.41371])
+    assert final == pytest.approx(6.41371)
+
+    monkeypatch.setattr(cal_module, "_find_pestpp_binary", lambda _name: "/fake/pestpp-glm")
+    monkeypatch.setattr(
+        cal_module,
+        "_run_pestpp_blocking",
+        lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
+    )
+    result = _impl_run_pestpp_glm(model, pst_file)
+    assert result["iterations"] == 4
+    assert result["final_phi"] == pytest.approx(6.41371)
+
+
 # ---------------------------------------------------------------------------
 # _impl_run_pestpp_ies — unit tests (no binary needed)
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ Translate processed spatial data (rasters, shapefiles, CSVs) into MODFLOW 6 mode
 | `assign_ic_from_raster` | `model: str`, `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Per-layer assignments, `cells_assigned`, `cells_no_coverage`, `head_range`, optional `warning` |
 | `assign_array_from_raster` | `model: str`, `target: str` (`NPF.k` / `NPF.k33` / `IC.strt` / `STO.ss` / `STO.sy` / `RCHA.recharge` / `EVTA.surface` / `EVTA.rate` / `EVTA.depth`), `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `stress_period: int = 0`, `method`, `fill`, `coverage_tolerance`, `rate_units: str \| None` | Per-layer or per-period assignment counts, written `value_range`, optional `warning` / `value_warnings`, `rate_units` when converted |
 | `import_boundary_from_shapefile` | `model: str`, `shapefile: str`, `package: "CHD" \| "WEL"`, `value_field: str \| None`, `value: float \| None`, `layer: int = 0`, `stress_period: int = 0`, `pname: str \| None` | Package summary: `n_features`, `n_cells`, `cells_inactive_skipped`, `value_range`. CHD from line/polygon features (every touched cell gets the head; several features on a cell average), WEL from points (nearest cell; wells sharing a cell sum; negative = extraction). Exactly one of `value_field`/`value`. Features are reprojected into the grid CRS (`CRS_UNKNOWN` when the grid has none); points about a cell or more outside the grid are `INVALID_INPUT`; inactive cells are skipped and counted. DIS only |
-| `import_river_from_shapefile` | `model: str`, `shapefile: str`, `package: "RIV" \| "DRN" \| "GHB"`, `stage_field: str \| None`, `cond_field: str \| None`, `depth_field: str \| None`, `stage_raster: str \| None`, `stage_offset: float = 1.0`, `coverage_tolerance: float = 0.1`, `stress_periods: list[int] \| None`, `bed_k: float \| None`, `bed_thickness: float \| None`, `channel_width: float \| None` | Stress period data summary: reach count, stage source, per-reach coverage count, package written |
+| `import_river_from_shapefile` | `model: str`, `shapefile: str`, `package: "RIV" \| "DRN" \| "GHB"`, `stage_field: str \| None`, `cond_field: str \| None`, `depth_field: str \| None`, `stage_raster: str \| None`, `stage_offset: float = 1.0`, `coverage_tolerance: float = 0.1`, `stress_periods: list[int] \| None`, `bed_k: float \| None`, `bed_thickness: float \| None`, `channel_width: float \| None`, `layer: int = 0` | Stress period data summary: reach count, `layer`, `reaches_inactive_skipped` (reaches on cells inactive in that layer are dropped), stage source, per-reach coverage count, package written |
 
 **Conductance is derived, not guessed (7f-H1.2):** pass a `cond_field`
 attribute, or `bed_k` + `bed_thickness` + `channel_width` and the tool computes
@@ -129,7 +129,7 @@ Inline `vertices`/`cell2d` payloads are rejected beyond 50,000 cells
 | `add_disu_package` | `model: str`, `nodes: int`, `nja: int`, `top: list`, `bot: list`, `area: list \| None = None`, `iac: list \| None = None`, `ja: list \| None = None`, `ihc: list \| None = None`, `cl12: list \| None = None`, `hwva: list \| None = None`, `angldegx: list \| None = None`, `idomain: list \| None = None`, `vertices: list \| None = None`, `cell2d: list \| None = None`, `nvert: int \| None = None`, `gridprops_file: str \| None = None` | Grid summary |
 
 Fully unstructured (DISU) grids are defined by explicit node connectivity: `nodes`/`nja` plus `iac` (connections per node) and `ja` (connected node ids, 0-based; each node's first connection must be itself). `top`/`bot` are per-node; `area` defaults to 1.0 and `ihc`/`cl12`/`hwva` default to single-layer/unit placeholders so a connectivity-only model still runs. Optional `vertices`/`cell2d` add cell x/y geometry (needed for coordinate observations and plan-view plots). Pass `gridprops_file` (JSON) for large grids. Obs cell ids are scalar 1-based node numbers; adopter models keep working via `adopt_model`.
-| `add_npf_package` | `model: str`, `icelltype: int \| list`, `k: float \| list`, `k33: float \| list \| None`, `save_flows: bool = True`, `k_units: str = "m/d"` | Confirmation |
+| `add_npf_package` | `model: str`, `icelltype: int \| list`, `k: float \| list`, `k33: float \| list \| None`, `save_flows: bool = True`, `k_units: str = "m/d"` | Confirmation. Inline `k` arrays are for small grids: a regional field (millions of cells) exceeds the request payload, so add NPF with a scalar `k` and then assign the field with `assign_k_from_zones` (zone polygons) or `assign_k_from_raster` (per-layer GeoTIFFs), run through `start_task` when slow |
 | `add_ic_package` | `model: str`, `strt: float \| list` | Confirmation |
 | `add_sto_package` | `model: str`, `iconvert: int \| list`, `ss: float \| list`, `sy: float \| list \| None`, `steady_state: list[int] \| None`, `save_flows: bool = True` | Package summary with resolved steady/transient periods |
 | `add_csub_package` | `model: str`, `packagedata: list \| dict`, `ninterbeds: int \| None`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr: float \| list \| None`, `head_based: bool`, `initial_preconsolidation_head: bool`, `specified_initial_interbed_state: bool`, `update_material_properties: bool`, `ndelaycells: int \| None`, `beta`/`gammaw: float \| None`, `interbeddata: list \| None`, `stress_period_data: dict \| None`, `observations: dict \| None`, `filerecords: dict \| None`, `print_input: bool`, `save_flows: bool`, `pname: str \| None` | CSUB package summary (interbed count, delay count, layers, filerecords, obs CSV) |
@@ -484,9 +484,11 @@ transitions: `running` → `succeeded` | `failed` | `cancelled`.
   exits or `release_workspace_lock(model)` terminates it; a lock whose process
   has exited is cleared automatically. On server shutdown every running job's
   process tree is terminated.
-- MF6 and PEST++ are spawned with stdin detached (`DEVNULL`). The server's own
-  stdin is the MCP stdio pipe, and the forward-run wrapper trace had recorded
-  `stdin=fifo` in the pestpp chain; no child may inherit or read it.
+- MF6 and PEST++ are spawned with stdin detached (`DEVNULL`), since the
+  server's own stdin is the MCP stdio pipe. This is hygiene: an earlier A/B
+  test showed stdin inheritance does not cause the background-calibration
+  stall, which is still not root-caused. If a background job is flagged
+  `possibly_stalled`, cancel it and use the synchronous runner.
 
 ---
 
@@ -496,7 +498,7 @@ Read binary output files and compute derived quantities.
 
 | Tool | Inputs | Returns |
 |---|---|---|
-| `read_heads` | `model: str`, `kstpkper: tuple[int,int] \| None`, `layer: int = 0`, `include_values: bool = False`, `max_cells: int = 10000`, `row_slice: list[int] \| None`, `col_slice: list[int] \| None`, `decimate: int \| None` | Statistics + `output_file` (`.npy`) — values only under `include_values` within `max_cells`, else `PAYLOAD_TOO_LARGE` (7e-A1) |
+| `read_heads` | `model: str`, `kstpkper: tuple[int,int] \| None`, `layer: int = 0`, `include_values: bool = False`, `max_cells: int = 10000`, `row_slice: list[int] \| None`, `col_slice: list[int] \| None`, `decimate: int \| None`, `output_file: str \| None` | Statistics + `output_file` (`.npy`; an absolute `output_file` is honoured, a relative one resolves inside the workspace, `.npy` is appended when missing) — values only under `include_values` within `max_cells`, else `PAYLOAD_TOO_LARGE` (7e-A1) |
 | `read_concentration` | `model: str`, `ucn_file: str \| None`, `kstpkper: tuple[int,int] \| None`, `layer: int \| None = 0`, `include_values: bool = False`, `max_cells: int = 10000`, `row_slice: list[int] \| None`, `col_slice: list[int] \| None` | Statistics (`MIN`/`MAX`/`MEAN`) + `output_file` (`.npy`) from a legacy MT3D-USGS `.UCN`; `kstpkper`/`layer` 0-based (`kstpkper=None` = last record, `layer=None` = all layers); values under `include_values` within `max_cells`, else `PAYLOAD_TOO_LARGE` |
 
 `read_heads` no longer returns the full array by default (a regional layer was
@@ -514,7 +516,7 @@ Layer indices are validated against the model's `nlay` (7f-D3): `layer < 0` or `
 | `compute_water_balance` | `model: str`, `kstpkper: tuple \| None` | Inflow/outflow table by boundary type, net balance |
 | `diagnose_water_balance` | `model: str`, `kstpkper: tuple \| None`, `tolerance_pct: float = 1.0`, `dominance_threshold: float = 0.5` | `{ percent_discrepancy, balanced, dominant_inflow_term, dominant_outflow_term, dominant_term, dominant_term_share, boundary_dominated, ... }` |
 | `read_simulated_observations` | `model: str` | Per-site simulated values from the model's obs CSV at the final output time (7f-F1.2) |
-| `compare_to_observed` | `model: str`, `output_file: str \| None` | RMSE, bias, R², MAE, per-site residual table (CSV) and a scatter plot — no PEST setup needed (7f-F1.3) |
+| `compare_to_observed` | `model: str`, `output_file: str \| None` | RMSE, bias, R², MAE, per-site residual table (CSV) and a scatter plot — no PEST setup needed (7f-F1.3). `output_file` names the plot, or the residual CSV when it ends in `.csv` |
 | `read_compaction` | `model: str`, `max_rows: int = 500` | Per-layer compaction + derived cumulative `subsidence` (sum of the layer compaction columns), `interbed_strain` from `<gwf>.strainib.csv`; full table written to `<model>_compaction.csv` |
 | `plot_subsidence` | `model: str`, `observed_csv: str \| None`, `output_file: str \| None` | The PNG returned natively (ImageContent) + `{ model, output_file, n_times, has_observed, observed_csv, observed_axis }` — cumulative subsidence vs model time, with an optional observed overlay placed on the same axis (`observed_axis` = `"model-time"`/`"row-index"`) |
 | `plot_heads_map` | `model: str`, `layer: int = 0`, `kstpkper: tuple \| None`, `contour_intervals: int = 10`, `output_file: str \| None` | The PNG returned natively (ImageContent) + the saved file path |
@@ -1030,4 +1032,4 @@ All tools return a consistent error envelope on failure:
 }
 ```
 
-Common error codes: `MODEL_NOT_FOUND`, `PACKAGE_MISSING`, `BINARY_NOT_FOUND`, `CONVERGENCE_FAILED`, `OUTPUT_FILE_MISSING`, `PEST_ERROR`, `CRS_UNKNOWN`, `MODEL_ADOPTED_READONLY`, `PAYLOAD_TOO_LARGE`, `JOB_NOT_FOUND`, `START_RUN_FAILED`, `JOB_STATUS_FAILED`, `JOB_CANCEL_FAILED`, `DIAGNOSIS_FAILED`, `VALIDATION_FAILED`, `MODEL_STATUS_FAILED`, `EXPORT_FAILED`.
+Common error codes: `MODEL_NOT_FOUND`, `PACKAGE_MISSING`, `BINARY_NOT_FOUND`, `CONVERGENCE_FAILED`, `OUTPUT_FILE_MISSING`, `PEST_ERROR`, `CRS_UNKNOWN`, `MODEL_ADOPTED_READONLY`, `PAYLOAD_TOO_LARGE`, `JOB_NOT_FOUND`, `START_RUN_FAILED`, `JOB_STATUS_FAILED`, `JOB_CANCEL_FAILED`, `WORKSPACE_BUSY`, `RELEASE_FAILED`, `DIAGNOSIS_FAILED`, `VALIDATION_FAILED`, `MODEL_STATUS_FAILED`, `EXPORT_FAILED`.

@@ -85,6 +85,14 @@ calibrated model (about ten seconds, results in
 uv run python examples/catchment_walkthrough.py
 ```
 
+A second example tracks particles to a pumping well with MODPATH 7 and checks
+the capture-zone width against the analytical `Q / (K b i)`
+([docs/examples/capture-zone.md](docs/examples/capture-zone.md)):
+
+```bash
+uv run python examples/capture_zone.py
+```
+
 ---
 
 ## Install
@@ -123,6 +131,20 @@ Linux: `~/.config/Claude/`), pointing `--directory` at your clone:
   }
 }
 ```
+
+### Troubleshooting
+
+Every tool failure returns `{"error": true, "code", "message", "suggestion"}`.
+The common ones:
+
+| Code | Usual cause | What to do |
+|---|---|---|
+| `BINARY_NOT_FOUND` | `mf6`, `mp7` or a `pestpp-*` binary is not installed | `uv run get-modflow :` / `uv run get-pestpp :`, then `check_environment` |
+| `CRS_UNKNOWN` | a shapefile/raster tool or export ran on a grid with no CRS | `set_model_crs`, or build the grid with `import_grid_from_shapefile` |
+| `CONVERGENCE_FAILED` | MODFLOW 6 did not converge | `diagnose_convergence` names the likely cause; `run_simulation(auto_fix=True)` tries a bounded solver ladder |
+| `WORKSPACE_BUSY` | another MF6/PEST++ process is running in the model workspace | wait (`get_job_status`), stop it (`cancel_job`), or clear an orphan from an earlier session (`release_workspace_lock`) |
+| `PAYLOAD_TOO_LARGE` | an inline array would exceed the response size | read the `.npy`/CSV the tool wrote, or subset (`row_slice`, `decimate`) |
+| MCP `-32001` timeout | a long call outlived the client's timeout (it usually finishes server-side) | use `start_run`, `start_calibration` or `start_task` and poll `get_job_status` |
 
 ---
 

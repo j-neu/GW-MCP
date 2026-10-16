@@ -3655,7 +3655,10 @@ def register(mcp) -> None:
         rate_units declares the units of RCH/EVT/RCHA/EVTA rates (default None
         = rates are already in the model's units); accepted: m/d, m/yr, mm/d,
         mm/yr. Rates are converted into the model's own length unit per its time
-        unit on entry.
+        unit on entry. Every other value is taken as already in model units and
+        never converted: WEL rates are volume per model time unit (L³/T,
+        negative = pumping; a source in m³/s on a DAYS model needs x 86400),
+        RIV/DRN/GHB conductance is L²/T, stages and heads are lengths.
 
         pname names the package in the model name file. Re-adding a package
         with the same pname (or with no pname) replaces the existing one(s) of

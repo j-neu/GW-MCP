@@ -250,6 +250,22 @@ def test_read_heads_returns_expected_keys(ran_model):
 
 
 @requires_mf6
+def test_read_heads_honours_output_file(ran_model, tmp_path):
+    """An absolute output_file is written there; a relative one inside the
+    workspace; the .npy suffix is added when missing (R4.1 backlog)."""
+    target = tmp_path / "elsewhere" / "ref_heads.npy"
+    result = _impl_read_heads(ran_model, output_file=str(target))
+    assert result["output_file"] == str(target)
+    assert np.load(target).shape == (5, 5)
+
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    rel = _impl_read_heads(ran_model, output_file="sub/heads_l0")
+    assert rel["output_file"] == str(resolve_workspace(ran_model) / "sub" / "heads_l0.npy")
+    assert Path(rel["output_file"]).exists()
+
+
+@requires_mf6
 def test_read_heads_values_in_range(ran_model):
     result = _impl_read_heads(ran_model, layer=0, include_values=True)
     # CHD boundaries at 3 and 8 m — all heads should be in [3, 8]

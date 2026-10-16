@@ -124,11 +124,17 @@ def _impl_import_grid_from_shapefile(
     method = method.lower()
 
     if method == "dis":
+        if layer_surfaces and len(layer_surfaces) != nlay + 1:
+            raise ValueError(
+                f"layer_surfaces needs nlay + 1 = {nlay + 1} rasters (the top, then "
+                f"one bottom per layer); got {len(layer_surfaces)}. To set only the "
+                "top from a DEM, omit layer_surfaces and call assign_top_from_raster."
+            )
         props = dis_grid_props_from_shapefile(shapefile, cell_size, target_crs)
         nrow, ncol = props["nrow"], props["ncol"]
 
         # Build flat layer tops/bottoms unless layer_surfaces provided
-        if layer_surfaces and len(layer_surfaces) == nlay + 1:
+        if layer_surfaces:
             # Sample each surface raster at cell centroids (flat pass for now —
             # full surface assignment happens via assign_top_from_raster)
             top = _sample_surface(layer_surfaces[0], props, nrow, ncol)
@@ -1582,8 +1588,13 @@ def _impl_import_river_from_shapefile(
     bed_k: float | None = None,
     bed_thickness: float | None = None,
     channel_width: float | None = None,
+    layer: int = 0,
 ) -> dict:
-    """Intersect river/drain polylines with the model grid and add boundary package."""
+    """Intersect river/drain polylines with the model grid and add boundary package.
+
+    Reaches go to model ``layer`` (0-based); reaches whose cell is inactive in
+    that layer are skipped and counted in ``reaches_inactive_skipped``.
+    """
     from groundwater_mcp.tools.builder import _BOUNDARY_PKG_CLASSES
     from groundwater_mcp.utils.spatial import CRSError, intersect_lines_with_dis_grid
 
@@ -1598,6 +1609,10 @@ def _impl_import_river_from_shapefile(
     dis_pkg = get_dis(gwf)
     if dis_pkg is None:
         raise RuntimeError("import_river_from_shapefile currently supports DIS grids only.")
+    nlay = int(dis_pkg.nlay.data)
+    if not (0 <= int(layer) < nlay):
+        raise ValueError(f"layer {layer} out of range for model with {nlay} layers.")
+    layer = int(layer)
 
     attr_cols = [c for c in [stage_field, cond_field, depth_field] if c]
     try:
@@ -1628,6 +1643,29 @@ def _impl_import_river_from_shapefile(
             "Check that the shapefile and model grid are in the same CRS and that "
             "the river network falls inside the grid extent.",
         )
+
+    # Place every reach in the requested layer and drop the ones on inactive
+    # cells there (a boundary on an idomain<=0 cell is ignored by MF6 at best).
+    idomain = getattr(dis_pkg, "idomain", None)
+    active = (
+        np.asarray(idomain.array)[layer] > 0
+        if idomain is not None and idomain.array is not None
+        else None
+    )
+    placed = []
+    inactive_skipped = 0
+    for reach in reaches:
+        _lay, r, c = reach["cellid"]
+        if active is not None and not active[r, c]:
+            inactive_skipped += 1
+            continue
+        placed.append({**reach, "cellid": (layer, r, c)})
+    if not placed:
+        raise ValueError(
+            f"Every intersected reach falls on an inactive cell of layer {layer}; "
+            "nothing to add."
+        )
+    reaches = placed
 
     # Optional stage-from-raster: sample the raster at each reach's cell
     # centroid; stage = sampled elevation - stage_offset.
@@ -1720,6 +1758,8 @@ def _impl_import_river_from_shapefile(
         "model": model,
         "package": pkg_name,
         "reach_count": len(reaches),
+        "layer": layer,
+        "reaches_inactive_skipped": inactive_skipped,
         "stage_source": "raster" if stage_raster else ("attribute" if stage_field else "default"),
         "stress_periods": {sp: len(spd[sp]) for sp in sps},
         "written": written,
@@ -2314,6 +2354,11 @@ def register(mcp) -> None:
         polygon (cells outside = IDOMAIN -1). For method='disv', creates a Voronoi
         unstructured grid with seed points inside the polygon.
         Requires set_simulation to have been called first.
+
+        layer_surfaces (DIS only) takes nlay + 1 GeoTIFFs: the top, then one
+        bottom per layer; any other count is INVALID_INPUT. Without it the
+        layers are flat (top 0, 1 m each): set elevations afterwards with
+        assign_top_from_raster (layer=0 top, layer=N bottom of layer N).
         """
         try:
             return _impl_import_grid_from_shapefile(
@@ -2644,8 +2689,13 @@ def register(mcp) -> None:
         bed_k: float | None = None,
         bed_thickness: float | None = None,
         channel_width: float | None = None,
+        layer: int = 0,
     ) -> dict:
         """Build RIV, DRN, or GHB stress period data from a river/drain shapefile.
+
+        Reaches are placed in model `layer` (0-based, default 0); reaches on
+        cells inactive in that layer are skipped and reported as
+        reaches_inactive_skipped.
 
         Intersects the river network with the model grid. By default the reaches
         are written for stress period 0 only; MODFLOW 6 reuses a list package's
@@ -2695,6 +2745,7 @@ def register(mcp) -> None:
                 bed_k,
                 bed_thickness,
                 channel_width,
+                layer,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -2724,6 +2775,11 @@ def register(mcp) -> None:
         allow_outside: bool = False,
     ) -> dict:
         """Import head or flow observations from a CSV file.
+
+        Expected columns (names configurable): site_col (default "site"),
+        date_col ("date"), value_col ("value"), plus x_col/y_col or cellid_col
+        for the location. A CSV whose value column is named e.g. "head_m"
+        needs value_col="head_m"; a missing column is INVALID_INPUT.
 
         In coordinate mode a site farther than about one cell beyond the grid
         fails with INVALID_INPUT (usually a CRS or unit mistake) unless
