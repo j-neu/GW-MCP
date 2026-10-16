@@ -90,6 +90,20 @@ register_component(
 )
 
 register_component(
+    "gwt",
+    model_class=mf6.ModflowGwt,
+    grid_classes={
+        "dis": mf6.ModflowGwtdis,
+        "disv": mf6.ModflowGwtdisv,
+        "disu": mf6.ModflowGwtdisu,
+    },
+    ic_class=mf6.ModflowGwtic,
+    oc_class=mf6.ModflowGwtoc,
+    oc_value_keyword="concentration_filerecord",
+    exchange_class=mf6.ModflowGwfgwt,
+)
+
+register_component(
     "prt",
     model_class=mf6.ModflowPrt,
     grid_classes={"dis": mf6.ModflowPrtdis, "disv": mf6.ModflowPrtdisv},

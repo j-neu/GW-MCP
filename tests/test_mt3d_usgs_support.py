@@ -104,8 +104,11 @@ def test_legacy_round_trip(tmp_path: Path):
     assert transport.version == "mt3d-usgs"
 
     ucn = fu.UcnFile(str(ws / "MT3D001.UCN"))
-    assert ucn.get_kstpkper() == [(0, 0)]
-    data = ucn.get_data(kstpkper=(0, 0))
+    try:
+        assert ucn.get_kstpkper() == [(0, 0)]
+        data = ucn.get_data(kstpkper=(0, 0))
+    finally:
+        ucn.close()  # an open handle here is GC'd inside a later test's window
     assert np.asarray(data).shape == (1, 3, 4)
     assert float(np.asarray(data).max()) == 11.0
 
@@ -381,6 +384,9 @@ def test_read_concentration_closes_ucn_handle(tmp_path: Path):
 
     name, ws = _adopt(tmp_path, "m18")
     _write_ucn(ws / "MT3D001.UCN", [(1, 1, 1.0, np.ones((1, 3, 4)))])
+    # Reap handles leaked by earlier tests (flopy's package loaders leave some
+    # open) before recording, so only a leak from the call under test counts.
+    gc.collect()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ResourceWarning)
         _impl_read_concentration(name)

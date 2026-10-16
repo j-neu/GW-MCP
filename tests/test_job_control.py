@@ -658,3 +658,82 @@ def test_setup_calibration_heals_empty_externalised_target(tmp_path):
         cal._impl_setup_calibration(name, "not-a-dict", obs_source="derived")
 
     assert target.read_text().strip(), "setup_calibration did not heal the empty target"
+
+
+# ---------------------------------------------------------------------------
+# Stall detection (R3.3): report idleness, never kill
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    """A controllable monotonic clock for the jobs module."""
+    from groundwater_mcp.utils import jobs
+
+    state = {"t": 1000.0}
+    monkeypatch.setattr(jobs, "_now", lambda: state["t"])
+    return state
+
+
+def _blocked_job(progress):
+    import threading
+
+    from groundwater_mcp.utils import jobs
+
+    release = threading.Event()
+    job = jobs.submit(
+        "stallmodel", "ies", lambda j: (release.wait(10) or {}),
+        progress_fn=lambda j: dict(progress),
+    )
+    return job, release
+
+
+def test_status_reports_idle_time_and_flags_a_stalled_job(clock):
+    from groundwater_mcp.utils import jobs
+
+    progress = {"iteration": 2, "latest_phi": 14.0}
+    job, release = _blocked_job(progress)
+    try:
+        first = jobs.get_status(job.job_id)
+        assert first["idle_s"] == 0 and first["possibly_stalled"] is False
+
+        clock["t"] += 3000.0
+        later = jobs.get_status(job.job_id)
+        assert later["idle_s"] == pytest.approx(3000.0)
+        assert later["possibly_stalled"] is True
+        assert "cancel_job" in later["stall_note"]
+        assert later["status"] == "running"  # reported, never killed
+    finally:
+        release.set()
+        jobs.cancel(job.job_id)
+
+
+def test_progress_change_resets_the_idle_clock(clock):
+    from groundwater_mcp.utils import jobs
+
+    progress = {"iteration": 1}
+    job, release = _blocked_job(progress)
+    try:
+        jobs.get_status(job.job_id)
+        clock["t"] += 3000.0
+        progress["iteration"] = 2
+        status = jobs.get_status(job.job_id)
+        assert status["idle_s"] == 0 and status["possibly_stalled"] is False
+    finally:
+        release.set()
+        jobs.cancel(job.job_id)
+
+
+def test_finished_jobs_carry_no_stall_fields(clock):
+    import time
+
+    from groundwater_mcp.utils import jobs
+
+    job = jobs.submit("stallmodel", "mf6", lambda j: {"ok": True})
+    for _ in range(100):
+        if jobs.get_status(job.job_id)["status"] != "running":
+            break
+        time.sleep(0.01)
+    status = jobs.get_status(job.job_id)
+    assert status["status"] == "succeeded"
+    assert "idle_s" not in status and "possibly_stalled" not in status

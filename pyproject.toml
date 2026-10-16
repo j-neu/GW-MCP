@@ -8,8 +8,30 @@ authors = [
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = [
+    "MODFLOW",
+    "MODFLOW 6",
+    "MCP",
+    "model context protocol",
+    "groundwater",
+    "hydrogeology",
+    "calibration",
+    "PEST++",
+    "FloPy",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     "flopy>=3.7",
     "pyemu>=1.3",
     "geopandas>=0.14",
@@ -31,6 +53,11 @@ dev = [
     "mypy>=1.10",
 ]
 
+[project.urls]
+Homepage = "https://github.com/j-neu/GW-MCP"
+Issues = "https://github.com/j-neu/GW-MCP/issues"
+Changelog = "https://github.com/j-neu/GW-MCP/blob/main/CHANGELOG.md"
+
 [project.scripts]
 groundwater-mcp = "groundwater_mcp.server:main"
 
@@ -44,6 +71,10 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures and expected strings are often long literals.
+"tests/*" = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -58,7 +58,7 @@ requires_mf6 = pytest.mark.skipif(
 # Tool listing
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 92
+_EXPECTED_TOOL_COUNT = 109
 
 # Keep in sync with the tool tables in README.md / tools.md / architecture.md
 # (7e-B18).
@@ -73,6 +73,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "assign_ic_from_raster",
         "assign_array_from_raster",
         "import_river_from_shapefile",
+        "import_boundary_from_shapefile",
         "import_obs_from_csv",
         "import_subsidence_observations",
     ],
@@ -105,6 +106,7 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "diagnose_convergence",
         "validate_model",
         "start_run",
+        "start_task",
         "get_job_status",
         "cancel_job",
     ],
@@ -136,6 +138,10 @@ _EXPECTED_TOOLS: dict[str, list[str]] = {
         "run_pestpp_ies",
         "run_pestpp_da",
         "summarise_calibration",
+        "apply_calibration_result",
+        "run_pestpp_sen",
+        "run_pestpp_sweep",
+        "run_pestpp_opt",
         "summarise_da",
         "run_ies_uncertainty",
         "check_parameter_sensitivity",

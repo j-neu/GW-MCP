@@ -439,6 +439,23 @@ def clear_csub_base_snapshot(model: str, gwf_name: str) -> bool:
     return removed
 
 
+def clear_sto_base_snapshot(model: str, gwf_name: str) -> bool:
+    """Delete ``setup_calibration``'s pristine STO ``ss``/``sy`` snapshots.
+
+    ``add_sto_package`` calls this so a deliberately changed storage package is
+    re-snapshotted at the next setup instead of being reverted. Returns
+    ``True`` when at least one snapshot was removed.
+    """
+    ws = resolve_workspace(model)
+    removed = False
+    for keyword in ("ss", "sy"):
+        path = ws / f"{gwf_name}_csub_{keyword}_pristine.npy"
+        if path.exists():
+            path.unlink()
+            removed = True
+    return removed
+
+
 def is_dirty(name: str) -> bool:
     """Return whether a model has staged in-memory changes not yet flushed."""
     return bool(_dirty.get(name))
@@ -486,7 +503,7 @@ def get_component_sim(name: str, component: str) -> mf6.MFSimulation:
             return sim
     raise KeyError(
         f"No '{component}' simulation for model '{name}'. "
-        f"Call add_gwe_model('{name}') first."
+        f"Call add_{component}_model('{name}') first."
     )
 
 

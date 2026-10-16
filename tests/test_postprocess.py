@@ -87,7 +87,7 @@ def synthetic_hds(runnable_model):
 
     # Write a minimal binary head file using flopy's HeadFile writer
     # Shape: 1 layer, 5 rows, 5 cols
-    nlay, nrow, ncol = 1, 5, 5
+    nrow, ncol = 5, 5
     heads = np.linspace(8.0, 3.0, ncol * nrow).reshape(nrow, ncol)
 
     # Use flopy's binary writer utilities
@@ -738,3 +738,109 @@ def test_compute_drawdown_payload_guard(large_ran_model):
     small = _impl_compute_drawdown(large_ran_model, (0, 0), (0, 0), layer=0)
     assert "values" not in small
     assert "output_file" in small
+
+
+# ---------------------------------------------------------------------------
+# Transient budgets without saved storage flows (R4.2)
+# ---------------------------------------------------------------------------
+
+
+def _transient_model(tmp_path, name: str, sto_save_flows: bool) -> str:
+    """Transient CHD-fed model; storage soaks up most of the inflow."""
+    import flopy.mf6 as mf6
+
+    from groundwater_mcp.tools.builder import _impl_adopt_model
+
+    ws = tmp_path / name
+    ws.mkdir()
+    sim = mf6.MFSimulation(sim_name="mfsim", version="mf6", sim_ws=str(ws))
+    gwf = mf6.ModflowGwf(sim, modelname="tr")
+    mf6.ModflowTdis(sim, nper=1, perioddata=[(10.0, 5, 1.0)])
+    mf6.ModflowIms(sim, complexity="SIMPLE")
+    mf6.ModflowGwfdis(gwf, nlay=1, nrow=3, ncol=6, delr=10.0, delc=10.0, top=10.0, botm=[0.0])
+    mf6.ModflowGwfnpf(gwf, k=0.5)
+    mf6.ModflowGwfic(gwf, strt=2.0)
+    mf6.ModflowGwfchd(
+        gwf, stress_period_data={0: [[(0, r, 0), 8.0] for r in range(3)]}, save_flows=True
+    )
+    mf6.ModflowGwfsto(
+        gwf, ss=1e-4, sy=0.2, iconvert=1, transient={0: True}, save_flows=sto_save_flows
+    )
+    mf6.ModflowGwfoc(
+        gwf,
+        budget_filerecord="tr.cbb",
+        head_filerecord="tr.hds",
+        saverecord=[("BUDGET", "ALL"), ("HEAD", "ALL")],
+    )
+    sim.write_simulation(silent=True)
+    _impl_adopt_model(name, str(ws))
+    return name
+
+
+@requires_mf6
+def test_water_balance_flags_missing_storage_flows(tmp_path):
+    name = _transient_model(tmp_path, "tr_nosave", sto_save_flows=False)
+    assert _impl_run_simulation(name).get("success") is True
+
+    wb = _impl_compute_water_balance(name)
+    assert wb["storage_flows_missing"] is True
+    assert "SAVE_FLOWS" in wb["warning"]
+
+    diag = _impl_diagnose_water_balance(name)
+    assert diag["balanced"] is None
+    assert diag["storage_flows_missing"] is True
+    assert "STO" in diag["balance_note"]
+
+
+@requires_mf6
+def test_water_balance_closes_when_storage_flows_saved(tmp_path):
+    name = _transient_model(tmp_path, "tr_save", sto_save_flows=True)
+    assert _impl_run_simulation(name).get("success") is True
+
+    wb = _impl_compute_water_balance(name)
+    assert wb["storage_flows_missing"] is False
+    diag = _impl_diagnose_water_balance(name)
+    assert diag["balanced"] is True
+
+
+def test_save_figure_resolves_relative_path_against_workspace(tmp_path, monkeypatch):
+    """A relative output path must land in the model workspace, not in the
+    MCP server process's working directory (R4.3)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from groundwater_mcp.utils.plotting import save_figure
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    fig, ax = plt.subplots()
+    ax.plot([0, 1])
+    out = save_figure(fig, "heads.png", workspace)
+    plt.close(fig)
+
+    assert Path(out) == workspace / "heads.png"
+    assert (workspace / "heads.png").exists()
+    assert not (cwd / "heads.png").exists()
+
+
+def test_save_figure_keeps_absolute_path(tmp_path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from groundwater_mcp.utils.plotting import save_figure
+
+    target = tmp_path / "out" / "fig.png"
+    target.parent.mkdir()
+    fig, ax = plt.subplots()
+    ax.plot([0, 1])
+    out = save_figure(fig, str(target), tmp_path / "ws_unused")
+    plt.close(fig)
+    assert Path(out) == target and target.exists()

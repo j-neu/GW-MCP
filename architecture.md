@@ -6,7 +6,7 @@ An open-source Python MCP server for AI-assisted groundwater modelling with MODF
 
 ## Overview
 
-The server exposes 92 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
+The server exposes 109 tools across 7 modules, plus 2 MCP prompts and 3 MCP resource templates, running locally over stdio transport. All computation happens on the user's machine — no external API calls, no waitlist, no paywall.
 
 ```
   [geodata-mcp]          Claude / AI client
@@ -108,9 +108,9 @@ groundwater-mcp/
 │   └── ...
 ├── pyproject.toml
 ├── README.md
-├── ARCHITECTURE.md
-├── TOOLS.md
-└── TASKS.md
+├── architecture.md
+├── tools.md
+└── tasks.md
 ```
 
 ---
@@ -155,7 +155,7 @@ and getting-started exercises) is sealed in the sibling holdout folder
 pre-registered validation protocol (Mode A replay via `GW_MCP_HOLDOUT` env var,
 Mode B manual sessions). Holdout data never enters `tests/fixtures/`.
 
-See `TASKS.md` Phase 6 for the full test checklist.
+See `tasks.md` Phase 6 for the full test checklist.
 
 ---
 
@@ -171,7 +171,7 @@ See `TASKS.md` Phase 6 for the full test checklist.
 ### Known deviations from these principles (audit 2026-08-17b)
 
 Recorded here so the document describes the code as it is, not only as
-intended. Each has atomic remediation tasks in `TASKS.md` § 7e.
+intended. Each has atomic remediation tasks in `tasks.md` § 7e.
 
 **Fixed by the 7f-D gate work (2026-08-17e):** the "fail loudly" principle is
 now enforced on the spatial/data layer. `stage_raster` sampling fails with

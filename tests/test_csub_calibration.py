@@ -942,8 +942,8 @@ def test_derived_time_axis_matches_elapsed_days_to_non_january_dates(tmp_path):
     the CSUB obs CSV ``time`` column is elapsed days while the observations are
     calendar dates (Critical 1).
     """
-    from groundwater_mcp.tools.calibration import _derived_observation_plan
     from groundwater_mcp.tools.builder import _impl_set_simulation
+    from groundwater_mcp.tools.calibration import _derived_observation_plan
 
     name = _csub_model(tmp_path, nlay=1)
     # Re-anchor the model to a non-January-1 start date.

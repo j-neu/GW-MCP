@@ -245,6 +245,30 @@ def test_tiny_csub_derived_setup_assembles_full_chain(tmp_path):
 
 
 @requires_mf6
+def test_tiny_csub_sensitivity_screen_uses_derived_observations(tmp_path):
+    """R3.6: the n+1 screen measures sensitivity against the subsidence series."""
+    from groundwater_mcp.tools.calibration import _impl_check_parameter_sensitivity
+
+    name = _build_tiny_csub(tmp_path, "sens")
+    _run_base_and_register_observed(tmp_path, name)
+    setup = _impl_setup_calibration(
+        name, _csub_spec(), obs_source="derived", noptmax=2
+    )
+    assert "error" not in setup, setup
+    params = {p["name"]: p["initial"] for p in setup["parameters"]}
+
+    out = _impl_check_parameter_sensitivity(
+        name, params, setup["template_files"], delta=0.2
+    )
+    assert "error" not in out, out
+    results = out["sensitivity"] if "sensitivity" in out else out["parameters"]
+    values = [r["sensitivity"] for r in results.values()]
+    assert values and all(v is not None for v in values), out
+    # Subsidence responds to at least one compressibility parameter.
+    assert max(values) > 1e-6, out
+
+
+@requires_mf6
 @requires_pestpp_ies
 def test_tiny_csub_calibration_end_to_end(tmp_path):
     """The whole chain: build → register → setup → pestpp-ies completes."""

@@ -30,7 +30,7 @@ def test_grid_classes_resolve_per_component():
 
 def test_unknown_component_raises_value_error():
     with pytest.raises(ValueError, match="Unknown component"):
-        components.spec_for("gwt")
+        components.spec_for("not_a_component")
 
 
 def test_register_component_extends_registry():

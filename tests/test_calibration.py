@@ -47,6 +47,12 @@ requires_pestpp = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
+# Every parameter token of the calib_workspace template file.
+_ALL_PARS = {"k": {"parval1": 10.0}, "ss": {"parval1": 0.001}}
+# Every observation token of the calib_workspace instruction file.
+_ALL_OBS = {f"h{i}": {"obsval": 5.0, "weight": 1.0} for i in range(1, 6)}
+
+
 def _write_minimal_tpl(path: Path, par_names: list[str]) -> None:
     """Write a minimal PEST++ template file defining par_names."""
     lines = ["ptf ~"]
@@ -289,8 +295,8 @@ def test_setup_pest_control_returns_expected_keys(pst_model):
 
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"k": {"parval1": 10.0, "parlbnd": 0.1, "parubnd": 1000.0}},
+        obs_data=_ALL_OBS,
+        par_data={**_ALL_PARS, "k": {"parval1": 10.0, "parlbnd": 0.1, "parubnd": 1000.0}},
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
     )
@@ -347,8 +353,8 @@ def test_setup_pest_control_writes_relative_io_paths(calib_workspace):
     ws = resolve_workspace(model)
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"k": {"parval1": 10.0}},
+        obs_data=_ALL_OBS,
+        par_data=_ALL_PARS,
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
     )
@@ -371,8 +377,8 @@ def test_setup_pest_control_model_command_written_as_list(calib_workspace):
     ws = resolve_workspace(model)
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"k": {"parval1": 10.0}},
+        obs_data=_ALL_OBS,
+        par_data=_ALL_PARS,
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
         pestpp_options={"model_command_line": "mf6 mfsim.nam"},
@@ -394,8 +400,8 @@ def test_setup_pest_control_input_files_override(calib_workspace):
     ws = resolve_workspace(model)
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"k": {"parval1": 10.0}},
+        obs_data=_ALL_OBS,
+        par_data=_ALL_PARS,
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
         pestpp_options={"input_files": ["hk.dat"]},
@@ -412,8 +418,8 @@ def test_setup_pest_control_input_files_len_mismatch(calib_workspace):
     with pytest.raises(ValueError, match="len\\(input_files\\)"):
         _impl_setup_pest_control(
             model=model,
-            obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-            par_data={"k": {"parval1": 10.0}},
+            obs_data=_ALL_OBS,
+            par_data=_ALL_PARS,
             template_files=[str(ws / "params.tpl")],
             instruction_files=[str(ws / "heads.ins")],
             pestpp_options={"input_files": ["a", "b"]},
@@ -428,8 +434,8 @@ def test_setup_pest_control_warns_on_windows_bat_command(calib_workspace, monkey
     monkeypatch.setattr("groundwater_mcp.tools.calibration.platform.system", lambda: "Windows")
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"k": {"parval1": 10.0}},
+        obs_data=_ALL_OBS,
+        par_data=_ALL_PARS,
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
         pestpp_options={"model_command": ["run_model.bat"]},
@@ -443,8 +449,8 @@ def test_setup_pest_control_model_command_list_form(calib_workspace):
     ws = resolve_workspace(model)
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"h1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"k": {"parval1": 10.0}},
+        obs_data=_ALL_OBS,
+        par_data=_ALL_PARS,
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
         pestpp_options={"model_command": ['"C:/path with spaces/mf6.exe"']},
@@ -462,7 +468,7 @@ def test_setup_pest_control_raises_on_unmatched_obs(calib_workspace):
         _impl_setup_pest_control(
             model=model,
             obs_data={"h1": {"obsval": 5.0}, "nope": {"obsval": 1.0}},
-            par_data={"k": {"parval1": 10.0}},
+            par_data=_ALL_PARS,
             template_files=[str(ws / "params.tpl")],
             instruction_files=[str(ws / "heads.ins")],
         )
@@ -474,8 +480,8 @@ def test_setup_pest_control_raises_on_unmatched_par(calib_workspace):
     with pytest.raises(ValueError, match="not found in the template"):
         _impl_setup_pest_control(
             model=model,
-            obs_data={"h1": {"obsval": 5.0}},
-            par_data={"k": {"parval1": 10.0}, "nope": {"parval1": 1.0}},
+            obs_data=_ALL_OBS,
+            par_data={**_ALL_PARS, "nope": {"parval1": 1.0}},
             template_files=[str(ws / "params.tpl")],
             instruction_files=[str(ws / "heads.ins")],
         )
@@ -488,8 +494,8 @@ def test_setup_pest_control_obs_alignment_case_insensitive(calib_workspace):
     ws = resolve_workspace(model)
     result = _impl_setup_pest_control(
         model=model,
-        obs_data={"H1": {"obsval": 5.0, "weight": 1.0}},
-        par_data={"K": {"parval1": 10.0}},
+        obs_data={name.upper(): attrs for name, attrs in _ALL_OBS.items()},
+        par_data={name.upper(): attrs for name, attrs in _ALL_PARS.items()},
         template_files=[str(ws / "params.tpl")],
         instruction_files=[str(ws / "heads.ins")],
     )
@@ -1250,3 +1256,61 @@ def test_integration_full_calibration_chain_windows(tmp_path, model_name):
     assert "error" not in summary
     assert len(summary["parameter_estimates"]) == 1
     assert summary["parameter_estimates"][0]["name"] == "kmult"
+
+
+# ---------------------------------------------------------------------------
+# setup_pest_control — instruction tokens with no supplied observation (R4.2)
+# ---------------------------------------------------------------------------
+
+
+def _setup_partial_obs(model, **kwargs):
+    ws = resolve_workspace(model)
+    return _impl_setup_pest_control(
+        model=model,
+        obs_data={"h1": {"obsval": 5.0}},
+        par_data={"k": {"parval1": 10.0}, "ss": {"parval1": 0.001}},
+        template_files=[str(ws / "params.tpl")],
+        instruction_files=[str(ws / "heads.ins")],
+        **kwargs,
+    )
+
+
+def test_setup_pest_control_raises_on_unsupplied_instruction_obs(calib_workspace):
+    """Instruction tokens missing from obs_data must not become weight-1
+    observations with pyemu's 1e10 placeholder value (freyberg: phi 6.5e22)."""
+    with pytest.raises(ValueError, match="unlisted_obs") as excinfo:
+        _setup_partial_obs(calib_workspace)
+    assert "h2" in str(excinfo.value)
+
+
+def test_setup_pest_control_zero_weights_unsupplied_obs_on_request(calib_workspace):
+    import pyemu
+
+    result = _setup_partial_obs(calib_workspace, unlisted_obs="zero_weight")
+    obs = pyemu.Pst(result["pst_file"]).observation_data
+    assert obs.loc["h1", "weight"] == 1.0
+    assert (obs.loc[["h2", "h3", "h4", "h5"], "weight"] == 0.0).all()
+    assert (obs["obsval"].abs() < 1e9).all()
+    assert result["n_observations_zero_weight"] == 4
+
+
+def test_setup_pest_control_rejects_unknown_unlisted_obs_mode(calib_workspace):
+    with pytest.raises(ValueError, match="unlisted_obs must be"):
+        _setup_partial_obs(calib_workspace, unlisted_obs="ignore")
+
+
+def test_setup_pest_control_raises_on_unsupplied_template_par(calib_workspace):
+    """A template token missing from par_data must not be written with pyemu's
+    placeholder (parval1 1.0, bounds 1.1e-10..1.1e10) — it would put 1.0 into
+    the model input (R4.2)."""
+    model = calib_workspace
+    ws = resolve_workspace(model)
+    with pytest.raises(ValueError, match="no entry in par_data") as excinfo:
+        _impl_setup_pest_control(
+            model=model,
+            obs_data=_ALL_OBS,
+            par_data={"k": {"parval1": 10.0}},
+            template_files=[str(ws / "params.tpl")],
+            instruction_files=[str(ws / "heads.ins")],
+        )
+    assert "ss" in str(excinfo.value)

@@ -333,7 +333,9 @@ def _impl_export_model_report(model: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _impl_clone_model(source: str, name: str, workspace: str) -> dict:
+def _impl_clone_model(
+    source: str, name: str, workspace: str, allow_modify: bool = True
+) -> dict:
     if len(name) > 16:
         raise ValueError(
             f"Model name '{name}' is {len(name)} characters; MODFLOW 6 caps "
@@ -343,19 +345,28 @@ def _impl_clone_model(source: str, name: str, workspace: str) -> dict:
     flush_model(source)
     dst = create_workspace(name, workspace or None)
 
+    # Walk the whole tree: external OPEN/CLOSE arrays (and component
+    # simulations) live in subdirectories, and a clone that drops them cannot
+    # load (R4.2). Hidden files/dirs and run outputs are skipped.
     _OUTPUT_SUFFIXES = (".hds", ".cbb", ".cbc", ".lst")
-    for f in src_ws.iterdir():
-        if not f.is_file() or f.name.startswith("."):
+    for f in src_ws.rglob("*"):
+        rel = f.relative_to(src_ws)
+        if not f.is_file() or any(part.startswith(".") for part in rel.parts):
             continue
         if f.suffix in _OUTPUT_SUFFIXES:
             continue
         if f.suffix == ".csv" and ("_obs.csv" in f.name or "_obs_summary" in f.name):
             continue
-        shutil.copy2(f, dst / f.name)
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
 
     meta = read_meta(source)
     meta["name"] = name
     meta["cloned_from"] = source
+    # A clone is a working copy: the read-only guard protects the adopted
+    # original, so the clone is writable unless asked otherwise (R4.2).
+    meta["allow_modify"] = bool(allow_modify)
     write_meta(name, meta)
 
     sim = mf6.MFSimulation.load(sim_ws=str(dst), verbosity_level=0)
@@ -366,6 +377,7 @@ def _impl_clone_model(source: str, name: str, workspace: str) -> dict:
         "workspace": str(dst),
         "cloned_from": source,
         "model_names": list(sim.model_names),
+        "read_only": bool(meta.get("adopted")) and not allow_modify,
     }
 
 
@@ -520,12 +532,17 @@ def register(mcp: FastMCP) -> None:
             return _err("REPORT_FAILED", str(exc))
 
     @mcp.tool()
-    def clone_model(source: str, name: str, workspace: str = "") -> dict:
+    def clone_model(
+        source: str, name: str, workspace: str = "", allow_modify: bool = True
+    ) -> dict:
         """Copy a model to a new registered workspace so a scenario does not
-        destroy the base model. Binary outputs are not copied; run the clone
-        to produce fresh outputs."""
+        destroy the base model. The whole workspace tree is copied (external
+        OPEN/CLOSE arrays included); binary outputs are not, so run the clone
+        to produce fresh outputs. The clone accepts edits even when the source
+        is a read-only adopted model — adopt the original untouched and work
+        on clones; pass allow_modify=False for a read-only clone."""
         try:
-            return _impl_clone_model(source, name, workspace)
+            return _impl_clone_model(source, name, workspace, allow_modify)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:

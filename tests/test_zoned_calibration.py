@@ -594,7 +594,7 @@ def test_setup_calibration_non_zoned_unchanged(tmp_path):
     name = _build_zoned_model(tmp_path)
     _register_obs(tmp_path, name)
     result = _impl_setup_calibration(
-        name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+        name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0, "allow_flatten": True}}
     )
     assert "error" not in result, result
     assert "zones" not in result
@@ -741,7 +741,7 @@ def test_setup_calibration_repeatable_preserves_base_k(tmp_path):
     # destroy the base field that later setups parameterise from.
     invalidate(name)
     r2 = _impl_setup_calibration(
-        name, {"k": {"target": "npf:k", "scope": "all", "initial": 1.0}}
+        name, {"k": {"target": "npf:k", "scope": "all", "initial": 1.0, "allow_flatten": True}}
     )
     assert "error" not in r2, r2
 
@@ -790,3 +790,40 @@ def test_setup_calibration_re_snapshots_after_k_change(tmp_path):
     )
     assert "error" not in r, r
     assert [z["base_k"] for z in r["zones"]] == [2.0, 7.0], r["zones"]
+
+
+def test_apply_calibration_result_rebuilds_zoned_k_from_multipliers(tmp_path):
+    """Zone multipliers scale the *base* K pattern: the written-back field must
+    keep the two-zone pattern and apply each zone's calibrated factor."""
+    import pyemu
+
+    from groundwater_mcp.tools.calibration import (
+        _impl_apply_calibration_result,
+        _impl_setup_calibration,
+    )
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    name = _build_zoned_model(tmp_path)
+    _register_obs(tmp_path, name)
+    result = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "zones", "layer": 0, "initial": 1.0}},
+        noptmax=0,
+    )
+    assert "error" not in result, result
+    pst_file = result["pst_file"]
+    par_names = list(pyemu.Pst(pst_file).parameter_data.index)
+    assert len(par_names) == 2
+
+    # zone order is by ascending K: zone 1 = K 1.0 (col 0), zone 2 = K 5.0
+    factors = {par_names[0]: 3.0, par_names[1]: 0.5}
+    base = pst_file[: -len(".pst")]
+    with open(f"{base}.par", "w") as fh:
+        fh.write("single point\n")
+        for n, v in factors.items():
+            fh.write(f"{n} {v:.6e} 1.0 0.0\n")
+
+    applied = _impl_apply_calibration_result(name, pst_file)
+    assert applied["engine"] == "glm"
+    k = np.asarray(get_gwf(name).get_package("npf").k.array)[0]
+    assert np.allclose(k[:, 0], 1.0 * 3.0)
+    assert np.allclose(k[:, 1:], 5.0 * 0.5)

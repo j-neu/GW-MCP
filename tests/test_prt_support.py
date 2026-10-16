@@ -158,8 +158,11 @@ def test_add_prt_model_mirrors_grid_and_registers_exchange(tmp_path):
 
 def test_add_prt_mip_package(tmp_path):
     from groundwater_mcp.tools.builder import (
-        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
-        _impl_add_prt_model, _impl_add_prt_mip_package,
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_mip_package,
+        _impl_add_prt_model,
+        _impl_create_model,
     )
     from groundwater_mcp.utils import model_store
 
@@ -178,8 +181,12 @@ def test_add_prt_mip_package(tmp_path):
 
 def test_add_prt_prp_package(tmp_path):
     from groundwater_mcp.tools.builder import (
-        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
-        _impl_add_prt_model, _impl_add_prt_prp_package, _impl_set_simulation,
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_add_prt_prp_package,
+        _impl_create_model,
+        _impl_set_simulation,
     )
     from groundwater_mcp.utils import model_store
 
@@ -203,8 +210,12 @@ def test_add_prt_prp_package(tmp_path):
 
 def test_add_prt_oc_package(tmp_path):
     from groundwater_mcp.tools.builder import (
-        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
-        _impl_add_prt_model, _impl_add_prt_oc_package, _impl_set_simulation,
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_add_prt_oc_package,
+        _impl_create_model,
+        _impl_set_simulation,
     )
     from groundwater_mcp.utils import model_store
 
@@ -231,8 +242,12 @@ def test_add_prt_oc_package(tmp_path):
 
 def test_add_prt_oc_package_defaults_trackcsv(tmp_path):
     from groundwater_mcp.tools.builder import (
-        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
-        _impl_add_prt_model, _impl_add_prt_oc_package, _impl_set_simulation,
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_add_prt_oc_package,
+        _impl_create_model,
+        _impl_set_simulation,
     )
     from groundwater_mcp.utils import model_store
 
@@ -256,8 +271,12 @@ def test_add_prt_oc_package_defaults_trackcsv(tmp_path):
 
 def test_add_prt_prp_package_save_flows_is_noop(tmp_path):
     from groundwater_mcp.tools.builder import (
-        _impl_add_dis_package, _impl_add_npf_package, _impl_create_model,
-        _impl_add_prt_model, _impl_add_prt_prp_package, _impl_set_simulation,
+        _impl_add_dis_package,
+        _impl_add_npf_package,
+        _impl_add_prt_model,
+        _impl_add_prt_prp_package,
+        _impl_create_model,
+        _impl_set_simulation,
     )
     from groundwater_mcp.utils import model_store
 

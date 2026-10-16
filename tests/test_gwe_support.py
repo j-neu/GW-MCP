@@ -131,7 +131,7 @@ def test_component_sim_cache_roundtrip(tmp_path):
     model_store.cache_component_sim("gwe_cache", "gwe", component)
     assert model_store.get_component_sim("gwe_cache", "gwe") is component
     assert model_store.component_sim_names("gwe_cache") == ["gwe"]
-    with pytest.raises(KeyError, match="add_gwe_model"):
+    with pytest.raises(KeyError, match="add_prt_model"):
         model_store.get_component_sim("gwe_cache", "prt")
     # invalidate() forces a flow reload but keeps derived component simulations
     model_store.invalidate("gwe_cache")

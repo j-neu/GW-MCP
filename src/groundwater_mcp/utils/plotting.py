@@ -40,7 +40,8 @@ def save_figure(fig: Figure, output_path: str | Path | None, workspace: Path) ->
     fig:
         The matplotlib Figure to save.
     output_path:
-        Destination path. If None, a temporary PNG file is created inside *workspace*.
+        Destination path; a relative path is resolved against *workspace*. If
+        None, a temporary PNG file is created inside *workspace*.
     workspace:
         Model workspace directory; used as the parent for auto-generated filenames.
 
@@ -54,7 +55,11 @@ def save_figure(fig: Figure, output_path: str | Path | None, workspace: Path) ->
         import os
         os.close(fd)
     else:
-        path = str(output_path)
+        # A relative path means "inside the model workspace", never the
+        # server process's working directory (R4.3).
+        candidate = Path(output_path)
+        path = str(candidate if candidate.is_absolute() else workspace / candidate)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     fig.tight_layout()
     fig.savefig(path, dpi=fig.get_dpi(), bbox_inches="tight")

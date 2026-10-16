@@ -258,22 +258,23 @@ stall, avoided via the synchronous runner.)
 | NPF (properties) | covered | `add_npf_package` | all testmodels/examples | |
 | IC (initial conditions) | covered | `add_ic_package` | all testmodels/examples | |
 | OC (output control) | covered | `add_oc_package` | all testmodels/examples | head/budget filerecords + saverecord |
-| CHD / WEL / RIV / DRN / RCH / EVT / GHB / SFR | covered | `add_boundary_package` | test005_advgw_tidal, test051_uzfp2, ex-gwf-advtidal, mf6-training | SFR via dispatch; RIV/DRN/GHB also via `import_river_from_shapefile` |
+| SFR (streamflow routing) | covered | `add_advanced_package` | ex-gwf-sfr-p01b, neversink_workflow (SFR obs), mf6_freyberg | Built 2026-10-15 (real-run test); replaces the earlier non-working `add_boundary_package("SFR")` dispatch. No shapefile-driven network importer |
+| CHD / WEL / RIV / DRN / RCH / EVT / GHB | covered | `add_boundary_package` | test005_advgw_tidal, test051_uzfp2, ex-gwf-advtidal, mf6-training | SFR via dispatch; RIV/DRN/GHB also via `import_river_from_shapefile` |
 | RCHA / EVTA (array-based recharge/ET) | covered | `add_boundary_package` | mf6brabant (RP1.tif recharge), test051_uzfp2 | Full-grid array per stress period (7e-B8) |
 | CSUB (subsidence / interbed compaction) | covered | `add_csub_package`, `read_compaction`, `plot_subsidence`, `import_subsidence_observations` | 1DSubsidenceModeling-MF6CSUB | v0.3.0 scope (landed 2026-09-19, 74 tools): delay + no-delay interbeds (11-field packagedata, `ndelaycells`, `sgm`/`sgs`/`cg_theta`/`cg_ske_cr`, filerecords, cell- and interbed-based obs); the CSUB obs CSV reads back as per-layer compaction + cumulative subsidence and a native PNG plot; measured subsidence registers as a **derived** time-series target; calibration targets `csub:packagedata` (+ `csub:cg_theta` / `csub:cg_ske_cr` / `npf:k33`) via `setup_calibration(obs_source="derived")` → `run_pestpp_ies` → `summarise_calibration`. Validation: playbook Target 9 — rerun-1 (2026-09-20) green-with-gaps; reruns 2–6 build/run/post-process green MCP-only, calibration blocked by an MCP-tree `pestpp` launch stall (all tool-side findings fixed); awaiting a rerun with the MCP server outside VS Code |
-| MAW (multi-aquifer well) | **gap** | — | test020_NevilleTonkinTransient, test001g_MVR, ex-gwf-maw-p01, ex-gwt-mt3dsupp82, mf6-training, ModelMuse MAW-solute tutorial | Not in supported boundary list |
-| UZF (unsaturated zone flow) | **gap** | — | test051_uzfp2, ex-gwf-sagehen, ex-gwt-uzt-2d, ex-gwf-drn-p01, mf6-training, Modflow-API-Ag-Package | Not in supported boundary list |
-| LAK (lakes) | **gap** | — | test045_lake1ss, ex-gwf-lak-p02, ex-gwf-sfr-p01b, modflow-setup (Pleasant Lake), mf6-training | Not in supported boundary list |
+| MAW (multi-aquifer well) | covered | `add_advanced_package` | test020_NevilleTonkinTransient, test001g_MVR, ex-gwf-maw-p01, ex-gwt-mt3dsupp82, mf6-training, ModelMuse MAW-solute tutorial | Built 2026-10-15 (`add_advanced_package`, real-run test). Transport counterparts (SFT/LKT/MWT/UZT) and the closed-book gate not done |
+| UZF (unsaturated zone flow) | covered | `add_advanced_package` | test051_uzfp2, ex-gwf-sagehen, ex-gwt-uzt-2d, ex-gwf-drn-p01, mf6-training, Modflow-API-Ag-Package | Built 2026-10-15 (`add_advanced_package`, real-run test). Transport counterparts (SFT/LKT/MWT/UZT) and the closed-book gate not done |
+| LAK (lakes) | covered | `add_advanced_package` | test045_lake1ss, ex-gwf-lak-p02, ex-gwf-sfr-p01b, modflow-setup (Pleasant Lake), mf6-training | Built 2026-10-15 (`add_advanced_package`, real-run test). Transport counterparts (SFT/LKT/MWT/UZT) and the closed-book gate not done |
 | GNC (ghost-node correction) | **gap** | — | test006_gwf3_gnc, test009_3lay-disu, test006_gwf3_disv, flopy lgr_gnc_example.py | Not exposed; thin coverage — red flag |
-| MVR (water mover) | **gap** | — | test001g_MVR, test051_uzfp2_mvr, ex-gwf-lak-p02, ex-gwf-sagehen, ex-gwt-mt3dsupp82, mf6-training | Not exposed |
+| MVR (water mover) | covered | `add_mvr_package` | test001g_MVR, test051_uzfp2_mvr, ex-gwf-lak-p02, ex-gwf-sagehen, ex-gwt-mt3dsupp82, mf6-training | Not exposed |
 
 ## GWT / SWT — transport
 
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
 |---|---|---|---|---|
-| GWT (solute transport) | **gap** | — | ex-gwt-mt3dms-p01, ex-gwt-prudic2004t2, ex-gwt-keating, test201_gwtbuy-henryCHD, PROMISCES PFOA (Zenodo), mf6-training | No GWT model support at all |
+| GWT (solute transport) | partial | `add_gwt_model`, `add_gwt_adv/dsp/mst/ssm/cnc/src_package`, `read_concentration`, `plot_concentration_map` | ex-gwt-mt3dms-p01, ex-gwt-prudic2004t2, ex-gwt-keating, test201_gwtbuy-henryCHD, PROMISCES PFOA (Zenodo), mf6-training | Built 2026-10-15 as an FMI-coupled derived simulation (same pattern as GWE); real-run tests incl. plug-flow front position. **Not covered:** SFT/LKT/MWT/UZT boundary packages. Closed-book gate not run |
 | SWT (saltwater) | **gap** | — | no MF6 SWT6 package exists (round-1 finding); nearest: test201/205_gwtbuy (BUY), ex-gwt-henry, ex-gwt-saltlake; verify `MODFLOW-USGS/swtv4` next round | Variable density in MF6 = GWT hydraulic-head formulation (Langevin et al. 2020) or standalone swtv4; SWT6 not an MF6 package |
-| GWF-GWT coupling | **gap** | — | test201/205_gwtbuy, ex-gwt-prudic2004t2, ex-gwt-keating, ex-gwt-uzt-2d, elder-mf6, mf6rtm | Requires both models + exch |
+| GWF-GWT coupling | partial | `add_gwt_model` (FMI, one-way) | test201/205_gwtbuy, ex-gwt-prudic2004t2, ex-gwt-keating, ex-gwt-uzt-2d, elder-mf6, mf6rtm | One-way flow→transport only; the density-coupled BUY exchange (variable density, `test201/205_gwtbuy`) is not supported |
 
 ## Observations
 
@@ -298,7 +299,7 @@ stall, avoided via the synchronous runner.)
 | PEST++ GLM / IES | covered | `setup_calibration`, `run_pestpp_glm`, `run_pestpp_ies` | | `setup_calibration` emits the whole interface (external-array rewire, wide-token template, ins from the OBS CSV, Windows-safe forward wrapper, safe `.pst` defaults); GLM phi from `.iobj`; `summarise_calibration` auto-detects the engine and summarises IES runs too (2026-08-29) — phi from the `.phi.actual.csv` mean column, parameter estimates from the final ensemble `par.csv` (mean + spread), residuals from `.rei` or the obs ensemble |
 | PEST++ DA (sequential ensemble data assimilation) | covered | `setup_da_control`, `run_pestpp_da`, `summarise_da` | MF6_EnKF_DISU (Neckartal DE) | `setup_da_control` builds the version-2 `.pst` with cycle tables and `da_*` options: NPF `k` + IC `strt` rewired to external arrays, one state parameter per observed cell (IC template tokens sharing the observation name) carried by `da_use_simulated_states`, non-zero weights in `obs_data.csv`; requires one stress period / one time step per cycle (`NPER=1`/`NSTP=1`). Verified end-to-end on `pestpp-da` v5.2.16 (≥2 cycles, state advance); `noptmax 0` performs **no** update on that build, so the tool defaults to `1`. `summarise_da` reads the per-cycle phi, posterior parameter ensemble and per-cycle residuals back |
 | PEST++ PPU (prediction uncertainty) | covered | `run_ies_uncertainty` | | Ensemble percentiles |
-| PEST++ SEN (sensitivities) | **gap** | — | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_run_sen.pst), neversink_workflow | |
+| PEST++ SEN (sensitivities) | covered | `run_pestpp_sen` | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_run_sen.pst), neversink_workflow | Morris elementary effects only (mu*, sigma, per-observation-group); built 2026-10-15. Closed-book gate (`mf6_freyberg` + `neversink_workflow`) still to run |
 | PEST++ Pareto / SWP (sweep) | **gap** | — | usgs/pestpp benchmarks/mf6_freyberg (freyberg6_sweep.pst, run_opt.pst) | |
 
 ## Workflow / meta tools (not capability-specific)
@@ -339,13 +340,13 @@ No capability-coverage rows changed except OBS (partial → covered).
 | MODFLOW-2005 / NWT / USG | legacy-out-of-scope | v0.2.0+ candidate |
 | SEAWAT | legacy-out-of-scope | — |
 | MT3D-MS | legacy-out-of-scope | MT3D-USGS **read + plot** moved to the post-processing row above (v0.3.0 sub-project 4, owner decision 2026-09-25; closed-book validation still required) |
-| MODPATH | legacy-out-of-scope | **v0.3.0 sub-project 5** (in scope, owner decision 2026-09-25) |
+| MODPATH 7 (particle tracking on MF6 flow) | covered | `run_modpath`, `plot_modpath_pathlines` | zenodo-21381071 (MODPATH inputs), ex-gwf-sagehen | v0.3.0 sub-project 5, built 2026-10-15: forward/backward tracking from chosen cells or whole layers on a completed flow run; verified against the plug-flow seepage velocity. Closed-book gate not run. Not covered: zones/weak-sink/stop-time options, MODPATH 6/legacy |
 
 ## Coverage summary
 
-- covered: 17 rows · partial: 1 (MT3D-USGS legacy concentration — read + plot
-  only) · gap: 10 (MAW, UZF, LAK, GNC, MVR,
-  GWT, SWT, GWF-GWT coupling, pestpp-sen, pestpp-pareto/swp) · legacy-out-of-scope: 4
+- covered: 23 rows · partial: 3 (MT3D-USGS legacy concentration — read + plot
+  only; GWT; GWF-GWT coupling — one-way FMI only) · gap: 3 (GNC,
+  SWT, pestpp-pareto/swp) · legacy-out-of-scope: 4
   (UCODE SVD estimation and UCODE linear/MCMC uncertainty rows removed
   2026-08-17 — UCODE is no longer part of the project's calibration scope)
   · CSUB moved from catalog "extra scope" to the covered GWF row on 2026-09-19

@@ -417,15 +417,13 @@ def test_replay_flow_build_check_run_postprocess(flow_project, tmp_path):
 # Known-limitation gate — GAP capabilities must fail cleanly at v0.1.0
 # ---------------------------------------------------------------------------
 
+# Capabilities that are still gaps. MAW/UZF/LAK (add_advanced_package), MVR
+# (add_mvr_package) and GWT (add_gwt_model) were built after the v0.1.0 freeze
+# and are no longer listed; the names below are the unbuilt ones (the old
+# per-package tool names for the built ones were never used).
 _GAP_TOOLS = [
-    "add_maw_package",
-    "add_uzf_package",
-    "add_lak_package",
     "add_gnc_package",
-    "add_mvr_package",
-    "add_gwt_package",
     "add_swt_package",
-    "add_obs_package",
 ]
 
 
@@ -465,10 +463,13 @@ def test_disu_project_has_tool_path(holdout_root):
     assert "add_disv_package" in tools  # DISV remains distinct from DISU
 
 
-def test_gap_transport_projects_present_and_ungated(holdout_root):
-    """GWT projects are sealed for v0.2.0; no transport tools at v0.1.0."""
+def test_gwt_transport_projects_stay_sealed(holdout_root):
+    """The GWT validation projects must stay intact in the sealed holdout:
+    GWT tools exist now (R2.1), but ``ex-gwt-keating`` and
+    ``test201_gwtbuy-henryCHD`` are the closed-book gate and must not have
+    been used to develop against."""
     tools = {t.name for t in _run(mcp.list_tools())}
-    assert not any(t.startswith("add_gwt") for t in tools)
+    assert "add_gwt_model" in tools
     for name in ("test201_gwtbuy-henryCHD", "ex-gwt-keating"):
         project_dir = _selected_dir(holdout_root, name)
         assert project_dir.is_dir(), f"seal broken: {name} missing from holdout"

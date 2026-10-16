@@ -749,6 +749,9 @@ def test_assign_array_npf_k33_missing_raises(tmp_path, model_name):
 
 def test_assign_array_sto_ss_and_sy(tmp_path, model_name):
     """STO.ss / STO.sy are written per layer on a transient model."""
+    import rasterio
+    from rasterio.transform import from_bounds
+
     from groundwater_mcp.tools.builder import (
         _impl_add_dis_package,
         _impl_add_ic_package,
@@ -759,8 +762,6 @@ def test_assign_array_sto_ss_and_sy(tmp_path, model_name):
     )
     from groundwater_mcp.tools.parameterise import _impl_assign_array_from_raster
     from groundwater_mcp.utils.model_store import get_gwf
-    import rasterio
-    from rasterio.transform import from_bounds
 
     ws = str(tmp_path / model_name)
     _impl_create_model(model_name, ws, "METERS", "DAYS")
@@ -1056,7 +1057,6 @@ def test_river_import_no_intersection_reports_bboxes(dis_model_crs, tmp_path):
 
 def test_import_obs_from_csv_with_coords(dis_model, obs_csv):
     from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
-    from groundwater_mcp.utils.workspace import resolve_workspace
 
     result = _impl_import_obs_from_csv(
         dis_model,
@@ -1073,7 +1073,6 @@ def test_import_obs_from_csv_with_coords(dis_model, obs_csv):
     assert result["site_count"] == 3
     assert result["total_records"] == 6
 
-    ws = resolve_workspace(dis_model)
     assert Path(result["summary_file"]).exists()
 
 
@@ -1097,3 +1096,494 @@ def test_import_obs_missing_column_raises(dis_model, obs_csv):
             obs_type="HEAD", site_col="site", date_col="date", value_col="nonexistent",
             x_col=None, y_col=None, layer=0,
         )
+
+
+def _import_obs(model, csv, **overrides):
+    from groundwater_mcp.tools.parameterise import _impl_import_obs_from_csv
+
+    kwargs = dict(
+        obs_type="HEAD", site_col="site", date_col="date", value_col="value",
+        x_col=None, y_col=None, layer=0,
+    )
+    kwargs.update(overrides)
+    return _impl_import_obs_from_csv(model, str(csv), **kwargs)
+
+
+def test_import_obs_without_site_mapping_raises(dis_model, obs_csv):
+    """No cellid_col and no x/y columns must not silently map sites to cells
+    in row order (R4.2: aare-valley registered 34 sites on the wrong cells)."""
+    with pytest.raises(ValueError, match="allow_sequential"):
+        _import_obs(dis_model, obs_csv)
+
+
+def test_import_obs_only_one_coordinate_column_raises(dis_model, obs_csv):
+    with pytest.raises(ValueError, match="x_col and y_col"):
+        _import_obs(dis_model, obs_csv, x_col="x")
+
+
+def test_import_obs_unknown_coordinate_column_raises(dis_model, obs_csv):
+    with pytest.raises(ValueError, match="'easting' not found"):
+        _import_obs(dis_model, obs_csv, x_col="easting", y_col="y")
+
+
+def test_import_obs_unknown_cellid_column_raises(dis_model, obs_csv):
+    with pytest.raises(ValueError, match="'cell' not found"):
+        _import_obs(dis_model, obs_csv, cellid_col="cell")
+
+
+def test_import_obs_allow_sequential_keeps_placeholder_mapping(dis_model, obs_csv):
+    result = _import_obs(dis_model, obs_csv, allow_sequential=True)
+    assert result["site_count"] == 3
+    assert result["site_mapping"] == "sequential"
+    assert "placeholder" in result["warning"]
+
+
+def test_import_obs_reports_coordinate_site_mapping(dis_model, obs_csv):
+    result = _import_obs(dis_model, obs_csv, x_col="x", y_col="y")
+    assert result["site_mapping"] == "coordinates"
+    assert "warning" not in result
+
+
+# ---------------------------------------------------------------------------
+# assign_k_from_zones — cells no polygon covers (R4.2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def left_half_zone(tmp_path: Path) -> Path:
+    """One zone over the left five columns only (K=7, K33=0.7, ICELLTYPE=0)."""
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+
+    gdf = gpd.GeoDataFrame(
+        {"k_hk": [7.0], "k_vk": [0.7], "ict": [0],
+         "geometry": [Polygon([(0, 0), (500, 0), (500, 1000), (0, 1000)])]},
+        crs="EPSG:32755",
+    )
+    path = tmp_path / "left_zone.gpkg"
+    gdf.to_file(path, driver="GPKG")
+    return path
+
+
+def _assign_left_zone(model, shapefile, **kwargs):
+    from groundwater_mcp.tools.parameterise import _impl_assign_k_from_zones
+
+    return _impl_assign_k_from_zones(
+        model, str(shapefile), k_field="k_hk", layer=0,
+        k33_field="k_vk", icelltype_field="ict", **kwargs,
+    )
+
+
+def _npf_layer0(model):
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    npf = get_gwf(model).npf
+    return npf.k.array[0], npf.k33.array[0], npf.icelltype.array[0]
+
+
+def test_assign_k_from_zones_unmatched_active_cells_raise(dis_model, left_half_zone):
+    """Active cells outside every polygon used to be written as NaN, which
+    crashes MF6's NPF prepcheck (mf6brabant rerun-2: 31 % of cells)."""
+    with pytest.raises(ValueError, match="50 active cells") as excinfo:
+        _assign_left_zone(dis_model, left_half_zone)
+    assert "unmatched=" in str(excinfo.value)
+    k, _, _ = _npf_layer0(dis_model)
+    assert np.isfinite(k).all()
+
+
+def test_assign_k_from_zones_unmatched_keep_retains_existing(dis_model, left_half_zone):
+    result = _assign_left_zone(dis_model, left_half_zone, unmatched="keep")
+    assert result["cells_unmatched"] == 50
+    k, k33, ict = _npf_layer0(dis_model)
+    assert k[0, 0] == pytest.approx(7.0) and k[0, 9] == pytest.approx(1.0)
+    assert k33[0, 0] == pytest.approx(0.7) and k33[0, 9] == pytest.approx(0.1)
+    assert ict[0, 0] == 0 and ict[0, 9] == 1
+
+
+def test_assign_k_from_zones_unmatched_nearest_fills_from_zone(dis_model, left_half_zone):
+    _assign_left_zone(dis_model, left_half_zone, unmatched="nearest")
+    k, k33, ict = _npf_layer0(dis_model)
+    assert np.allclose(k, 7.0) and np.allclose(k33, 0.7) and (ict == 0).all()
+
+
+def test_assign_k_from_zones_inactive_unmatched_cells_keep_value(dis_model, left_half_zone):
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    idomain = np.ones((2, 10, 10), dtype=int)
+    idomain[:, :, 5:] = 0
+    get_gwf(dis_model).dis.idomain.set_data(idomain)
+    result = _assign_left_zone(dis_model, left_half_zone)
+    assert result["cells_unmatched"] == 50
+    k, _, _ = _npf_layer0(dis_model)
+    assert np.isfinite(k).all() and k[0, 9] == pytest.approx(1.0)
+
+
+def test_assign_k_from_zones_rejects_unknown_unmatched_policy(dis_model, left_half_zone):
+    with pytest.raises(ValueError, match="unmatched must be"):
+        _assign_left_zone(dis_model, left_half_zone, unmatched="median")
+
+
+def test_river_written_for_period_one_stays_active_in_later_periods(
+    dis_model, river_shapefile
+):
+    """The backlog claimed a river imported with the default stress_periods
+    ([0]) 'vanishes in later periods'. MF6 reuses the previous period's list
+    when a period block is omitted, so the reaches stay active; this pins that
+    through a real 3-period run so the documentation cannot drift."""
+    import flopy
+
+    from groundwater_mcp.tools.builder import (
+        _impl_add_boundary_package,
+        _impl_add_oc_package,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.tools.parameterise import _impl_import_river_from_shapefile
+    from groundwater_mcp.tools.runner import _find_mf6_binary, _impl_run_simulation
+    from groundwater_mcp.utils.model_store import flush_model
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    try:
+        _find_mf6_binary()
+    except RuntimeError:
+        pytest.skip("MODFLOW 6 binary not available")
+
+    _impl_set_simulation(dis_model, 3, [1.0, 1.0, 1.0], [1, 1, 1], "simple")
+    _impl_add_boundary_package(
+        dis_model, "CHD", {"0": [[[0, 0, 0], 49.0], [[0, 9, 9], 44.0]]}, None
+    )
+    _impl_add_oc_package(dis_model, None, None, None, None)
+    result = _impl_import_river_from_shapefile(
+        dis_model, str(river_shapefile), "RIV", "stage", "conductance", None, None
+    )
+    assert result["stress_periods"] == {0: result["reach_count"]}
+
+    flush_model(dis_model)
+    run = _impl_run_simulation(dis_model)
+    assert run.get("success") is True, run
+    cbc = flopy.utils.CellBudgetFile(str(next(resolve_workspace(dis_model).glob("*.cbb"))))
+    n_riv = [len(cbc.get_data(text="RIV", kstpkper=(0, kper))[0]) for kper in range(3)]
+    assert n_riv == [result["reach_count"]] * 3
+
+
+# ---------------------------------------------------------------------------
+# import_obs_from_csv — append across layers (R4.2)
+# ---------------------------------------------------------------------------
+
+
+def _layer_csv(tmp_path, prefix: str) -> Path:
+    import pandas as pd
+
+    path = tmp_path / f"{prefix}_obs.csv"
+    pd.DataFrame({
+        "site": [f"{prefix}1", f"{prefix}2"],
+        "date": ["2020-01-01", "2020-01-01"],
+        "value": [30.0, 31.0],
+        "x": [250.0, 750.0],
+        "y": [250.0, 750.0],
+    }).to_csv(path, index=False)
+    return path
+
+
+def test_import_obs_append_merges_a_second_layer(dis_model, tmp_path):
+    from groundwater_mcp.utils.model_store import flush_model, get_gwf, read_meta
+
+    _import_obs(dis_model, _layer_csv(tmp_path, "L0"), x_col="x", y_col="y", layer=0)
+    result = _import_obs(
+        dis_model, _layer_csv(tmp_path, "L1"), x_col="x", y_col="y", layer=1, append=True
+    )
+    assert result["site_count"] == 4
+    assert result["appended_to"] == 2
+    meta = read_meta(dis_model)["observations"]
+    assert [s["site"] for s in meta["sites"]] == ["L01", "L02", "L11", "L12"]
+    assert {tuple(s["cellid"])[0] for s in meta["sites"]} == {0, 1}
+    flush_model(dis_model)
+    obs = get_gwf(dis_model).get_package("obs")
+    records = obs.continuous.get_data()
+    assert sum(len(v) for v in records.values()) == 4
+
+
+def test_import_obs_default_still_replaces(dis_model, tmp_path):
+    from groundwater_mcp.utils.model_store import read_meta
+
+    _import_obs(dis_model, _layer_csv(tmp_path, "L0"), x_col="x", y_col="y", layer=0)
+    _import_obs(dis_model, _layer_csv(tmp_path, "L1"), x_col="x", y_col="y", layer=1)
+    assert [s["site"] for s in read_meta(dis_model)["observations"]["sites"]] == ["L11", "L12"]
+
+
+def test_import_obs_append_rejects_duplicate_site_names(dis_model, tmp_path):
+    csv0 = _layer_csv(tmp_path, "L0")
+    _import_obs(dis_model, csv0, x_col="x", y_col="y", layer=0)
+    with pytest.raises(ValueError, match="already registered"):
+        _import_obs(dis_model, csv0, x_col="x", y_col="y", layer=1, append=True)
+
+
+def test_import_obs_append_rejects_a_different_obs_type(dis_model, tmp_path):
+    _import_obs(dis_model, _layer_csv(tmp_path, "L0"), x_col="x", y_col="y", layer=0)
+    with pytest.raises(ValueError, match="obs_type"):
+        _import_obs(
+            dis_model, _layer_csv(tmp_path, "L1"), x_col="x", y_col="y",
+            layer=1, append=True, obs_type="DRAWDOWN",
+        )
+
+
+def test_import_obs_sites_far_outside_the_grid_raise(dis_model, tmp_path):
+    """Coordinates in the wrong CRS/units used to be snapped to the nearest
+    edge cell, so every site landed on one cell (found by the worked
+    example: all six sites read the same head)."""
+    import pandas as pd
+
+    csv = tmp_path / "far.csv"
+    pd.DataFrame({
+        "site": ["A", "B"], "date": ["2020-01-01"] * 2, "value": [1.0, 2.0],
+        "x": [500000.0, 500100.0], "y": [4000000.0, 4000100.0],
+    }).to_csv(csv, index=False)
+    with pytest.raises(ValueError, match="outside the model grid") as excinfo:
+        _import_obs(dis_model, csv, x_col="x", y_col="y")
+    assert "allow_outside" in str(excinfo.value)
+
+
+def test_import_obs_allow_outside_snaps_to_the_nearest_cell(dis_model, tmp_path):
+    import pandas as pd
+
+    csv = tmp_path / "far.csv"
+    pd.DataFrame({
+        "site": ["A"], "date": ["2020-01-01"], "value": [1.0],
+        "x": [500000.0], "y": [4000000.0],
+    }).to_csv(csv, index=False)
+    result = _import_obs(dis_model, csv, x_col="x", y_col="y", allow_outside=True)
+    assert result["site_count"] == 1
+    assert "warning" in result and "outside" in result["warning"]
+
+
+def test_import_obs_site_on_the_grid_edge_is_accepted(dis_model, tmp_path):
+    """Sites just outside the outer cell edge (within a cell) are fine."""
+    import pandas as pd
+
+    csv = tmp_path / "edge.csv"
+    pd.DataFrame({
+        "site": ["A"], "date": ["2020-01-01"], "value": [1.0],
+        "x": [1040.0], "y": [500.0],  # 40 m beyond the 1000 m east edge
+    }).to_csv(csv, index=False)
+    assert _import_obs(dis_model, csv, x_col="x", y_col="y")["site_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# intersect_lines_with_dis_grid — only cells near the lines are materialised
+# ---------------------------------------------------------------------------
+
+
+def _line_grid(tmp_path, n, line_coords, cell=10.0):
+    import flopy
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    mg = flopy.discretization.StructuredGrid(
+        delc=np.full(n, cell), delr=np.full(n, cell),
+        top=np.ones((n, n)), botm=np.zeros((1, n, n)),
+        nlay=1, nrow=n, ncol=n, xoff=0.0, yoff=0.0, crs="EPSG:32755",
+    )
+    path = tmp_path / "lines.gpkg"
+    gpd.GeoDataFrame(
+        {"stage": [1.0]}, geometry=[LineString(line_coords)], crs="EPSG:32755"
+    ).to_file(path, driver="GPKG")
+    return mg, str(path)
+
+
+def _brute_force_intersection(shapefile, mg):
+    """The pre-optimisation algorithm: one box per cell, full overlay."""
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    gdf = gpd.read_file(shapefile)
+    xv, yv = mg.xvertices, mg.yvertices
+    cells = [
+        {"row": r, "col": c, "geometry": box(
+            float(xv[r, c]), float(yv[r + 1, c + 1]), float(xv[r + 1, c + 1]), float(yv[r, c])
+        )}
+        for r in range(mg.nrow) for c in range(mg.ncol)
+    ]
+    grid = gpd.GeoDataFrame(cells, crs=mg.crs)
+    inter = gpd.overlay(gdf, grid, how="intersection", keep_geom_type=False)
+    return {
+        (int(r.row), int(r.col)): round(r.geometry.length, 6)
+        for r in inter.itertuples() if r.geometry.length > 0
+    }
+
+
+def test_line_intersection_matches_brute_force(tmp_path):
+    from groundwater_mcp.utils.spatial import intersect_lines_with_dis_grid
+
+    mg, shp = _line_grid(tmp_path, 40, [(15, 25), (200, 120), (310, 390), (60, 215)])
+    expected = _brute_force_intersection(shp, mg)
+    got = {
+        (r["cellid"][1], r["cellid"][2]): round(r["length_m"], 6)
+        for r in intersect_lines_with_dis_grid(shp, mg, [])
+    }
+    assert got == expected and len(got) > 20
+
+
+def test_line_intersection_is_fast_on_a_regional_grid(tmp_path):
+    import time
+
+    from groundwater_mcp.utils.spatial import intersect_lines_with_dis_grid
+
+    mg, shp = _line_grid(tmp_path, 800, [(100, 100), (3000, 4000), (7000, 7500)])
+    start = time.perf_counter()
+    reaches = intersect_lines_with_dis_grid(shp, mg, ["stage"])
+    elapsed = time.perf_counter() - start
+    assert len(reaches) > 1000
+    assert elapsed < 6.0, f"{elapsed:.1f}s for 640,000 cells"
+
+
+# ---------------------------------------------------------------------------
+# import_boundary_from_shapefile — CHD from lines/polygons, WEL from points
+# ---------------------------------------------------------------------------
+
+
+def _points_shapefile(tmp_path, rows, name="wells.gpkg", crs="EPSG:32755"):
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame(
+        {"Q": [r[2] for r in rows]},
+        geometry=[Point(r[0], r[1]) for r in rows],
+        crs=crs,
+    )
+    path = tmp_path / name
+    gdf.to_file(path, driver="GPKG")
+    return str(path)
+
+
+def _spd(model, pkg):
+    from groundwater_mcp.utils.model_store import flush_model, get_gwf
+
+    flush_model(model)
+    return get_gwf(model).get_package(pkg).stress_period_data.array[0]
+
+
+@pytest.fixture()
+def mid_row_line(tmp_path: Path) -> Path:
+    """A west-east line through the middle of row 4 (y = 550), stage 45."""
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    path = tmp_path / "mid_row.gpkg"
+    gpd.GeoDataFrame(
+        {"stage": [45.0]}, geometry=[LineString([(0, 550), (1000, 550)])], crs="EPSG:32755"
+    ).to_file(path, driver="GPKG")
+    return path
+
+
+def test_chd_from_line_shapefile_uses_the_attribute(dis_model, mid_row_line):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    result = _impl_import_boundary_from_shapefile(
+        dis_model, str(mid_row_line), "CHD", value_field="stage"
+    )
+    assert result["package"] == "CHD"
+    assert result["n_cells"] == 10  # the line crosses one 10-cell row
+    rec = _spd(dis_model, "chd")
+    assert len(rec) == 10 and np.allclose(rec["head"], 45.0)
+    assert {int(c[1]) for c in rec["cellid"]} == {4}
+
+
+def test_chd_constant_value(dis_model, mid_row_line):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    _impl_import_boundary_from_shapefile(dis_model, str(mid_row_line), "CHD", value=12.5)
+    assert np.allclose(_spd(dis_model, "chd")["head"], 12.5)
+
+
+def test_wel_from_points_sums_wells_sharing_a_cell(dis_model, tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    shp = _points_shapefile(
+        tmp_path, [(150.0, 150.0, -10.0), (160.0, 140.0, -5.0), (850.0, 850.0, -2.0)]
+    )
+    result = _impl_import_boundary_from_shapefile(dis_model, shp, "WEL", value_field="Q")
+    assert result["n_features"] == 3 and result["n_cells"] == 2
+    rec = _spd(dis_model, "wel")
+    by_cell = {tuple(int(v) for v in r["cellid"]): float(r["q"]) for r in rec}
+    assert sorted(by_cell.values()) == [-15.0, -2.0]
+
+
+def test_wel_rejects_line_features(dis_model, river_shapefile):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    with pytest.raises(ValueError, match="point"):
+        _impl_import_boundary_from_shapefile(
+            dis_model, str(river_shapefile), "WEL", value_field="stage"
+        )
+
+
+def test_boundary_import_validates_the_value_source(dis_model, river_shapefile):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _impl_import_boundary_from_shapefile(dis_model, str(river_shapefile), "CHD")
+    with pytest.raises(ValueError, match="'nope' not found"):
+        _impl_import_boundary_from_shapefile(
+            dis_model, str(river_shapefile), "CHD", value_field="nope"
+        )
+    with pytest.raises(ValueError, match="CHD or WEL"):
+        _impl_import_boundary_from_shapefile(dis_model, str(river_shapefile), "RIV", value=1.0)
+
+
+def test_boundary_import_points_far_outside_the_grid_raise(dis_model, tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    shp = _points_shapefile(tmp_path, [(500000.0, 4000000.0, -1.0)], "far.gpkg")
+    with pytest.raises(ValueError, match="outside the model grid"):
+        _impl_import_boundary_from_shapefile(dis_model, shp, "WEL", value_field="Q")
+
+
+def test_boundary_import_reprojects_into_the_grid_crs(dis_model, tmp_path):
+    from pyproj import Transformer
+
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+
+    x, y = Transformer.from_crs("EPSG:32755", "EPSG:4326", always_xy=True).transform(150.0, 150.0)
+    shp = _points_shapefile(tmp_path, [(x, y, -7.0)], "ll.gpkg", crs="EPSG:4326")
+    _impl_import_boundary_from_shapefile(dis_model, shp, "WEL", value_field="Q")
+    rec = _spd(dis_model, "wel")
+    assert len(rec) == 1 and tuple(int(v) for v in rec[0]["cellid"]) == (0, 8, 1)
+
+
+def test_boundary_import_skips_inactive_cells_and_says_so(dis_model, tmp_path):
+    from groundwater_mcp.tools.parameterise import _impl_import_boundary_from_shapefile
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    idomain = np.ones((2, 10, 10), dtype=int)
+    idomain[0, 8, 1] = 0
+    get_gwf(dis_model).dis.idomain.set_data(idomain)
+    shp = _points_shapefile(tmp_path, [(150.0, 150.0, -7.0), (850.0, 850.0, -2.0)])
+    result = _impl_import_boundary_from_shapefile(dis_model, shp, "WEL", value_field="Q")
+    assert result["n_cells"] == 1 and result["cells_inactive_skipped"] == 1
+    assert "inactive" in result["warning"]
+
+
+def test_boundary_import_through_the_mcp_layer(dis_model, tmp_path):
+    import asyncio
+    import json
+
+    from groundwater_mcp.server import mcp
+
+    shp = _points_shapefile(tmp_path, [(150.0, 150.0, -10.0)])
+    out = json.loads(
+        asyncio.run(
+            mcp.call_tool(
+                "import_boundary_from_shapefile",
+                {"model": dis_model, "shapefile": shp, "package": "WEL", "value_field": "Q"},
+            )
+        )[0].text
+    )
+    assert out["package"] == "WEL" and out["n_cells"] == 1
+    bad = json.loads(
+        asyncio.run(
+            mcp.call_tool(
+                "import_boundary_from_shapefile",
+                {"model": dis_model, "shapefile": shp, "package": "WEL"},
+            )
+        )[0].text
+    )
+    assert bad["code"] == "INVALID_INPUT"

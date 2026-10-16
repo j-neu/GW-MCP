@@ -983,3 +983,112 @@ def test_model_status_adopted_model_runnable(tmp_path, model_name):
     status = _compute_model_status(model_name)
     assert status["runnable"] is True
     assert status["missing_required"] == []
+
+
+# ---------------------------------------------------------------------------
+# adopt_model reads LENGTH_UNITS / TIME_UNITS from the files (R4.2)
+# ---------------------------------------------------------------------------
+
+
+def _write_unit_model(dir_path, length_units, time_units):
+    """A minimal MF6 input set declaring the given DIS/TDIS units (or none)."""
+    import flopy.mf6 as mf6
+
+    sim = mf6.MFSimulation(sim_name="mfsim", version="mf6", sim_ws=str(dir_path))
+    gwf = mf6.ModflowGwf(sim, modelname="units")
+    mf6.ModflowTdis(sim, time_units=time_units, nper=1, perioddata=[(1.0, 1, 1.0)])
+    mf6.ModflowIms(sim, complexity="SIMPLE")
+    mf6.ModflowGwfdis(
+        gwf, length_units=length_units, nlay=1, nrow=3, ncol=3,
+        delr=10.0, delc=10.0, top=10.0, botm=[0.0],
+    )
+    mf6.ModflowGwfnpf(gwf, k=5.0)
+    mf6.ModflowGwfic(gwf, strt=8.0)
+    sim.write_simulation(silent=True)
+
+
+def test_adopt_model_reads_units_from_model_files(tmp_path, model_name):
+    """A FEET/SECONDS model adopted without units used to be registered as
+    METERS/DAYS, mis-scaling every later unit conversion (GMS rerun-2)."""
+    from groundwater_mcp.utils.model_store import read_meta
+
+    _write_unit_model(tmp_path / "ft", "FEET", "SECONDS")
+    result = _impl_adopt_model(model_name, str(tmp_path / "ft"))
+    assert (result["units"], result["time_units"]) == ("FEET", "SECONDS")
+    assert result["units_source"] == {"length": "model files", "time": "model files"}
+    meta = read_meta(model_name)
+    assert (meta["units"], meta["time_units"]) == ("FEET", "SECONDS")
+
+
+def test_adopt_model_rejects_units_contradicting_the_files(tmp_path, model_name):
+    from groundwater_mcp.tools.builder import UnitsMismatchError
+
+    _write_unit_model(tmp_path / "ft", "FEET", "DAYS")
+    with pytest.raises(UnitsMismatchError, match="LENGTH_UNITS FEET"):
+        _impl_adopt_model(model_name, str(tmp_path / "ft"), "METERS", "DAYS")
+
+
+def test_adopt_model_accepts_units_matching_the_files(tmp_path, model_name):
+    _write_unit_model(tmp_path / "ft", "FEET", "DAYS")
+    result = _impl_adopt_model(model_name, str(tmp_path / "ft"), "feet", "days")
+    assert (result["units"], result["time_units"]) == ("FEET", "DAYS")
+
+
+def test_adopt_model_undeclared_units_use_argument_then_default(tmp_path, model_name):
+    _write_unit_model(tmp_path / "none", None, None)
+    result = _impl_adopt_model(model_name, str(tmp_path / "none"), "FEET")
+    assert (result["units"], result["time_units"]) == ("FEET", "DAYS")
+    assert result["units_source"] == {"length": "argument", "time": "default"}
+    assert "warning" in result
+
+
+def test_summarise_model_labels_undeclared_rates_in_model_units(tmp_path, model_name):
+    """An adopted FEET/DAYS model used to be reported as K/recharge in m/d."""
+    _write_unit_model(tmp_path / "ft", "FEET", "DAYS")
+    _impl_adopt_model(model_name, str(tmp_path / "ft"))
+    units = _impl_summarise_model(model_name)["units"]
+    assert units["k"] == "ft/d"
+    assert units["recharge"] == "ft/d"
+    assert units["model_rate"] == "ft/d"
+
+
+@pytest.mark.parametrize("units", ["METERS", "FEET"])
+def test_built_grid_packages_declare_length_units(tmp_path, model_name, units):
+    """create_model(units=...) must reach the DIS file, otherwise MF6 runs the
+    model with UNKNOWN units and a later re-adoption falls back to defaults."""
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils.model_store import flush_model, get_gwf
+
+    _impl_create_model(model_name, str(tmp_path / "m"), units, "DAYS")
+    _impl_set_simulation(model_name, 1, [1.0], [1], "simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 10.0, 10.0, 10.0, [0.0])
+    assert str(get_gwf(model_name).dis.length_units.get_data()).upper() == units
+    flush_model(model_name)
+    from groundwater_mcp.utils.workspace import resolve_workspace
+
+    dis_files = list(resolve_workspace(model_name).glob("*.dis"))
+    assert len(dis_files) == 1
+    import re
+
+    assert re.search(rf"LENGTH_UNITS\s+{units}", dis_files[0].read_text(), re.IGNORECASE)
+
+
+def test_built_model_round_trips_units_through_adoption(tmp_path, model_name):
+    from groundwater_mcp.tools.builder import (
+        _impl_add_dis_package,
+        _impl_create_model,
+        _impl_set_simulation,
+    )
+    from groundwater_mcp.utils.model_store import flush_model
+
+    _impl_create_model(model_name, str(tmp_path / "m"), "FEET", "DAYS")
+    _impl_set_simulation(model_name, 1, [1.0], [1], "simple")
+    _impl_add_dis_package(model_name, 1, 3, 3, 10.0, 10.0, 10.0, [0.0])
+    flush_model(model_name)
+    result = _impl_adopt_model("roundtrip", str(tmp_path / "m"))
+    assert result["units"] == "FEET"
+    assert result["units_source"]["length"] == "model files"

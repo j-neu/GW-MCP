@@ -21,7 +21,6 @@ import pyemu
 import pytest
 
 from groundwater_mcp.server import mcp
-
 from groundwater_mcp.tools.builder import (
     _impl_add_boundary_package,
     _impl_add_dis_package,
@@ -36,8 +35,8 @@ from groundwater_mcp.tools.builder import (
 from groundwater_mcp.tools.calibration import (
     _da_cell_flat_index,
     _detect_pestpp_engine,
-    _impl_setup_da_control,
     _impl_run_pestpp_da,
+    _impl_setup_da_control,
     _impl_summarise_da,
     _write_cycle_table,
 )
@@ -871,7 +870,7 @@ def test_setup_da_control_disu_writes_v2_state_parameters(tmp_path):
     name = _disu_da_model(tmp_path, "disuda")
     res = _impl_setup_da_control(
         name,
-        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0, "allow_flatten": True}},
         cycles=[0, 1],
         obs_cycles=_disu_obs_cycles(),
         num_reals=4,
@@ -919,7 +918,7 @@ def test_setup_da_control_disu_out_of_bounds_site_is_transactional(tmp_path):
     with pytest.raises(ValueError, match="out of bounds"):
         _impl_setup_da_control(
             name,
-            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+            {"k": {"target": "npf:k", "scope": "all", "initial": 5.0, "allow_flatten": True}},
             cycles=[0, 1],
             obs_cycles=_disu_obs_cycles(),
         )
@@ -1462,7 +1461,7 @@ def test_setup_da_control_disu_state_bounds_head_scale(tmp_path):
     name = _disu_da_model(tmp_path, "disubound")
     res = _impl_setup_da_control(
         name,
-        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}},
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0, "allow_flatten": True}},
         cycles=[0, 1],
         obs_cycles=_disu_obs_cycles(),
         num_reals=4,

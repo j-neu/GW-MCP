@@ -536,3 +536,27 @@ def test_summarise_calibration_residual_cap(tmp_path):
     csv_path = Path(result["residuals_csv"])
     assert csv_path.exists()
     assert len(pd.read_csv(csv_path)) == 5000
+
+
+def test_verdict_first_run_with_no_descent_is_not_improved(tmp_path):
+    """With no previous run, 'improved' used to be True whatever the phi did."""
+    model, pst_file = _write_calib_artifacts(tmp_path, "flat", [40.0, 40.0, 40.0], None)
+    verdict = _impl_summarise_calibration(model, pst_file)["verdict"]
+    assert verdict["improved"] is False
+    assert verdict["initial_phi"] == pytest.approx(40.0)
+    assert verdict["phi_reduction_pct"] == pytest.approx(0.0)
+
+
+def test_verdict_reports_the_reduction_against_the_runs_own_start(tmp_path):
+    model, pst_file = _write_calib_artifacts(tmp_path, "drop", [200.0, 50.0, 10.0], None)
+    verdict = _impl_summarise_calibration(model, pst_file)["verdict"]
+    assert verdict["improved"] is True
+    assert verdict["initial_phi"] == pytest.approx(200.0)
+    assert verdict["phi_reduction_pct"] == pytest.approx(95.0)
+
+
+def test_verdict_with_a_single_phi_value_is_unknown(tmp_path):
+    model, pst_file = _write_calib_artifacts(tmp_path, "single", [25.0], None)
+    verdict = _impl_summarise_calibration(model, pst_file)["verdict"]
+    assert verdict["improved"] is None
+    assert verdict["final_phi"] == pytest.approx(25.0)

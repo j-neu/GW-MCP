@@ -173,7 +173,8 @@ def test_import_obs_from_csv_disu_sequential_uses_node_ids(tmp_path):
     name = _build_disu_model(tmp_path, "disu_obsseq")
     csv_path = _write_seq_obs_csv(tmp_path, name)
     result = _impl_import_obs_from_csv(
-        name, csv_path, "HEAD", "site", "date", "value", None, None, 0
+        name, csv_path, "HEAD", "site", "date", "value", None, None, 0,
+        allow_sequential=True,
     )
     assert "error" not in result, result
     # DISU OBS node numbers are 1-based (FloPy does not add 1 for a scalar id).
@@ -190,7 +191,7 @@ def test_disu_obs_file_is_one_based_and_model_runs(tmp_path):
     name = _build_disu_model(tmp_path, "disu_obsrun")
     _impl_import_obs_from_csv(
         name, _write_seq_obs_csv(tmp_path, name), "HEAD", "site", "date", "value",
-        None, None, 0,
+        None, None, 0, allow_sequential=True,
     )
     flush_model(name)
     obs_text = (resolve_workspace(name) / f"{name}.obs").read_text()
@@ -269,7 +270,7 @@ def test_setup_calibration_disu_all_scope(tmp_path):
     name = _build_disu_model(tmp_path, "disu_calall")
     _impl_import_obs_from_csv(
         name, _write_seq_obs_csv(tmp_path, name), "HEAD", "site", "date", "value",
-        None, None, 0,
+        None, None, 0, allow_sequential=True,
     )
     result = _impl_setup_calibration(
         name,
@@ -288,7 +289,7 @@ def test_setup_calibration_disu_base_run_succeeds(tmp_path):
     name = _build_disu_model(tmp_path, "disu_calrun")
     _impl_import_obs_from_csv(
         name, _write_seq_obs_csv(tmp_path, name), "HEAD", "site", "date", "value",
-        None, None, 0,
+        None, None, 0, allow_sequential=True,
     )
     result = _impl_setup_calibration(
         name,
@@ -306,7 +307,7 @@ def test_setup_calibration_disu_zones_scope(tmp_path):
     name = _build_disu_model(tmp_path, "disu_calzon")
     _impl_import_obs_from_csv(
         name, _write_seq_obs_csv(tmp_path, name), "HEAD", "site", "date", "value",
-        None, None, 0,
+        None, None, 0, allow_sequential=True,
     )
     result = _impl_setup_calibration(
         name,

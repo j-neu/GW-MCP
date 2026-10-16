@@ -347,13 +347,10 @@ def intersect_lines_with_dis_grid(
     attribute column.
     """
     import geopandas as gpd
-    from shapely.geometry import box
+    import shapely
 
     gdf = gpd.read_file(shapefile)
 
-    # Build a GeoDataFrame of model grid cells
-    nrow = modelgrid.nrow
-    ncol = modelgrid.ncol
     xv, yv = modelgrid.xvertices, modelgrid.yvertices  # shape (nrow+1, ncol+1)
 
     model_crs = modelgrid.crs
@@ -366,22 +363,32 @@ def intersect_lines_with_dis_grid(
             "corrupt the river boundary."
         )
 
-    cells = []
-    for r in range(nrow):
-        for c in range(ncol):
-            cell_box = box(
-                float(xv[r, c]),
-                float(yv[r + 1, c + 1]),
-                float(xv[r + 1, c + 1]),
-                float(yv[r, c]),
-            )
-            cells.append({"row": r, "col": c, "geometry": cell_box})
-
-    grid_gdf = gpd.GeoDataFrame(cells, crs=model_crs if model_crs else None)
-
     # Reproject lines into the grid's CRS if needed
-    if gdf.crs and grid_gdf.crs and not gdf.crs.equals(grid_gdf.crs):
-        gdf = gdf.to_crs(grid_gdf.crs)
+    if gdf.crs and model_crs and not gdf.crs.equals(model_crs):
+        gdf = gdf.to_crs(model_crs)
+
+    # Only cells whose bounding box meets the features' bounding box can
+    # intersect them, so materialise just those as polygons (a regional grid
+    # has millions of cells; one box per cell was minutes and gigabytes).
+    x_lo = np.minimum(xv[:-1, :-1], xv[1:, 1:])
+    x_hi = np.maximum(xv[:-1, :-1], xv[1:, 1:])
+    y_lo = np.minimum(yv[1:, 1:], yv[:-1, :-1])
+    y_hi = np.maximum(yv[1:, 1:], yv[:-1, :-1])
+    minx, miny, maxx, maxy = gdf.total_bounds
+    near = (x_hi >= minx) & (x_lo <= maxx) & (y_hi >= miny) & (y_lo <= maxy)
+    rows, cols = np.nonzero(near)
+    grid_gdf = gpd.GeoDataFrame(
+        {
+            "row": rows,
+            "col": cols,
+            "geometry": shapely.box(
+                x_lo[rows, cols], y_lo[rows, cols], x_hi[rows, cols], y_hi[rows, cols]
+            ),
+        },
+        crs=model_crs if model_crs else None,
+    )
+    if len(grid_gdf) == 0:
+        return []
 
     # Intersection
     intersected = gpd.overlay(gdf, grid_gdf, how="intersection", keep_geom_type=False)

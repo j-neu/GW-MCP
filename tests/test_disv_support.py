@@ -198,7 +198,8 @@ def test_import_obs_from_csv_disv_sequential_uses_two_tuple_cellids(tmp_path):
         for i in range(2):
             writer.writerow([f"S{i + 1:02d}", "2020-01-01", 30.0])
     result = _impl_import_obs_from_csv(
-        name, str(csv_path), "HEAD", "site", "date", "value", None, None, 0
+        name, str(csv_path), "HEAD", "site", "date", "value", None, None, 0,
+        allow_sequential=True,
     )
     assert result["site_cellid_map"]["S01"] == [0, 0]
     assert result["site_cellid_map"]["S02"] == [0, 1]
@@ -216,7 +217,7 @@ def test_setup_calibration_disv_all_scope(tmp_path):
 
     result = _impl_setup_calibration(
         name,
-        {"k": {"target": "npf:k", "scope": "all", "initial": 2.0}},
+        {"k": {"target": "npf:k", "scope": "all", "initial": 2.0, "allow_flatten": True}},
         obs_source="model",
         noptmax=1,
     )

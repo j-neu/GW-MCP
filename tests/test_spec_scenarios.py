@@ -438,3 +438,66 @@ def test_compare_scenarios_well_rate_difference(tmp_path):
 
     # Response stays small (no arrays)
     assert len(json.dumps(result)) < 8_000
+
+
+def test_clone_model_carries_external_arrays_in_subdirectories(tmp_path):
+    """OPEN/CLOSE arrays in a subfolder (the Neckartal DISU layout) used to be
+    skipped, leaving a clone that could not load (R4.2)."""
+    import flopy.mf6 as mf6
+
+    from groundwater_mcp.tools.builder import _impl_adopt_model
+    from groundwater_mcp.utils.model_store import get_gwf
+
+    src = tmp_path / "ext_src"
+    (src / "flow_input").mkdir(parents=True)
+    sim = mf6.MFSimulation(sim_name="mfsim", version="mf6", sim_ws=str(src))
+    gwf = mf6.ModflowGwf(sim, modelname="ext")
+    mf6.ModflowTdis(sim, nper=1, perioddata=[(1.0, 1, 1.0)])
+    mf6.ModflowIms(sim, complexity="SIMPLE")
+    mf6.ModflowGwfdis(gwf, nlay=1, nrow=3, ncol=3, delr=10.0, delc=10.0, top=10.0, botm=[0.0])
+    k = np.arange(1.0, 10.0).reshape(1, 3, 3)
+    mf6.ModflowGwfnpf(gwf, k={"filename": "flow_input/k.txt", "data": k})
+    mf6.ModflowGwfic(gwf, strt=5.0)
+    sim.write_simulation(silent=True)
+    assert (src / "flow_input" / "k.txt").exists()
+
+    _impl_adopt_model("ext_src", str(src))
+    result = _impl_clone_model("ext_src", "ext_clone", str(tmp_path / "ext_clone"))
+    assert "error" not in result
+    assert (tmp_path / "ext_clone" / "flow_input" / "k.txt").exists()
+    cloned_k = np.asarray(get_gwf("ext_clone").npf.k.array)
+    assert np.allclose(cloned_k, k)
+
+
+def _adopted_readonly(tmp_path, label):
+    from groundwater_mcp.tools.builder import _impl_adopt_model
+    from tests.test_builder import _write_existing_mf6_setup  # noqa: PLC0415
+
+    src = tmp_path / label
+    src.mkdir()
+    _write_existing_mf6_setup(src)
+    _impl_adopt_model(label, str(src))
+    return label
+
+
+def test_clone_of_readonly_adopted_model_is_writable(tmp_path):
+    """The pristine-adopt-then-clone workflow needs the clone to accept edits;
+    the source must stay read-only (R4.2)."""
+    from groundwater_mcp.utils.model_store import ModelReadOnlyError
+
+    src = _adopted_readonly(tmp_path, "ro_src")
+    result = _impl_clone_model(src, "ro_clone", str(tmp_path / "ro_clone"))
+    assert result["read_only"] is False
+    _impl_add_boundary_package("ro_clone", "WEL", {"0": [[[0, 2, 2], -10.0]]}, None)
+    with pytest.raises(ModelReadOnlyError):
+        _impl_add_boundary_package(src, "WEL", {"0": [[[0, 2, 2], -10.0]]}, None)
+
+
+def test_clone_can_stay_read_only_on_request(tmp_path):
+    from groundwater_mcp.utils.model_store import ModelReadOnlyError
+
+    src = _adopted_readonly(tmp_path, "ro_src2")
+    result = _impl_clone_model(src, "ro_clone2", str(tmp_path / "ro_clone2"), allow_modify=False)
+    assert result["read_only"] is True
+    with pytest.raises(ModelReadOnlyError):
+        _impl_add_boundary_package("ro_clone2", "WEL", {"0": [[[0, 2, 2], -10.0]]}, None)

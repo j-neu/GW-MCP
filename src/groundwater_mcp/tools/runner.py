@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from io import StringIO
@@ -32,7 +33,9 @@ from groundwater_mcp.utils.model_store import (
     get_model,
     get_sim,
     invalidate,
+    read_meta,
     save_sim,
+    write_meta,
 )
 from groundwater_mcp.utils.workspace import resolve_workspace
 
@@ -84,6 +87,212 @@ def _apply_ims_rung(ims, rung: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Binary detection
 # ---------------------------------------------------------------------------
+
+
+def _find_mp7_binary() -> str:
+    """Locate the MODPATH 7 executable (``mp7``), as installed by get-modflow."""
+    exe_name = "mp7.exe" if platform.system() == "Windows" else "mp7"
+    found = shutil.which(exe_name)
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".local" / "bin" / exe_name,
+        Path.home() / "bin" / exe_name,
+    ):
+        if candidate.exists():
+            return str(candidate)
+    raise RuntimeError(
+        "MODPATH 7 binary (mp7) not found. Install it with: get-modflow :"
+    )
+
+
+_MP7_STATUS = {
+    0: "pending release",
+    1: "active",
+    2: "terminated at boundary face",
+    3: "weak sink",
+    4: "weak source",
+    5: "no exit face (strong sink)",
+    6: "stop zone",
+    7: "inactive cell",
+    8: "unknown",
+}
+
+
+def _impl_run_modpath(
+    model: str,
+    direction: str = "forward",
+    release_cells: list | None = None,
+    release_layers: list[int] | None = None,
+    porosity: float = 0.3,
+    divisions: int = 1,
+    max_particles_returned: int = 200,
+) -> dict:
+    """Run MODPATH 7 on a completed MODFLOW 6 flow run (R1.4).
+
+    Particles start at the centre of each requested cell (or on an evenly
+    spaced ``divisions`` x ``divisions`` x ``divisions`` sub-grid within it),
+    and are tracked ``forward`` (where does water go) or ``backward`` (where
+    does it come from — capture zones). ``release_cells`` is a list of
+    ``[layer, row, col]`` (DIS) or ``[layer, node]`` (DISV); without it every
+    active cell of ``release_layers`` (default layer 0) releases particles.
+    Reads the flow run's head, budget and grid files; run ``run_simulation``
+    first.
+    """
+    import flopy
+
+    from groundwater_mcp.utils.grid import get_disv
+
+    if direction not in ("forward", "backward"):
+        raise ValueError(f"direction must be 'forward' or 'backward', got '{direction}'.")
+    if not porosity > 0:
+        raise ValueError("porosity must be > 0.")
+    if divisions < 1:
+        raise ValueError("divisions must be >= 1.")
+
+    gwf = get_gwf(model)
+    ws = resolve_workspace(model)
+    dis, disv = get_dis(gwf), get_disv(gwf)
+    if dis is not None:
+        nlay, nrow, ncol = int(dis.nlay.data), int(dis.nrow.data), int(dis.ncol.data)
+        cells_per_layer = nrow * ncol
+    elif disv is not None:
+        nlay, ncols_ = int(disv.nlay.data), int(disv.ncpl.data)
+        cells_per_layer = ncols_
+    else:
+        raise ValueError("run_modpath supports DIS and DISV grids (not DISU).")
+
+    idomain = np.asarray(
+        getattr(getattr(dis or disv, "idomain", None), "array", None)
+        if getattr(getattr(dis or disv, "idomain", None), "array", None) is not None
+        else np.ones(nlay * cells_per_layer, dtype=int)
+    ).reshape(-1)
+
+    nodes: list[int] = []
+    if release_cells:
+        for cell in release_cells:
+            if dis is not None:
+                if len(cell) != 3:
+                    raise ValueError(f"Cell {cell} must be [layer, row, col] on a DIS grid.")
+                lay, r, c = (int(v) for v in cell)
+                if not (0 <= lay < nlay and 0 <= r < nrow and 0 <= c < ncol):
+                    raise ValueError(
+                        f"Cell {cell} is out of range for a {nlay}x{nrow}x{ncol} grid."
+                    )
+                nodes.append(lay * cells_per_layer + r * ncol + c)
+            else:
+                if len(cell) != 2:
+                    raise ValueError(f"Cell {cell} must be [layer, node] on a DISV grid.")
+                lay, n = (int(v) for v in cell)
+                if not (0 <= lay < nlay and 0 <= n < cells_per_layer):
+                    raise ValueError(
+                        f"Cell {cell} is out of range for a {nlay}x{cells_per_layer} grid."
+                    )
+                nodes.append(lay * cells_per_layer + n)
+    else:
+        for lay in release_layers if release_layers is not None else [0]:
+            if not (0 <= int(lay) < nlay):
+                raise ValueError(f"Layer {lay} out of range for model with {nlay} layers.")
+            nodes.extend(
+                int(lay) * cells_per_layer + i for i in range(cells_per_layer)
+            )
+    if idomain.size == nlay * cells_per_layer:
+        nodes = [n for n in nodes if idomain[n] > 0]
+    if not nodes:
+        raise ValueError("No active cells to release particles from.")
+
+    flush_model(model)
+    missing = [
+        pat for pat in ("*.hds", "*.cbb", "*.cbc", "*.grb")
+        if not any(ws.glob(pat)) and pat not in ("*.cbb", "*.cbc")
+    ]
+    if missing or not (any(ws.glob("*.cbb")) or any(ws.glob("*.cbc"))):
+        raise FileNotFoundError(
+            "MODPATH needs the flow run's head, budget and grid (.grb) files; "
+            "run run_simulation first."
+        )
+
+    mp_ws = ws / "modpath"
+    mp_ws.mkdir(exist_ok=True)
+    mp = flopy.modpath.Modpath7.create_mp7(
+        modelname=f"{model}_mp",
+        trackdir=direction,
+        flowmodel=gwf,
+        model_ws=str(mp_ws),
+        exe_name=_find_mp7_binary(),
+        rowcelldivisions=divisions,
+        columncelldivisions=divisions,
+        layercelldivisions=divisions,
+        nodes=np.asarray(nodes, dtype=int),
+        porosity=porosity,
+    )
+    mp.write_input()
+    ok, buff = mp.run_model(silent=True)
+    if not ok:
+        raise RuntimeError(
+            "MODPATH 7 failed: " + "\n".join(str(b) for b in (buff or [])[-8:])
+        )
+
+    stem = f"{model}_mp"
+    endpoints = flopy.utils.EndpointFile(str(mp_ws / f"{stem}.mpend")).get_alldata()
+    pathline_file = flopy.utils.PathlineFile(str(mp_ws / f"{stem}.mppth"))
+    pathlines = pathline_file.get_alldata()
+    end_npy = mp_ws / f"{model}_modpath_endpoints.npy"
+    path_npy = mp_ws / f"{model}_modpath_pathlines.npy"
+    np.save(end_npy, endpoints)
+    np.save(path_npy, np.concatenate(pathlines) if len(pathlines) else np.array([]))
+
+    status_counts: dict[str, int] = {}
+    for code in endpoints["status"]:
+        label = _MP7_STATUS.get(int(code), f"status {int(code)}")
+        status_counts[label] = status_counts.get(label, 0) + 1
+    travel = np.asarray(endpoints["time"] - endpoints["time0"], dtype=float)
+
+    def _start_cell(node: int, k: int) -> list[int]:
+        local = int(node) - int(k) * cells_per_layer
+        if dis is not None:
+            return [int(k), local // ncol, local % ncol]
+        return [int(k), local]
+
+    particles = [
+        {
+            "particle_id": int(e["particleid"]),
+            "start_cell": _start_cell(e["node0"], e["k0"]),
+            "start": {"x": float(e["x0"]), "y": float(e["y0"]), "z": float(e["z0"])},
+            "end": {"x": float(e["x"]), "y": float(e["y"]), "z": float(e["z"])},
+            "travel_time": float(e["time"] - e["time0"]),
+            "status": _MP7_STATUS.get(int(e["status"]), str(int(e["status"]))),
+        }
+        for e in endpoints[:max_particles_returned]
+    ]
+
+    meta = read_meta(model)
+    meta["modpath"] = {
+        "direction": direction,
+        "n_particles": int(len(endpoints)),
+        "workspace": "modpath",
+        "model_name": stem,
+    }
+    write_meta(model, meta)
+
+    return {
+        "model": model,
+        "direction": direction,
+        "n_particles": int(len(endpoints)),
+        "porosity": porosity,
+        "status_counts": status_counts,
+        "travel_time": {
+            "min": float(travel.min()) if travel.size else None,
+            "max": float(travel.max()) if travel.size else None,
+            "mean": float(travel.mean()) if travel.size else None,
+        },
+        "particles": particles,
+        "particles_truncated": bool(len(endpoints) > max_particles_returned),
+        "endpoints_npy": str(end_npy),
+        "pathlines_npy": str(path_npy),
+        "endpoint_file": str(mp_ws / f"{stem}.mpend"),
+        "pathline_file": str(mp_ws / f"{stem}.mppth"),
+    }
 
 
 def _find_mf6_binary() -> str:
@@ -282,6 +491,91 @@ def _impl_start_run(model: str) -> dict:
         "kind": "mf6",
         "status": "running",
         "note": "Poll progress with get_job_status; stop with cancel_job.",
+    }
+
+
+# Heavy synchronous operations that can outlast the MCP client timeout on
+# regional models (R3.4). ``start_task`` runs one in a worker thread; the value
+# is ``(module, function)`` of the implementation, imported lazily.
+_BACKGROUND_TASKS: dict[str, tuple[str, str]] = {
+    "check_model": ("groundwater_mcp.tools.runner", "_impl_check_model"),
+    "export_model_spec": ("groundwater_mcp.tools.spec", "_impl_export_model_spec"),
+    "setup_da_control": ("groundwater_mcp.tools.calibration", "_impl_setup_da_control"),
+    "assign_k_from_raster": (
+        "groundwater_mcp.tools.parameterise",
+        "_impl_assign_k_from_raster",
+    ),
+    "assign_k_from_zones": (
+        "groundwater_mcp.tools.parameterise",
+        "_impl_assign_k_from_zones",
+    ),
+    "assign_top_from_raster": (
+        "groundwater_mcp.tools.parameterise",
+        "_impl_assign_top_from_raster",
+    ),
+    "assign_array_from_raster": (
+        "groundwater_mcp.tools.parameterise",
+        "_impl_assign_array_from_raster",
+    ),
+    "import_obs_from_csv": (
+        "groundwater_mcp.tools.parameterise",
+        "_impl_import_obs_from_csv",
+    ),
+    "flush_model": ("groundwater_mcp.utils.model_store", "flush_model"),
+}
+
+# One heavy task per model at a time: parallel heavy calls on one model were
+# observed to drop the server connection, and they mutate the same cached model.
+_task_locks: dict[str, threading.Lock] = {}
+_task_locks_guard = threading.Lock()
+
+
+def _impl_start_task(model: str, task: str, arguments: dict | None = None) -> dict:
+    """Run a heavy tool in the background and return a job id (R3.4).
+
+    ``task`` names the tool (see ``_BACKGROUND_TASKS``); ``arguments`` are its
+    keyword arguments *without* ``model``. Arguments are validated against the
+    implementation's signature before anything starts, so a typo fails fast
+    rather than inside the worker. Tasks on the same model run one at a time.
+    """
+    import importlib
+    import inspect
+
+    if task not in _BACKGROUND_TASKS:
+        raise ValueError(
+            f"Unknown task '{task}'. Supported: {sorted(_BACKGROUND_TASKS)}."
+        )
+    arguments = dict(arguments or {})
+    module_name, func_name = _BACKGROUND_TASKS[task]
+    fn = getattr(importlib.import_module(module_name), func_name)
+    sig = inspect.signature(fn)
+    params = [p for p in sig.parameters if p != "model"]
+    unknown = [a for a in arguments if a not in params]
+    if unknown:
+        raise ValueError(
+            f"Unknown argument(s) {unknown} for task '{task}'. Accepted: {params}."
+        )
+    try:
+        sig.bind(model, **arguments)
+    except TypeError as exc:
+        raise ValueError(f"Invalid arguments for task '{task}': {exc}") from exc
+
+    with _task_locks_guard:
+        lock = _task_locks.setdefault(model, threading.Lock())
+
+    def _worker(job) -> dict:
+        with lock:
+            out = fn(model, **arguments)
+        result = out if isinstance(out, dict) else {"result": out}
+        return {"task": task, "model": model, **result}
+
+    job = jobs.submit(model, f"task:{task}", _worker)
+    return {
+        "model": model,
+        "job_id": job.job_id,
+        "kind": f"task:{task}",
+        "status": "running",
+        "note": "Poll with get_job_status; the finished job's result is the tool's result.",
     }
 
 
@@ -1111,6 +1405,45 @@ def register(mcp: FastMCP) -> None:
             return _err("CHECK_FAILED", str(exc))
 
     @mcp.tool()
+    def run_modpath(
+        model: str,
+        direction: str = "forward",
+        release_cells: list | None = None,
+        release_layers: list[int] | None = None,
+        porosity: float = 0.3,
+        divisions: int = 1,
+        max_particles_returned: int = 200,
+    ) -> dict:
+        """Particle tracking with MODPATH 7 on a completed flow run.
+
+        direction="forward" shows where water goes, "backward" where it comes
+        from (capture zones, travel-time to a well). Particles start at the
+        centre of each requested cell: release_cells is [[layer, row, col],
+        ...] (DIS) or [[layer, node], ...] (DISV); without it every active cell
+        of release_layers (default [0]) releases one. Run run_simulation first.
+        Returns end-point status counts, travel-time statistics and per-particle
+        start/end/travel time (capped), and writes endpoint and pathline .npy
+        files; plot with plot_modpath_pathlines."""
+        try:
+            return _impl_run_modpath(
+                model, direction, release_cells, release_layers, porosity,
+                divisions, max_particles_returned,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "binary" in msg.lower():
+                return _err("BINARY_NOT_FOUND", msg, "Install MODPATH 7 with: get-modflow :")
+            return _err("MODPATH_FAILED", msg)
+        except Exception as exc:
+            return _err("MODPATH_FAILED", str(exc))
+
+    @mcp.tool()
     def run_simulation(model: str, silent: bool = False, auto_fix: bool = False) -> dict:
         """Run the MODFLOW 6 simulation and return convergence status and timing.
 
@@ -1227,6 +1560,27 @@ def register(mcp: FastMCP) -> None:
             return _err("START_RUN_FAILED", msg)
         except Exception as exc:
             return _err("START_RUN_FAILED", str(exc))
+
+    @mcp.tool()
+    def start_task(model: str, task: str, arguments: dict | None = None) -> dict:
+        """Run a heavy tool in the background and return a job id, for regional
+        models where the call would outlast the client timeout.
+
+        task is one of: check_model, export_model_spec, setup_da_control,
+        assign_k_from_raster, assign_k_from_zones, assign_top_from_raster,
+        assign_array_from_raster, import_obs_from_csv, flush_model. arguments
+        are that tool's keyword arguments without `model` (e.g. {"raster":
+        "dem.tif"}); they are validated before the job starts. Tasks on the same
+        model run one at a time. Poll with get_job_status; the finished job's
+        result is the tool's normal result (failures surface as the job error)."""
+        try:
+            return _impl_start_task(model, task, arguments)
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except Exception as exc:
+            return _err("START_TASK_FAILED", str(exc))
 
     @mcp.tool()
     def get_job_status(job_id: str) -> dict:

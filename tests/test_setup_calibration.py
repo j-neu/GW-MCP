@@ -700,3 +700,509 @@ def test_setup_calibration_e2e_reduces_phi(tmp_path):
     progress = summary["phi_progress"]
     assert progress, "expected phi progress from the GLM run"
     assert progress[-1]["phi"] < progress[0]["phi"] or summary["verdict"]["improved"]
+
+
+@requires_mf6
+@requires_pestpp
+def test_setup_calibration_rch_recharge_e2e_moves_parameter(tmp_path):
+    """R3.2: a recharge-only calibration really substitutes into the RCH file —
+    the heads respond, phi falls and the parameter moves up toward the data."""
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_glm,
+        _impl_setup_calibration,
+        _impl_summarise_calibration,
+    )
+
+    name = _build_base_model(tmp_path, "rch_e2e", recharge=0.001)
+    _register_obs(tmp_path, name)
+    setup = _impl_setup_calibration(
+        name,
+        {
+            "rech": {
+                "target": "rch:recharge",
+                "scope": "all",
+                "initial": 0.0001,
+                "lower_factor": 0.01,
+                "upper_factor": 1000.0,
+            }
+        },
+        noptmax=4,
+    )
+    assert "error" not in setup, setup
+    run = _impl_run_pestpp_glm(name, setup["pst_file"])
+    assert "error" not in run, run
+
+    summary = _impl_summarise_calibration(name, setup["pst_file"])
+    assert "error" not in summary, summary
+    estimate = summary["parameter_estimates"][0]
+    assert estimate["name"] == "rech"
+    assert estimate["estimated_value"] > estimate["initial_value"] * 2, estimate
+    progress = summary["phi_progress"]
+    assert progress[-1]["phi"] < progress[0]["phi"]
+
+
+def test_rejected_setup_leaves_no_artifacts(tmp_path):
+    """R4.1: an obs-interface failure must not leave snapshots/externals behind."""
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _build_base_model(tmp_path, "no_obs", recharge=0.001)  # no observations
+    ws = resolve_workspace(name)
+    before = {p.name for p in ws.iterdir()}
+    with pytest.raises(ValueError, match="obs_source='model' requires"):
+        _impl_setup_calibration(
+            name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+        )
+    assert {p.name for p in ws.iterdir()} == before
+
+
+def _drain_model(tmp_path, name, cond=1000.0, conds=None):
+    name = _build_base_model(tmp_path, name, recharge=0.001)
+    rows = range(1, 4)
+    recs = [
+        [[0, r, 2], 5.0, (conds[i] if conds else cond)] for i, r in enumerate(rows)
+    ]
+    _impl_add_boundary_package(name, "DRN", {"0": recs}, None)
+    return name
+
+
+@requires_mf6
+@requires_pestpp
+def test_setup_calibration_drn_cond_e2e_moves_parameter(tmp_path):
+    """R3.2: drain conductance is substituted into the DRN file by PEST++."""
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_glm,
+        _impl_setup_calibration,
+        _impl_summarise_calibration,
+    )
+
+    name = _drain_model(tmp_path, "drn_e2e")
+    _register_obs(tmp_path, name)
+    setup = _impl_setup_calibration(
+        name,
+        {
+            "dcond": {
+                "target": "drn:cond",
+                "scope": "all",
+                "initial": 1000.0,
+                "lower_factor": 0.0001,
+                "upper_factor": 10.0,
+            }
+        },
+        noptmax=5,
+    )
+    assert "error" not in setup, setup
+    run = _impl_run_pestpp_glm(name, setup["pst_file"])
+    assert "error" not in run, run
+    summary = _impl_summarise_calibration(name, setup["pst_file"])
+    est = summary["parameter_estimates"][0]
+    assert est["name"] == "dcond"
+    assert est["estimated_value"] != pytest.approx(est["initial_value"], rel=1e-3)
+    progress = summary["phi_progress"]
+    assert progress[-1]["phi"] < progress[0]["phi"]
+
+
+def test_drn_cond_refuses_nonuniform_base(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _drain_model(tmp_path, "drn_het", conds=[1.0, 2.0, 3.0])
+    _register_obs(tmp_path, name)
+    with pytest.raises(ValueError, match="uniform"):
+        _impl_setup_calibration(
+            name, {"dcond": {"target": "drn:cond", "scope": "all", "initial": 2.0}}
+        )
+
+
+@requires_mf6
+@pytest.mark.skipif(not _pestpp_available("pestpp-opt"), reason="pestpp-opt not installed")
+@pytest.mark.skipif(not _pestpp_available("pestpp-swp"), reason="pestpp-swp not installed")
+def test_run_pestpp_opt_maximises_drainage_subject_to_a_head_limit(tmp_path):
+    """Maximise drain conductance while keeping a head above a limit."""
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_opt,
+        _impl_run_pestpp_sweep,
+        _impl_setup_calibration,
+    )
+
+    name = _drain_model(tmp_path, "opt_model")
+    _register_obs(tmp_path, name)
+    setup = _impl_setup_calibration(
+        name,
+        {
+            "dcond": {
+                "target": "drn:cond", "scope": "all", "initial": 1000.0,
+                "lower_factor": 0.01, "upper_factor": 10.0,
+            }
+        },
+        noptmax=0,
+    )
+    assert "error" not in setup, setup
+    csv_path = tmp_path / "bounds.csv"
+    csv_path.write_text("dcond\n1000.0\n10000.0\n")
+    sweep = _impl_run_pestpp_sweep(name, setup["pst_file"], parameter_csv=str(csv_path))
+    high = sweep["runs"][0]["observations"]["s01"]  # the starting point, cond 1000
+    low = sweep["runs"][1]["observations"]["s01"]   # strongest drain, cond 10000
+    assert high > low
+    # A limit below the starting head keeps the start feasible, so the linearised
+    # problem is well posed; draining harder is then bounded by the limit.
+    limit = low + 0.5 * (high - low)
+
+    out = _impl_run_pestpp_opt(
+        name,
+        setup["pst_file"],
+        objective="dcond",
+        decision_parameters=["dcond"],
+        constraints={"s01": {"type": "greater_than", "value": limit}},
+        direction="max",
+    )
+    cond = out["optimal_decisions"]["dcond"]
+    assert 1000.0 < cond <= 10000.0  # drains harder than the start, up to the limit
+    assert out["objective_value"] == pytest.approx(cond)
+    (c,) = out["constraints"]
+    assert c["observation"] == "s01" and c["simulated"] is not None
+    # the linearised constraint is respected to within a small fraction of the range
+    assert c["simulated"] >= limit - 0.1 * (high - low)
+
+    # A limit the start cannot meet (linearised) is reported as infeasible, not as
+    # a nonsense optimum.
+    with pytest.raises(ValueError, match="infeasible"):
+        _impl_run_pestpp_opt(
+            name,
+            setup["pst_file"],
+            objective="dcond",
+            decision_parameters=["dcond"],
+            constraints={"s01": {"type": "greater_than", "value": high + 3.0}},
+            direction="max",
+        )
+
+
+def test_run_pestpp_opt_validates_inputs(tmp_path):
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_opt,
+        _impl_setup_calibration,
+    )
+
+    name = _drain_model(tmp_path, "opt_bad")
+    _register_obs(tmp_path, name)
+    setup = _impl_setup_calibration(
+        name, {"dcond": {"target": "drn:cond", "scope": "all", "initial": 1000.0}}, noptmax=0
+    )
+    pst = setup["pst_file"]
+    ok = {"s01": {"type": "greater_than", "value": 1.0}}
+    with pytest.raises(ValueError, match="not in the control file"):
+        _impl_run_pestpp_opt(name, pst, "dcond", ["nope"], ok)
+    with pytest.raises(ValueError, match="not a decision parameter"):
+        _impl_run_pestpp_opt(name, pst, {"other": 1.0}, ["dcond"], ok)
+    with pytest.raises(ValueError, match="type must be"):
+        _impl_run_pestpp_opt(name, pst, "dcond", ["dcond"], {"s01": {"type": "equal", "value": 1}})
+    with pytest.raises(ValueError, match="direction"):
+        _impl_run_pestpp_opt(name, pst, "dcond", ["dcond"], ok, direction="up")
+
+
+def test_drn_cond_cells_scope_keeps_unclaimed_and_rejects_overlap(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _drain_model(tmp_path, "drn_cells", conds=[1.0, 2.0, 3.0])
+    _register_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "da": {"target": "drn:cond", "scope": "cells", "cells": [[0, 1, 2]], "initial": 7.0},
+            "db": {"target": "drn:cond", "scope": "cells", "cells": [[0, 2, 2]], "initial": 8.0},
+        },
+    )
+    assert "error" not in res, res
+    assert res["n_adjustable_parameters"] == 2
+    ws = resolve_workspace(name)
+    rows = [ln.split() for ln in (ws / "drn_cells.drn_0.dat").read_text().splitlines() if ln.strip()]
+    assert [float(r[4]) for r in rows] == pytest.approx([7.0, 8.0, 3.0])
+    with pytest.raises(ValueError, match="claimed by both"):
+        _impl_setup_calibration(
+            name,
+            {
+                "x": {"target": "drn:cond", "scope": "cells", "cells": [[0, 1, 2]]},
+                "y": {"target": "drn:cond", "scope": "cells", "cells": [[0, 1, 2]]},
+            },
+        )
+
+
+def test_drn_cond_template_tokenises_cond_column(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _drain_model(tmp_path, "drn_tpl")
+    _register_obs(tmp_path, name)
+    res = _impl_setup_calibration(
+        name, {"dcond": {"target": "drn:cond", "scope": "all", "initial": 500.0}}
+    )
+    assert "error" not in res, res
+    ws = resolve_workspace(name)
+    tpl = (ws / "drn_tpl.drn_0.dat.tpl").read_text().splitlines()
+    assert tpl[0] == "ptf ~"
+    for line in tpl[1:]:
+        # cellid (3 tokens), elev literal, then the padded cond token
+        assert line.rstrip().endswith("~") and "dcond" in line
+        assert line.split()[3] == "5.00000000E+00"
+    dat = (ws / "drn_tpl.drn_0.dat").read_text().split()
+    assert float(dat[4]) == pytest.approx(500.0)
+
+
+# ---------------------------------------------------------------------------
+# R4.2 — a uniform parameter must not silently flatten a heterogeneous array
+# ---------------------------------------------------------------------------
+
+
+def _heterogeneous_k_model(tmp_path, name: str = "hetero") -> str:
+    _build_base_model(tmp_path, name=name)
+    k = np.full((1, 5, 5), 5.0)
+    k[0, :, 3:] = 50.0
+    get_gwf(name).get_package("npf").k.set_data(k)
+    return name
+
+
+def test_normalise_rejects_uniform_param_over_heterogeneous_k(tmp_path):
+    """scope="all" over a field holding several K values would replace them
+    all with ``initial`` (EnKF rerun-5: 10,413 distinct values became one)."""
+    from groundwater_mcp.tools.calibration import _normalise_parameterisation
+
+    name = _heterogeneous_k_model(tmp_path)
+    with pytest.raises(ValueError, match="allow_flatten") as excinfo:
+        _normalise_parameterisation(
+            name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+        )
+    assert "2 distinct" in str(excinfo.value)
+
+
+def test_normalise_allows_flatten_when_requested(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_parameterisation
+
+    name = _heterogeneous_k_model(tmp_path)
+    norm = _normalise_parameterisation(
+        name,
+        {"k": {"target": "npf:k", "scope": "all", "initial": 5.0, "allow_flatten": True}},
+    )
+    assert len(norm["cell_param"]) == 25
+
+
+def test_normalise_accepts_params_matching_uniform_blocks(tmp_path):
+    """Parameters whose cells each hold one value flatten nothing."""
+    from groundwater_mcp.tools.calibration import _normalise_parameterisation
+
+    name = _heterogeneous_k_model(tmp_path)
+    low = [[0, r, c] for r in range(5) for c in range(3)]
+    high = [[0, r, c] for r in range(5) for c in range(3, 5)]
+    norm = _normalise_parameterisation(
+        name,
+        {
+            "klow": {"target": "npf:k", "scope": "cells", "cells": low, "initial": 5.0},
+            "khigh": {"target": "npf:k", "scope": "cells", "cells": high, "initial": 50.0},
+        },
+    )
+    assert len(norm["cell_param"]) == 25
+
+
+def test_normalise_ignores_inactive_cells_when_checking_heterogeneity(tmp_path):
+    from groundwater_mcp.tools.calibration import _normalise_parameterisation
+
+    name = _heterogeneous_k_model(tmp_path)
+    idomain = np.ones((1, 5, 5), dtype=int)
+    idomain[0, :, 3:] = 0
+    get_gwf(name).get_package("dis").idomain.set_data(idomain)
+    norm = _normalise_parameterisation(
+        name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}
+    )
+    assert len(norm["cell_param"]) == 25
+
+
+def test_setup_calibration_rejects_flattening_after_a_previous_setup(tmp_path):
+    """The check reads the pristine snapshot, so a field already flattened by
+    an earlier opted-in setup is still reported on the next call."""
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    name = _heterogeneous_k_model(tmp_path)
+    _register_obs(tmp_path, name)
+    spec = {"target": "npf:k", "scope": "all", "initial": 5.0}
+    first = _impl_setup_calibration(name, {"k": {**spec, "allow_flatten": True}})
+    assert "error" not in first, first
+    with pytest.raises(ValueError, match="allow_flatten"):
+        _impl_setup_calibration(name, {"k": spec})
+
+
+# ---------------------------------------------------------------------------
+# R3.1 — write calibrated parameters back into the model
+# ---------------------------------------------------------------------------
+
+
+def _calibration_setup(tmp_path, name="wb_model", scope="all"):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    _build_base_model(tmp_path, name=name, recharge=0.001)
+    _register_obs(tmp_path, name)
+    param = {"target": "npf:k", "scope": scope, "initial": 5.0}
+    result = _impl_setup_calibration(name, {"k": param}, noptmax=0)
+    assert "error" not in result, result
+    return result["pst_file"]
+
+
+def _fake_glm_par(pst_file: str, value: float) -> None:
+    base = Path(pst_file).with_suffix("")
+    Path(f"{base}.par").write_text(f"single point\nk   {value:.8e}  1.0  0.0\n")
+
+
+def test_apply_calibration_result_writes_glm_estimate_into_npf(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_apply_calibration_result
+
+    pst = _calibration_setup(tmp_path)
+    _fake_glm_par(pst, 12.5)
+    result = _impl_apply_calibration_result("wb_model", pst)
+
+    assert result["engine"] == "glm"
+    assert result["parameters"] == {"k": pytest.approx(12.5)}
+    k = np.asarray(get_gwf("wb_model").get_package("npf").k.array)
+    assert np.allclose(k, 12.5)
+
+
+def test_apply_calibration_result_changes_the_simulated_heads(tmp_path):
+    """The point of the tool: a forward run of the model now uses the
+    calibrated field, so heads/plots/exports reflect the calibration."""
+    from groundwater_mcp.tools.calibration import _impl_apply_calibration_result
+
+    pst = _calibration_setup(tmp_path)
+    flush_model("wb_model")
+    before = _impl_run_simulation("wb_model")
+    assert before.get("success") is True, before
+    heads_before = _head_array("wb_model").copy()
+
+    _fake_glm_par(pst, 50.0)
+    _impl_apply_calibration_result("wb_model", pst)
+    after = _impl_run_simulation("wb_model")
+    assert after.get("success") is True, after
+    assert not np.allclose(heads_before, _head_array("wb_model"))
+
+
+def test_apply_calibration_result_without_an_estimate_fails_loudly(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_apply_calibration_result
+
+    pst = _calibration_setup(tmp_path)
+    with pytest.raises(FileNotFoundError, match="calibration"):
+        _impl_apply_calibration_result("wb_model", pst)
+
+
+def test_apply_calibration_result_records_what_was_applied(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_apply_calibration_result
+    from groundwater_mcp.utils.model_store import read_meta
+
+    pst = _calibration_setup(tmp_path)
+    _fake_glm_par(pst, 7.0)
+    _impl_apply_calibration_result("wb_model", pst)
+    applied = read_meta("wb_model")["calibration_applied"]
+    assert applied["engine"] == "glm"
+    assert applied["parameters"] == {"k": pytest.approx(7.0)}
+
+
+# ---------------------------------------------------------------------------
+# R2.5 — pestpp-sen global sensitivity (Morris)
+# ---------------------------------------------------------------------------
+
+
+def _sen_model(tmp_path, name="sen_model"):
+    from groundwater_mcp.tools.calibration import _impl_setup_calibration
+
+    _build_base_model(tmp_path, name=name, recharge=0.001)
+    _register_obs(tmp_path, name)
+    result = _impl_setup_calibration(
+        name, {"k": {"target": "npf:k", "scope": "all", "initial": 5.0}}, noptmax=0
+    )
+    assert "error" not in result, result
+    return result["pst_file"]
+
+
+@pytest.mark.skipif(not _pestpp_available("pestpp-sen"), reason="pestpp-sen not installed")
+def test_run_pestpp_sen_ranks_parameters(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_run_pestpp_sen
+
+    pst = _sen_model(tmp_path)
+    pst_before = Path(pst).read_text()
+    result = _impl_run_pestpp_sen("sen_model", pst, method="morris", morris_r=4, morris_p=4)
+
+    assert result["method"] == "morris"
+    assert result["completed"] is True
+    ranked = result["parameters"]
+    assert [p["name"] for p in ranked] == ["k"]
+    assert ranked[0]["mu_star"] > 0 and ranked[0]["n_samples"] > 0
+    assert ranked[0]["rank"] == 1
+    assert result["by_observation_group"][0]["obs_group"] == "head_obs"
+    assert Path(result["summary_file"]).exists()
+    # the control file the caller built must not be modified
+    assert Path(pst).read_text() == pst_before
+
+
+def test_run_pestpp_sen_rejects_unverified_method(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_run_pestpp_sen
+
+    pst = _sen_model(tmp_path, "sen_model2")
+    with pytest.raises(ValueError, match="morris"):
+        _impl_run_pestpp_sen("sen_model2", pst, method="fast")
+
+
+@pytest.mark.skipif(not _pestpp_available("pestpp-swp"), reason="pestpp-swp not installed")
+def test_run_pestpp_sweep_lhs_runs_inside_bounds(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_run_pestpp_sweep
+
+    pst = _sen_model(tmp_path, "swp_model")
+    before = Path(pst).read_text()
+    out = _impl_run_pestpp_sweep("swp_model", pst, num_samples=6, seed=3)
+    assert out["n_runs"] == 6 and out["n_failed"] == 0
+    assert out["parameter_names"] == ["k"]
+    ks = [r["parameters"]["k"] for r in out["runs"]]
+    assert all(0.5 <= k <= 50.0 for k in ks)  # base 5, factors 0.1 / 10
+    assert len(set(round(k, 6) for k in ks)) == 6
+    assert all(r["phi"] is not None and r["observations"] for r in out["runs"])
+    # higher K lowers heads under recharge, so phi vs the 30 m targets differs
+    assert out["phi_range"]["max"] > out["phi_range"]["min"]
+    assert Path(pst).read_text() == before
+
+
+@pytest.mark.skipif(not _pestpp_available("pestpp-swp"), reason="pestpp-swp not installed")
+def test_run_pestpp_sweep_explicit_csv_and_missing_column(tmp_path):
+    from groundwater_mcp.tools.calibration import _impl_run_pestpp_sweep
+
+    pst = _sen_model(tmp_path, "swp_model2")
+    good = tmp_path / "vectors.csv"
+    good.write_text("k\n1.0\n5.0\n20.0\n")
+    out = _impl_run_pestpp_sweep("swp_model2", pst, parameter_csv=str(good))
+    assert [r["parameters"]["k"] for r in out["runs"]] == [1.0, 5.0, 20.0]
+    bad = tmp_path / "bad.csv"
+    bad.write_text("other\n1.0\n")
+    with pytest.raises(ValueError, match="missing column"):
+        _impl_run_pestpp_sweep("swp_model2", pst, parameter_csv=str(bad))
+
+
+@pytest.mark.skipif(not _pestpp_available("pestpp-sen"), reason="pestpp-sen not installed")
+def test_run_pestpp_sen_sobol_ranks_by_total_index(tmp_path):
+    from groundwater_mcp.tools.calibration import (
+        _impl_run_pestpp_sen,
+        _impl_setup_calibration,
+    )
+
+    name = "sobol_model"
+    _build_base_model(tmp_path, name=name, recharge=0.001)
+    _register_obs(tmp_path, name)
+    setup = _impl_setup_calibration(
+        name,
+        {
+            "k": {"target": "npf:k", "scope": "all", "initial": 5.0},
+            "rech": {"target": "rch:recharge", "scope": "all", "initial": 0.001},
+        },
+        noptmax=0,
+    )
+    assert "error" not in setup, setup
+    result = _impl_run_pestpp_sen(
+        name, setup["pst_file"], method="sobol", sobol_samples=32
+    )
+    assert result["method"] == "sobol" and result["completed"] is True
+    ranked = result["parameters"]
+    assert {p["name"] for p in ranked} == {"k", "rech"}
+    assert ranked[0]["st"] >= ranked[1]["st"]
+    assert [p["rank"] for p in ranked] == [1, 2]
+    assert all(p["st"] > 0 for p in ranked)
+    assert "phi" in result["by_output"]
+    assert Path(result["summary_file"]).exists()

@@ -25,17 +25,18 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 ---
 
-## Tools (92 total, plus 2 MCP prompts and 3 MCP resource templates)
+## Tools (109 total, plus 2 MCP prompts and 3 MCP resource templates)
 
 | Module | Tools |
 |---|---|
 | **environment** | `check_environment` |
 | **docs** | `search_docs`, `search_tutorials`, `get_doc_file`, `describe_package` |
-| **parameterise** | `import_grid_from_shapefile`, `assign_top_from_raster`, `assign_k_from_zones`, `assign_k_from_raster`, `assign_ic_from_raster`, `assign_array_from_raster`, `import_river_from_shapefile`, `import_obs_from_csv`, `import_subsidence_observations` |
-| **model builder** | `create_model`, `adopt_model`, `set_simulation`, `set_model_crs`, `add_dis_package`, `add_disv_package`, `add_disu_package`, `add_npf_package`, `add_ic_package`, `add_sto_package`, `add_csub_package`, `add_boundary_package`, `add_oc_package`, `flush_model`, `summarise_model`, `model_status`, `list_model_files`, `list_models`, `delete_model` |
-| **runner** | `check_model`, `run_simulation`, `get_run_log`, `diagnose_convergence`, `validate_model`, `start_run`, `get_job_status`, `cancel_job` |
+| **parameterise** | `import_grid_from_shapefile`, `import_boundary_from_shapefile`, `assign_top_from_raster`, `assign_k_from_zones`, `assign_k_from_raster`, `assign_ic_from_raster`, `assign_array_from_raster`, `import_river_from_shapefile`, `import_obs_from_csv`, `import_subsidence_observations` |
+| **model builder** | `create_model`, `adopt_model`, `set_simulation`, `set_model_crs`, `add_dis_package`, `add_disv_package`, `add_disu_package`, `add_npf_package`, `add_ic_package`, `add_sto_package`, `add_csub_package`, `add_boundary_package`, `add_advanced_package`, `add_mvr_package`, `add_oc_package`, `flush_model`, `summarise_model`, `model_status`, `list_model_files`, `list_models`, `delete_model` |
+| **runner** | `check_model`, `run_simulation`, `get_run_log`, `diagnose_convergence`, `validate_model`, `start_run`, `start_task`, `get_job_status`, `cancel_job` |
 | **post-processing** | `read_heads`, `read_budget`, `compute_drawdown`, `compute_water_balance`, `diagnose_water_balance`, `export_heads_to_raster`, `export_boundaries_to_shapefile`, `export_water_balance_csv`, `read_simulated_observations`, `compare_to_observed`, `read_compaction`, `plot_subsidence`, `plot_heads_map`, `plot_cross_section` |
-| **calibration (PEST++)** | `setup_calibration`, `setup_da_control`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `run_pestpp_da`, `summarise_calibration`, `summarise_da`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
+| **calibration (PEST++)** | `setup_calibration`, `setup_da_control`, `setup_pest_control`, `start_calibration`, `run_pestpp_glm`, `run_pestpp_ies`, `run_pestpp_da`, `run_pestpp_sen`, `run_pestpp_sweep`, `run_pestpp_opt`, `apply_calibration_result`, `summarise_calibration`, `summarise_da`, `run_ies_uncertainty`, `check_parameter_sensitivity`, `calibrate` |
+| **multi-model transport and tracking** | `add_gwe_model`, `add_gwe_adv_package`, `add_gwe_cnd_package`, `add_gwe_est_package`, `add_gwe_ssm_package`, `add_gwe_esl_package`, `read_temperature`, `plot_temperature_map`, `plot_temperature_timeseries`, `add_gwt_model`, `add_gwt_adv_package`, `add_gwt_dsp_package`, `add_gwt_mst_package`, `add_gwt_ssm_package`, `add_gwt_cnc_package`, `add_gwt_src_package`, `add_prt_model`, `add_prt_mip_package`, `add_prt_prp_package`, `add_prt_oc_package`, `read_pathlines`, `plot_pathlines`, `run_modpath`, `plot_modpath_pathlines`, `adopt_mt3d_usgs_model`, `read_concentration`, `plot_concentration_map` |
 | **spec / provenance** | `apply_model_spec`, `export_model_spec`, `export_reproducible_script`, `describe_model`, `export_model_report`, `clone_model`, `compare_scenarios` |
 
 `setup_calibration` supports **zoned NPF K multipliers** (`scope="zones"`): zones auto-derived from groups of equal positive per-layer `npf:k` values become dimensionless multiplier parameters applied by a generated forward wrapper (`k = base_k × multiplier[zone]`), preserving the base K pattern while calibrating only zone magnitudes. `setup_da_control` builds a DA-ready PEST++ **version-2** control file (cycle tables + `da_*` options, IC state parameterisation) for sequential ensemble data assimilation with `run_pestpp_da`; `summarise_da` reads pestpp-da's per-cycle outputs back (per-cycle phi, posterior parameter statistics, per-cycle residuals). These capabilities add no extra tools beyond `setup_da_control` and `summarise_da`, and the total above reflects the current registration.
@@ -46,11 +47,15 @@ Upstream data preparation — clipping DEMs, kriging borehole logs, processing c
 
 **GWE heat transport** (2026-09-25) is built: `add_gwe_model` creates a heat simulation coupled to a completed flow run through MF6's Flow Model Interface, with `add_gwe_adv/cnd/est/ssm/esl_package` for the physics, `read_temperature` and `plot_temperature_*` for post-processing, and `run_simulation` running flow then heat. The ex-gwe-radial closed-book validation is the remaining v0.3.0 gate for GWE.
 
+**GWT solute transport** (2026-10-15) is built: `add_gwt_model` creates a solute-transport simulation coupled to a completed flow run through the same Flow Model Interface as GWE, with `add_gwt_adv/dsp/mst/ssm/cnc/src_package` for the physics (advection, dispersion, sorption/decay, boundary and mass sources), `read_concentration` / `plot_concentration_map` for post-processing (shared with the legacy MT3D-USGS tools), and `run_simulation` running flow then transport. It is one-way (no density coupling) and covers CNC/SRC sources only; the `ex-gwt-keating` closed-book gate has not been run.
+
+**MODPATH 7 particle tracking** (2026-10-15) is built: `run_modpath` tracks particles forward (where water goes) or backward (capture zones) from chosen cells or whole layers of a completed MODFLOW 6 run, returning end-point status counts, travel-time statistics and per-particle start/end/travel time, and `plot_modpath_pathlines` draws the pathlines. It reads the flow run's own head/budget/grid files and needs the `mp7` binary (`get-modflow` installs it); zones, weak-sink/source options and stop times are not exposed.
+
 **PRT particle tracking** (2026-09-27) is built: `add_prt_model` adds a MODFLOW 6 PRT model as a **same-simulation** component (the GWF grid is mirrored and a `GWF6-PRT6` exchange registered), with `add_prt_mip/prp/oc_package` for the physics, release schedule and track output, and `read_pathlines` / `plot_pathlines` for post-processing. The `ex-prt-mp7-p01` closed-book validation is the remaining v0.3.0 gate for PRT.
 
 **MT3D-USGS legacy post-processing** (2026-10-03) is built: `adopt_mt3d_usgs_model` registers an existing MODFLOW-2005 + MT3D-USGS model directory (the grid is read from the flow model's DIS), and `read_concentration` / `plot_concentration_map` read the binary `.UCN` concentration output and render a plan-view plume. This is **read + plot only** — the MCP does not author MT3D-USGS input or run the legacy binary. The closed-book **GMS "MT3D-USGS Keating"** validation is the remaining v0.3.0 gate for MT3D-USGS.
 
-See [TOOLS.md](TOOLS.md) for full input/output documentation.
+See [tools.md](tools.md) for full input/output documentation.
 
 ### Safety guarantees
 
@@ -69,32 +74,51 @@ See [TOOLS.md](TOOLS.md) for full input/output documentation.
 
 ---
 
-## Install
+## Try it
+
+The fastest way to see the whole chain work is the runnable worked example, which
+builds a model from a shapefile and DEM, calibrates it with PEST++ and runs the
+calibrated model (about ten seconds, results in
+[docs/examples/catchment-walkthrough.md](docs/examples/catchment-walkthrough.md)):
 
 ```bash
-# 1. Install the package
-pip install groundwater-mcp
+uv run python examples/catchment_walkthrough.py
+```
 
-# 2. Download MODFLOW 6 binary
-get-modflow :
+---
 
-# 3. Download PEST++ binaries (for calibration)
-get-pestpp :
+## Install
+
+The package is not on PyPI yet; install it from a clone:
+
+```bash
+# 1. Clone and install (uv recommended; `pip install -e .` also works)
+git clone https://github.com/j-neu/GW-MCP.git
+cd GW-MCP
+uv sync
+
+# 2. Download the MODFLOW 6 binary
+uv run get-modflow :
+
+# 3. Download the PEST++ binaries (for calibration)
+uv run get-pestpp :
 
 # 4. Build the local docs search index
-groundwater-mcp build-index
+uv run groundwater-mcp build-index
 ```
 
 ### Claude Desktop configuration
 
-Add to `~/.config/claude/claude_desktop_config.json`:
+Add to `claude_desktop_config.json` (macOS:
+`~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`,
+Linux: `~/.config/Claude/`), pointing `--directory` at your clone:
 
 ```json
 {
   "mcpServers": {
     "groundwater": {
-      "command": "groundwater-mcp",
-      "args": ["serve"]
+      "command": "uv",
+      "args": ["--directory", "/path/to/GW-MCP", "run", "groundwater-mcp", "serve"]
     }
   }
 }
@@ -117,12 +141,14 @@ Add to `~/.config/claude/claude_desktop_config.json`:
 
 | File | Contents |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | System design, module responsibilities, file structure, tech stack |
-| [TOOLS.md](TOOLS.md) | Full tool reference: inputs, outputs, error codes |
-| [TASKS.md](TASKS.md) | Phased implementation plan with checkboxes |
-| [RESEARCH/capability-matrix.md](research/capability-matrix.md) | MODFLOW 6 + PEST capability coverage vs. MCP tools |
-| [RESEARCH/discovery/catalog.md](research/discovery/catalog.md) | Catalogue of open-source models/tutorials, capability-tagged |
-| [RESEARCH/holdout-registry.md](research/holdout-registry.md) | Sealed validation pool — the data itself lives in the sibling `GW-MCP-holdout/` folder, outside this repo |
+| [architecture.md](architecture.md) | System design, module responsibilities, file structure, tech stack |
+| [docs/examples/catchment-walkthrough.md](docs/examples/catchment-walkthrough.md) | Worked example: build, calibrate and re-run a catchment model (runnable script in `examples/`) |
+| [docs/examples/capture-zone.md](docs/examples/capture-zone.md) | Worked example: capture zone of a pumping well with MODPATH, checked against the analytical width |
+| [tools.md](tools.md) | Full tool reference: inputs, outputs, error codes |
+| [tasks.md](tasks.md) | Phased implementation plan with checkboxes |
+| [research/capability-matrix.md](research/capability-matrix.md) | MODFLOW 6 + PEST capability coverage vs. MCP tools |
+| [research/discovery/catalog.md](research/discovery/catalog.md) | Catalogue of open-source models/tutorials, capability-tagged |
+| [research/holdout-registry.md](research/holdout-registry.md) | Sealed validation pool — the data itself lives in the sibling `GW-MCP-holdout/` folder, outside this repo |
 
 ---
 

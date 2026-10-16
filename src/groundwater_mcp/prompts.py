@@ -92,7 +92,8 @@ def register(mcp: FastMCP) -> None:
         if has_observations:
             steps.append(
                 "12. import_obs_from_csv(model, csv_file, obs_type, "
-                "site_col, date_col, value_col) — registers calibration "
+                "site_col, date_col, value_col, x_col, y_col) — x_col/y_col (or "
+                "cellid_col) are required to place the sites; registers calibration "
                 "targets so read_simulated_observations / "
                 'compare_to_observed / setup_pest_control(obs_source="model")'
                 " can use them later."

@@ -796,20 +796,27 @@ def _impl_plot_concentration_map(
     vmin: float | None = None,
     vmax: float | None = None,
 ) -> dict:
-    """Plot a plan view of MT3D-USGS concentration for one time/layer as PNG."""
+    """Plot a plan view of concentration for one time/layer as PNG — MT3D-USGS
+    (legacy) or a MODFLOW 6 GWT component."""
     from flopy.plot import PlotMapView
 
     from groundwater_mcp.utils import legacy_transport
     from groundwater_mcp.utils.plotting import figure, save_figure
 
-    legacy = legacy_transport.get_legacy_model(model)
+    is_gwt = not legacy_transport.is_legacy(model)
     result = _impl_read_concentration(model, kstpkper=kstpkper, layer=layer)
     arr = np.load(result["output_file"])
-    ws = legacy.workspace
+    if is_gwt:
+        ws = resolve_workspace(model)
+        plot_model = get_model(model, "gwt")
+    else:
+        legacy = legacy_transport.get_legacy_model(model)
+        ws = legacy.workspace
+        plot_model = legacy.flow_model
 
     with figure(figsize=(8, 6)) as fig:
         ax = fig.add_subplot(1, 1, 1)
-        pmv = PlotMapView(model=legacy.flow_model, ax=ax, layer=layer)
+        pmv = PlotMapView(model=plot_model, ax=ax, layer=layer)
         cb = pmv.plot_array(arr, cmap=cmap, vmin=vmin, vmax=vmax)
         fig.colorbar(cb, ax=ax, shrink=0.7, label="Concentration")
         ax.set_aspect("equal")
@@ -819,7 +826,7 @@ def _impl_plot_concentration_map(
 
     return {
         "model": model,
-        "type": "mt3d-usgs",
+        "type": "gwt" if is_gwt else "mt3d-usgs",
         "output_file": out_path,
         "kstpkper": result.get("kstpkper"),
         "layer": layer,
@@ -944,6 +951,91 @@ def _open_ucn(path: Path):
     raise ValueError(f"Could not read MT3D-USGS concentration file {path}: {last}")
 
 
+def _gwt_concentration_reader(model: str):
+    """Open the GWT component's concentration file; return (reader, comp_ws)."""
+    ws = resolve_workspace(model)
+    comp_ws = ws / (component_workspace(model, "gwt") or "gwt")
+    gwt = get_model(model, "gwt")
+    keyword = spec_for("gwt").oc_value_keyword or "concentration_filerecord"
+    declared = _oc_file_record(gwt, keyword)
+    ucn = comp_ws / declared if declared else comp_ws / f"{gwt.name}.ucn"
+    if not ucn.exists():
+        raise FileNotFoundError(
+            f"No GWT concentration output ({ucn.name}) in {comp_ws}. "
+            "Run run_simulation first."
+        )
+    for precision in ("double", "single"):
+        try:
+            return fu.HeadFile(str(ucn), text="CONCENTRATION", precision=precision), comp_ws
+        except Exception:  # noqa: BLE001 - try the other precision
+            continue
+    raise ValueError(f"Could not read GWT concentration file {ucn}.")
+
+
+def _impl_read_gwt_concentration(
+    model: str,
+    kstpkper: tuple[int, int] | None,
+    layer: int | None,
+    include_values: bool,
+    max_cells: int,
+    row_slice: list[int] | None,
+    col_slice: list[int] | None,
+) -> dict:
+    """Read concentration from a GWT component's output (MODFLOW 6 transport)."""
+    reader, comp_ws = _gwt_concentration_reader(model)
+    kstpkper_list = reader.get_kstpkper()
+    if not kstpkper_list:
+        raise ValueError("Concentration file contains no data.")
+    target = tuple(kstpkper) if kstpkper is not None else kstpkper_list[-1]
+    if target not in kstpkper_list:
+        raise ValueError(f"kstpkper {target} not found. Available: {kstpkper_list}")
+
+    conc = np.asarray(reader.get_data(kstpkper=target))
+    if layer is not None:
+        if not (0 <= layer < conc.shape[0]):
+            raise ValueError(
+                f"layer {layer} out of range: model has nlay={conc.shape[0]} "
+                f"(valid: 0..{conc.shape[0] - 1})."
+            )
+        arr = conc[layer]
+    else:
+        arr = conc
+    if row_slice is not None and arr.ndim >= 2:
+        arr = arr[..., slice(*row_slice), :]
+    if col_slice is not None and arr.ndim >= 2:
+        arr = arr[..., :, slice(*col_slice)]
+
+    times = list(reader.get_times())
+    idx = kstpkper_list.index(target)
+    result: dict = {
+        "model": model,
+        "type": "gwt",
+        "component": "gwt",
+        "kstpkper": [int(v) for v in target],
+        "totim": float(times[idx]) if idx < len(times) else None,
+        "layer": layer,
+        "shape": list(arr.shape),
+        "n_times": len(kstpkper_list),
+        "n_active": int(np.sum(np.abs(arr) < 1e20)),
+        **_array_stats(arr),
+    }
+    out = comp_ws / (
+        f"{model}_conc_l{layer if layer is not None else 'all'}"
+        f"_k{target[0]}_{target[1]}.npy"
+    )
+    np.save(out, arr)
+    result["output_file"] = str(out)
+    if include_values:
+        if arr.size > max_cells:
+            return _err(
+                "PAYLOAD_TOO_LARGE",
+                f"{arr.size} cells exceed max_cells={max_cells}.",
+                "Use include_values=False and load the array from output_file.",
+            )
+        result["values"] = arr.tolist()
+    return result
+
+
 def _impl_read_concentration(
     model: str,
     ucn_file: str | None = None,
@@ -954,13 +1046,19 @@ def _impl_read_concentration(
     row_slice: list[int] | None = None,
     col_slice: list[int] | None = None,
 ) -> dict:
-    """Read concentration from a legacy MT3D-USGS .UCN output file.
+    """Read concentration from a legacy MT3D-USGS .UCN output file, or from a
+    MODFLOW 6 GWT component (``add_gwt_model``) when the model is not a legacy
+    one.
 
     Returns statistics plus an ``output_file`` (.npy) of the selected layer (or
     all layers when ``layer=None``). ``kstpkper`` is 0-based and defaults to the
     last record."""
     from groundwater_mcp.utils import legacy_transport
 
+    if not legacy_transport.is_legacy(model):
+        return _impl_read_gwt_concentration(
+            model, kstpkper, layer, include_values, max_cells, row_slice, col_slice
+        )
     legacy = legacy_transport.get_legacy_model(model)
     ws = legacy.workspace
     path = _find_ucn_file(model, ws, ucn_file)
@@ -1279,6 +1377,56 @@ def _impl_read_pathlines(model: str) -> dict:
     }
 
 
+def _impl_plot_modpath_pathlines(
+    model: str,
+    output_file: str | None = None,
+    layer: int = 0,
+    title: str | None = None,
+) -> dict:
+    """Plot the pathlines of the last ``run_modpath`` over the model grid."""
+    from flopy.plot import PlotMapView
+
+    from groundwater_mcp.utils.plotting import figure, save_figure
+
+    ws = resolve_workspace(model)
+    meta = read_meta(model).get("modpath")
+    if not meta:
+        raise FileNotFoundError("No MODPATH run recorded for this model; run run_modpath first.")
+    npy = ws / meta.get("workspace", "modpath") / f"{model}_modpath_pathlines.npy"
+    if not npy.exists():
+        raise FileNotFoundError(f"{npy.name} is missing; run run_modpath first.")
+    records = np.load(npy, allow_pickle=False)
+    if records.size == 0:
+        raise ValueError("The MODPATH run produced no pathline points.")
+
+    gwf = get_gwf(model)
+    by_particle: dict[int, list] = {}
+    for rec in records:
+        by_particle.setdefault(int(rec["particleid"]), []).append(rec)
+
+    with figure(figsize=(8, 6)) as fig:
+        ax = fig.add_subplot(1, 1, 1)
+        pmv = PlotMapView(model=gwf, ax=ax, layer=layer)
+        pmv.plot_grid(alpha=0.3, lw=0.4)
+        for pid, pts in sorted(by_particle.items()):
+            ax.plot(
+                [float(p["x"]) for p in pts], [float(p["y"]) for p in pts],
+                lw=1.2, color="tab:blue",
+            )
+            ax.plot(float(pts[0]["x"]), float(pts[0]["y"]), "o", ms=3, color="tab:green")
+        ax.set_aspect("equal")
+        ax.set_title(title or f"{model} MODPATH {meta.get('direction', '')} pathlines")
+        target = _resolve_output_path(ws, output_file, "") if output_file else None
+        out_path = save_figure(fig, target, ws)
+
+    return {
+        "model": model,
+        "output_file": out_path,
+        "n_pathlines": len(by_particle),
+        "direction": meta.get("direction"),
+    }
+
+
 def _impl_plot_pathlines(
     model: str,
     output_file: str | None = None,
@@ -1499,6 +1647,41 @@ def _impl_compute_drawdown(
     return result
 
 
+def _storage_flows_missing(model: str, labels: list[str]) -> bool:
+    """True when the model has transient storage but the budget has no STORAGE.
+
+    MODFLOW 6 only writes the STORAGE record when the STO package sets
+    SAVE_FLOWS; without it the missing term is exactly the storage release, and
+    the net balance looks like a model error when it is a reporting gap.
+    """
+    if any(
+        "STORAGE" in label.upper() or label.upper().startswith("STO-")
+        for label in labels
+    ):
+        return False
+    try:
+        gwf = get_gwf(model)
+        sto = gwf.get_package("sto")
+        if sto is None:
+            return False
+        nper = int(gwf.simulation.tdis.nper.get_data())
+    except Exception:  # noqa: BLE001 - model not loadable: report nothing
+        return False
+    # A period without a block keeps the previous period's STEADY-STATE /
+    # TRANSIENT setting, so walk the periods in order.
+    state = False
+    for per in range(nper):
+        for keyword, value in (("transient", True), ("steady_state", False)):
+            try:
+                if getattr(sto, keyword).get_data(key=per):
+                    state = value
+            except Exception:  # noqa: BLE001, S112 - no block for this period
+                continue
+        if state:
+            return True
+    return False
+
+
 def _impl_compute_water_balance(
     model: str,
     kstpkper: tuple[int, int] | None = None,
@@ -1554,6 +1737,20 @@ def _impl_compute_water_balance(
     total_out = sum(outflow.values())
     net = total_in + total_out  # outflow is negative
 
+    labels = [
+        (t.decode() if isinstance(t, bytes) else str(t)).strip() for t in unique_texts
+    ]
+    storage_missing = _storage_flows_missing(model, labels)
+    warnings = [warning] if warning else []
+    if storage_missing:
+        warnings.append(
+            "The model has transient storage but the budget has no storage "
+            "record (STO-SS/STO-SY): the STO package lacks SAVE_FLOWS — set "
+            "save_flows=True on add_sto_package and rerun. The net balance "
+            "omits the storage term, so a non-zero value is not evidence of a "
+            "model error."
+        )
+
     return {
         "model": model,
         "kstpkper": list(target),
@@ -1562,7 +1759,8 @@ def _impl_compute_water_balance(
         "total_inflow": total_in,
         "total_outflow": total_out,
         "net_balance": net,
-        **({"warning": warning} if warning else {}),
+        "storage_flows_missing": storage_missing,
+        **({"warning": " ".join(warnings)} if warnings else {}),
     }
 
 
@@ -1592,7 +1790,17 @@ def _impl_diagnose_water_balance(
 
     avg = (total_in + total_out_abs) / 2.0
     percent_discrepancy = (100.0 * net / avg) if avg > 0 else 0.0
-    balanced = abs(percent_discrepancy) < tolerance_pct
+    balanced: bool | None = abs(percent_discrepancy) < tolerance_pct
+    storage_missing = bool(wb.get("storage_flows_missing", False))
+    balance_note = None
+    if storage_missing:
+        # The storage term is absent from the budget, so closure cannot be
+        # judged: report unknown rather than a spurious imbalance.
+        balanced = None
+        balance_note = (
+            "Balance not assessable: the STO package did not save flows "
+            "(set save_flows=True on add_sto_package and rerun)."
+        )
 
     dominant_inflow_term = max(inflow, key=lambda k: inflow[k]) if inflow else None
     dominant_outflow_term = min(outflow, key=lambda k: outflow[k]) if outflow else None
@@ -1620,12 +1828,15 @@ def _impl_diagnose_water_balance(
         "percent_discrepancy": percent_discrepancy,
         "tolerance_pct": tolerance_pct,
         "balanced": balanced,
+        "storage_flows_missing": storage_missing,
         "dominant_inflow_term": dominant_inflow_term,
         "dominant_outflow_term": dominant_outflow_term,
         "dominant_term": dominant_term,
         "dominant_term_share": dominant_term_share,
         "boundary_dominated": boundary_dominated,
     }
+    if balance_note:
+        result["balance_note"] = balance_note
     if "warning" in wb:
         result["warning"] = wb["warning"]
     return result
@@ -2125,11 +2336,14 @@ def register(mcp: FastMCP) -> None:
         row_slice: list[int] | None = None,
         col_slice: list[int] | None = None,
     ) -> dict:
-        """Read concentration from a legacy MT3D-USGS .UCN output file.
+        """Read concentration from a MODFLOW 6 GWT model (add_gwt_model; after
+        run_simulation) or, for an adopt_mt3d_usgs_model model, from its legacy
+        MT3D-USGS .UCN file (ucn_file only applies to the legacy case).
 
         ``kstpkper`` is 0-based (default: last record); ``layer`` is 0-based
         (None returns all layers). Returns statistics plus an output_file (.npy);
-        include_values=True returns raw values within max_cells."""
+        include_values=True returns raw values within max_cells. ``type`` in the
+        result is "gwt" or "mt3d-usgs"."""
         try:
             return _impl_read_concentration(
                 model, ucn_file, kstpkper, layer, include_values, max_cells,
@@ -2452,7 +2666,8 @@ def register(mcp: FastMCP) -> None:
         vmin: float | None = None,
         vmax: float | None = None,
     ) -> dict | list:
-        """Plot a plan view of legacy MT3D-USGS concentration and save as PNG.
+        """Plot a plan view of concentration (MODFLOW 6 GWT model, or a legacy
+        MT3D-USGS model) for one time/layer and save as PNG.
 
         Returns the PNG image natively (ImageContent) together with the file
         path."""
@@ -2565,6 +2780,28 @@ def register(mcp: FastMCP) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PRT_READ_FAILED", str(exc))
+
+    @mcp.tool(structured_output=False)
+    def plot_modpath_pathlines(
+        model: str,
+        output_file: str | None = None,
+        layer: int = 0,
+        title: str | None = None,
+    ) -> dict | list:
+        """Plot the pathlines of the last run_modpath over the model grid
+        (start points in green) and save as PNG. Returns the image natively
+        together with the file path."""
+        try:
+            result = _impl_plot_modpath_pathlines(model, output_file, layer, title)
+            return [Image(path=result["output_file"]), result]
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_modpath first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PLOT_FAILED", str(exc))
 
     @mcp.tool(structured_output=False)
     def plot_pathlines(

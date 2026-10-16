@@ -12,6 +12,7 @@ import sys
 import tempfile
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,7 @@ from groundwater_mcp.utils.grid import get_dis, get_disu, get_disv
 from groundwater_mcp.utils.model_store import (
     flush_model,
     get_gwf,
+    invalidate,
     read_meta,
     save_sim,
     write_meta,
@@ -863,6 +865,37 @@ def _tpl_substitute(tpl: Path, target: Path, values: dict[str, float]) -> None:
     target.write_text("\n".join(out) + "\n")
 
 
+def _read_derived_simulated_values(model: str) -> dict[str, float]:
+    """Simulated values of the registered derived observations (R3.6).
+
+    Mirrors what the forward wrapper writes for PEST: each matched observed
+    date maps to the summed compaction at the matched simulated time, keyed by
+    the same observation tokens ``setup_calibration(obs_source="derived")``
+    uses. Empty when no derived observation is registered or the CSUB obs CSV
+    has not been produced yet.
+    """
+    ws = resolve_workspace(model)
+    values: dict[str, float] = {}
+    for group in _derived_observation_plan(model):
+        if group["deferred"]:
+            continue
+        built = _derived_sim_series(
+            ws,
+            group["sim_csv"],
+            group["time_col"],
+            group["sum_cols"],
+            start_date_time=group["start_date_time"],
+            time_units=group["time_units"],
+        )
+        if built is None:
+            continue
+        series, _ = built
+        for token, key in zip(group["tokens"], group["keys"]):
+            if key is not None and key in series:
+                values[token] = float(series[key])
+    return values
+
+
 def _impl_check_parameter_sensitivity(
     model: str,
     parameters: dict[str, float],
@@ -924,13 +957,26 @@ def _impl_check_parameter_sensitivity(
             "Base run failed before the sensitivity analysis.",
             "Check the model converges first (run_simulation).",
         )
-    base_sim, _, _ = _read_simulated_observations_values(model)
+    # Head/flow observations come from the model's obs package; models whose
+    # only targets are derived subsidence series use those instead (R3.6).
+    use_derived = bool(read_meta(model).get("derived_observations"))
+
+    def _read_sim() -> dict:
+        if use_derived:
+            derived = _read_derived_simulated_values(model)
+            if derived:
+                return derived
+        sim_values, _, _ = _read_simulated_observations_values(model)
+        return sim_values
+
+    base_sim = _read_sim()
     base_values = {k: v for k, v in base_sim.items() if v is not None and abs(v) > 1e-12}
     if not base_values:
         return _err(
             "MODEL_HAS_NO_OBSERVATIONS",
             "No simulated observation values to measure sensitivity against. "
-            "Register observations with import_obs_from_csv and re-run.",
+            "Register observations with import_obs_from_csv (or "
+            "import_subsidence_observations) and re-run.",
         )
 
     results: dict = {}
@@ -960,9 +1006,9 @@ def _impl_check_parameter_sensitivity(
         if not run["success"]:
             results[name] = {"sensitivity": None, "run_succeeded": False}
             continue
-        sim, _, _ = _read_simulated_observations_values(model)
+        sim = _read_sim()
         rel = [
-            abs(sim[site] - base) / base
+            abs(sim[site] - base) / abs(base)
             for site, base in base_values.items()
             if site in sim and sim[site] is not None
         ]
@@ -1148,6 +1194,12 @@ _SUPPORTED_TARGETS = (
     "csub:packagedata",
     "csub:cg_theta",
     "csub:cg_ske_cr",
+    "sto:ss",
+    "sto:sy",
+    "rch:recharge",
+    "riv:cond",
+    "drn:cond",
+    "ghb:cond",
 )
 _TPL_TOKEN_WIDTH = 15
 
@@ -1600,6 +1652,30 @@ def _normalise_zoned_parameterisation(model: str, parameterisation: dict) -> dic
     }
 
 
+def _active_cell_mask(gwf, ncell: int) -> np.ndarray:
+    """Flat boolean mask of active cells (all True when no idomain is set)."""
+    grid_pkg = get_dis(gwf) or get_disv(gwf) or get_disu(gwf)
+    idomain = getattr(getattr(grid_pkg, "idomain", None), "array", None)
+    if idomain is None:
+        return np.ones(ncell, dtype=bool)
+    mask = np.asarray(idomain).reshape(-1) > 0
+    return mask if mask.size == ncell else np.ones(ncell, dtype=bool)
+
+
+def _base_array_for_flatten_check(model: str, gwf, keyword: str) -> np.ndarray:
+    """The NPF array a uniform parameter would overwrite, flattened.
+
+    Reads the pristine snapshot when an earlier setup took one: the live array
+    may already hold that setup's single value, which would hide the field
+    the next setup is about to replace again.
+    """
+    path = resolve_workspace(model) / f"{gwf.name}_{keyword}_pristine.npy"
+    if path.exists():
+        return np.load(path).astype(float).reshape(-1)
+    field = getattr(gwf.get_package("npf"), keyword)
+    return np.asarray(field.array, dtype=float).reshape(-1)
+
+
 def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
     """Validate and normalise a ``setup_calibration`` parameterisation spec.
 
@@ -1746,6 +1822,28 @@ def _normalise_parameterisation(model: str, parameterisation: dict) -> dict:
             if not raw_cells:
                 raise ValueError(f"Parameter '{name}' scope=cells requires 'cells'.")
             cells = [cell_to_flat(c) for c in raw_cells]
+
+        # One parameter writes one value into every cell it owns. Refuse to
+        # replace a spatially varying field that way unless asked to (R4.2).
+        if not spec.get("allow_flatten", False):
+            base = _base_array_for_flatten_check(model, gwf, keyword)
+            if base.size == ncell:
+                idx = np.asarray(cells, dtype=int)
+                idx = idx[_active_cell_mask(gwf, ncell)[idx]]
+                distinct = np.unique(_round_sig_array(base[idx]))
+                distinct = distinct[np.isfinite(distinct)]
+                if distinct.size > 1:
+                    raise ValueError(
+                        f"Parameter '{name}' (scope='{scope}') would replace "
+                        f"{idx.size} active cells holding {distinct.size} distinct "
+                        f"{keyword} values ({distinct.min():.6g} to "
+                        f"{distinct.max():.6g}) with the single value "
+                        f"{initial:.6g}, discarding the spatial pattern. To keep "
+                        "the pattern, use scope='zones' (setup_calibration) or "
+                        "scope='multiplier' (setup_da_control). To replace the "
+                        f"field deliberately, add \"allow_flatten\": true to "
+                        f"parameter '{name}'."
+                    )
 
         params.append(
             {
@@ -2873,7 +2971,23 @@ def _needs_forward_wrapper(model: str) -> bool:
 _CSUB_ARRAY_TARGET_KEYWORDS = {
     "csub:cg_theta": "cg_theta",
     "csub:cg_ske_cr": "cg_ske_cr",
+    # R3.2: STO storage arrays share the CSUB per-layer machinery (layered
+    # external array, one constant token per layer).
+    "sto:ss": "ss",
+    "sto:sy": "sy",
 }
+
+
+def _layer_array_package(gwf, keyword: str):
+    """Package owning a per-layer array keyword (CSUB cg_* or STO ss/sy)."""
+    if keyword in ("ss", "sy"):
+        return gwf.get_package("sto")
+    return _get_csub_package(gwf)
+
+
+def _layer_array_label(keyword: str) -> str:
+    return "STO" if keyword in ("ss", "sy") else "CSUB"
+
 
 # Packagedata numeric column -> field index counted from the END of the record
 # line. The external file holds ``icsubno cellid... cdelay pcs0 thick_frac rnb
@@ -3276,15 +3390,16 @@ def _restore_or_snapshot_csub_array(model: str, keyword: str) -> np.ndarray:
             f"{sorted(_CSUB_ARRAY_TARGET_KEYWORDS.values())}."
         )
     gwf = get_gwf(model)
-    pkg = _get_csub_package(gwf)
+    label = _layer_array_label(keyword)
+    pkg = _layer_array_package(gwf, keyword)
     if pkg is None:
         raise ValueError(
-            "No CSUB package found; run add_csub_package before parameterising "
-            f"csub:{keyword}."
+            f"No {label} package found; add it before parameterising "
+            f"{label.lower()}:{keyword}."
         )
     field = getattr(pkg, keyword, None)
     if field is None or getattr(field, "array", None) is None:
-        raise ValueError(f"CSUB has no '{keyword}' array to parameterise.")
+        raise ValueError(f"{label} has no '{keyword}' array to parameterise.")
     path = resolve_workspace(model) / f"{gwf.name}_csub_{keyword}_pristine.npy"
     current = np.asarray(field.array, dtype=float)
     if path.exists():
@@ -3316,16 +3431,17 @@ def _impl_rewire_csub_array_external(
             f"{sorted(_CSUB_ARRAY_TARGET_KEYWORDS.values())}."
         )
     gwf = get_gwf(model)
-    pkg = _get_csub_package(gwf)
+    label = _layer_array_label(keyword)
+    pkg = _layer_array_package(gwf, keyword)
     if pkg is None:
         raise ValueError(
-            "No CSUB package found; run add_csub_package before rewiring "
+            f"No {label} package found; add it before rewiring "
             f"{keyword} to an external array."
         )
     field = getattr(pkg, keyword, None)
     if field is None or getattr(field, "array", None) is None:
-        raise ValueError(f"CSUB has no '{keyword}' array to rewire.")
-    filename = filename or f"{gwf.name}.csub_{keyword}.dat"
+        raise ValueError(f"{label} has no '{keyword}' array to rewire.")
+    filename = filename or f"{gwf.name}.{label.lower()}_{keyword}.dat"
     arr = np.asarray(field.array)
     field.set_data({"filename": filename, "data": arr})
     save_sim(model, gwf.simulation)
@@ -3356,15 +3472,16 @@ def _normalise_csub_layer_array_parameterisation(
         raise ValueError(f"{target} requires at least one parameter spec.")
     keyword = _CSUB_ARRAY_TARGET_KEYWORDS[target]
     gwf = get_gwf(model)
-    pkg = _get_csub_package(gwf)
+    label = _layer_array_label(keyword)
+    pkg = _layer_array_package(gwf, keyword)
     if pkg is None:
         raise ValueError(
-            "No CSUB package found; run add_csub_package before parameterising "
+            f"No {label} package found; add it before parameterising "
             f"{target}."
         )
     field = getattr(pkg, keyword, None)
     if field is None or getattr(field, "array", None) is None:
-        raise ValueError(f"CSUB has no '{keyword}' array to parameterise.")
+        raise ValueError(f"{label} has no '{keyword}' array to parameterise.")
     nlay = int(np.asarray(field.array).shape[0])
 
     parameters: list[dict] = []
@@ -3553,6 +3670,547 @@ def _resolve_csub_layer_array_target(model: str, specs: dict) -> dict:
     }
 
 
+def _resolve_rch_cells_target(model: str, specs: dict) -> dict:
+    """Spatially varying ``rch:recharge``: one parameter per group of cells.
+
+    Every spec is ``{"target": "rch:recharge", "scope": "cells", "cells":
+    [[layer, row, col], ...], "initial": ...}`` (optional ``stress_period``,
+    which must agree across specs). Cells not claimed by any parameter keep
+    their base recharge, so a heterogeneous field is preserved rather than
+    flattened. Groups may not overlap. For RCHA the layer index is ignored
+    (recharge is a 2-D grid).
+    """
+    ws = resolve_workspace(model)
+    gwf = get_gwf(model)
+    sps = {int(s.get("stress_period", 0)) for s in specs.values()}
+    if len(sps) != 1:
+        raise ValueError("All rch:recharge specs must use the same stress_period.")
+    sp = sps.pop()
+    pkg = gwf.get_package("rcha")
+    is_array = pkg is not None
+    if pkg is None:
+        pkg = gwf.get_package("rch")
+    if pkg is None:
+        raise ValueError(
+            "No RCH/RCHA package found; add recharge with add_boundary_package "
+            "before parameterising rch:recharge."
+        )
+    if is_array:
+        try:
+            current = np.asarray(pkg.recharge.get_data(sp), dtype=float)
+        except Exception as exc:
+            raise ValueError(f"RCHA has no recharge data for stress period {sp}.") from exc
+        ncol = current.shape[-1]
+    else:
+        rec = pkg.stress_period_data.get_data(sp)
+        if rec is None or len(rec) == 0:
+            raise ValueError(f"RCH has no records for stress period {sp}.")
+        current = np.asarray(rec["recharge"], dtype=float)
+    snap = ws / f"{gwf.name}_rch_sp{sp}_pristine.npy"
+    if snap.exists():
+        base = np.load(snap)
+        if base.shape != current.shape:
+            raise ValueError(
+                f"RCH recharge shape {current.shape} does not match the "
+                f"pristine snapshot shape {base.shape}."
+            )
+    else:
+        base = current.copy()
+        np.save(snap, base)
+
+    # Map each cell to its flat position in the data being templated.
+    if is_array:
+        def position(cell):
+            r, c = int(cell[-2]), int(cell[-1])
+            if not (0 <= r < base.shape[0] and 0 <= c < ncol):
+                raise ValueError(f"Cell {list(cell)} is outside the recharge grid.")
+            return (r, c)
+    else:
+        index = {tuple(int(v) for v in cid): i for i, cid in enumerate(rec["cellid"])}
+
+        def position(cell):
+            key = tuple(int(v) for v in cell)
+            if key not in index:
+                raise ValueError(
+                    f"Cell {list(cell)} has no RCH record in stress period {sp}."
+                )
+            return index[key]
+
+    claimed: dict = {}
+    parameters: list[dict] = []
+    initial_values: dict[str, float] = {}
+    for raw_key, spec in specs.items():
+        key = str(raw_key)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits and "
+                "underscores."
+            )
+        if spec.get("scope") != "cells":
+            raise ValueError(
+                "rch:recharge specs cannot mix scope='cells' with other scopes."
+            )
+        cells = spec.get("cells")
+        if not isinstance(cells, list) or not cells:
+            raise ValueError(f"Parameter '{key}' scope=cells requires a non-empty 'cells' list.")
+        positions = [position(c) for c in cells]
+        for pos in positions:
+            if pos in claimed:
+                raise ValueError(
+                    f"Cell position {pos} is claimed by both '{claimed[pos]}' and '{key}'."
+                )
+            claimed[pos] = key
+        vals = np.array([base[p] for p in positions], dtype=float)
+        initial = float(spec.get("initial", float(np.mean(vals))))
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"Parameter '{key}' initial must be a positive number.")
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+            )
+        initial_values[key] = initial
+        parameters.append(
+            {
+                "name": key,
+                "target": "rch:recharge",
+                "scope": "cells",
+                "layer": None,
+                "initial": initial,
+                "lower_bound": initial * lower_factor,
+                "upper_bound": initial * upper_factor,
+                "partrans": str(spec.get("partrans", "log")).lower(),
+            }
+        )
+
+    external_file = f"{gwf.name}.rch_{sp}.dat"
+    if is_array:
+        pkg.recharge.set_data({sp: {"filename": external_file, "data": base}})
+    else:
+        out_rec = pkg.stress_period_data.get_data(sp).copy()
+        out_rec["recharge"] = base
+        pkg.stress_period_data.set_data({sp: {"filename": external_file, "data": out_rec}})
+    save_sim(model, gwf.simulation)
+    flush_model(model)
+
+    target = ws / external_file
+    lines = [
+        ln for ln in target.read_text().replace("\r\n", "\n").split("\n") if ln.strip()
+    ]
+    out = ["ptf ~"]
+    seen = 0  # running row-major value index (flopy may wrap long rows)
+    for li, ln in enumerate(lines):
+        fields = ln.split()
+        if is_array:
+            for ci in range(len(fields)):
+                owner = claimed.get(divmod(seen, ncol))
+                seen += 1
+                if owner is not None:
+                    fields[ci] = "~" + f"{owner:^{_TPL_TOKEN_WIDTH}s}" + "~"
+        else:
+            owner = claimed.get(li)
+            if owner is not None:
+                fields[-1] = "~" + f"{owner:^{_TPL_TOKEN_WIDTH}s}" + "~"
+        out.append("  ".join(fields))
+    tpl_path = ws / f"{external_file}.tpl"
+    tpl_path.write_text("\n".join(out) + "\n")
+    return {
+        "external_files": [external_file],
+        "templates": [
+            {
+                "tpl_path": str(tpl_path),
+                "target": str(target),
+                "initial_values": initial_values,
+            }
+        ],
+        "parameters": parameters,
+    }
+
+
+def _resolve_rch_recharge_target(model: str, specs: dict) -> dict:
+    """Resolve a ``rch:recharge`` target (RCH list or RCHA array package).
+
+    One constant recharge parameter for a stress period (``stress_period``,
+    default 0). The base recharge must already be uniform over the cells it
+    covers; a heterogeneous field would be silently flattened, so it is refused.
+    The period's data is written to ``<gwf>.rch_<sp>.dat`` (``OPEN/CLOSE``) and a
+    template tokenises every recharge value in it.
+    """
+    if any(isinstance(s, dict) and s.get("scope") == "cells" for s in specs.values()):
+        return _resolve_rch_cells_target(model, specs)
+    if len(specs) != 1:
+        raise ValueError(
+            "rch:recharge with scope='all' takes exactly one parameter (one "
+            "constant recharge rate per stress period); use scope='cells' for "
+            f"several spatial groups. Got {len(specs)}."
+        )
+    ((key, spec),) = specs.items()
+    key = str(key)
+    if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+        raise ValueError(
+            f"Parameter prefix '{key}' must contain only letters, digits and "
+            "underscores."
+        )
+    if spec.get("scope", "all") != "all":
+        raise ValueError(
+            f"Parameter '{key}': rch:recharge requires scope='all', got "
+            f"'{spec.get('scope')}'."
+        )
+    sp = int(spec.get("stress_period", 0))
+    gwf = get_gwf(model)
+    pkg = gwf.get_package("rcha")
+    is_array = pkg is not None
+    if pkg is None:
+        pkg = gwf.get_package("rch")
+    if pkg is None:
+        raise ValueError(
+            "No RCH/RCHA package found; add recharge with add_boundary_package "
+            "before parameterising rch:recharge."
+        )
+    ws = resolve_workspace(model)
+    snap = ws / f"{gwf.name}_rch_sp{sp}_pristine.npy"
+    if is_array:
+        field = pkg.recharge
+        try:
+            current = np.asarray(field.get_data(sp), dtype=float)
+        except Exception as exc:
+            raise ValueError(f"RCHA has no recharge data for stress period {sp}.") from exc
+    else:
+        rec = pkg.stress_period_data.get_data(sp)
+        if rec is None or len(rec) == 0:
+            raise ValueError(f"RCH has no records for stress period {sp}.")
+        current = np.asarray(rec["recharge"], dtype=float)
+    if snap.exists():
+        base = np.load(snap)
+        if base.shape != current.shape:
+            raise ValueError(
+                f"RCH recharge shape {current.shape} does not match the "
+                f"pristine snapshot shape {base.shape}."
+            )
+    else:
+        base = current.copy()
+        np.save(snap, base)
+    finite = base[np.isfinite(base)]
+    if finite.size == 0 or not np.allclose(finite, finite.flat[0], rtol=1e-9, atol=0.0):
+        raise ValueError(
+            "rch:recharge requires a uniform base recharge (the parameter is one "
+            "constant rate); the current recharge varies in space, so it would be "
+            "flattened. Make it uniform first or calibrate a different target."
+        )
+    base_value = float(finite.flat[0])
+    initial = float(spec.get("initial", base_value))
+    if not np.isfinite(initial) or initial <= 0:
+        raise ValueError(f"Parameter '{key}' initial must be a positive number.")
+    lower_factor = float(spec.get("lower_factor", 0.1))
+    upper_factor = float(spec.get("upper_factor", 10.0))
+    if lower_factor >= 1.0 or upper_factor <= 1.0:
+        raise ValueError(
+            f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+        )
+    external_file = f"{gwf.name}.rch_{sp}.dat"
+    if is_array:
+        field.set_data({sp: {"filename": external_file, "data": base}})
+    else:
+        rec = pkg.stress_period_data.get_data(sp).copy()
+        rec["recharge"] = base
+        pkg.stress_period_data.set_data({sp: {"filename": external_file, "data": rec}})
+    save_sim(model, gwf.simulation)
+    flush_model(model)
+
+    target = ws / external_file
+    lines = [ln for ln in target.read_text().replace("\r\n", "\n").split("\n") if ln.strip()]
+    token = "~" + f"{key:^{_TPL_TOKEN_WIDTH}s}" + "~"
+    out = ["ptf ~"]
+    for ln in lines:
+        fields = ln.split()
+        if is_array:
+            out.append("  ".join([token] * len(fields)))
+        else:
+            out.append("  ".join(fields[:-1] + [token]))
+    tpl_path = ws / f"{external_file}.tpl"
+    tpl_path.write_text("\n".join(out) + "\n")
+    parameter = {
+        "name": key,
+        "target": "rch:recharge",
+        "scope": "all",
+        "layer": None,
+        "initial": initial,
+        "lower_bound": initial * lower_factor,
+        "upper_bound": initial * upper_factor,
+        "partrans": str(spec.get("partrans", "log")).lower(),
+    }
+    return {
+        "external_files": [external_file],
+        "templates": [
+            {
+                "tpl_path": str(tpl_path),
+                "target": str(target),
+                "initial_values": {key: initial},
+            }
+        ],
+        "parameters": [parameter],
+    }
+
+
+_COND_TARGETS = {"riv:cond": "riv", "drn:cond": "drn", "ghb:cond": "ghb"}
+
+
+def _resolve_boundary_cond_cells_target(model: str, specs: dict) -> dict:
+    """Spatially varying ``riv:cond`` / ``drn:cond`` / ``ghb:cond``.
+
+    One parameter per group of boundary cells (``scope="cells"`` with a
+    ``cells`` list of ``[layer, row, col]``); cells in no group keep their base
+    conductance, so a varying field is preserved. Groups may not overlap.
+    """
+    targets = {str(s["target"]) for s in specs.values()}
+    if len(targets) != 1:
+        raise ValueError("Conductance groups must all name the same target.")
+    target = targets.pop()
+    ptype = _COND_TARGETS[target]
+    sps = {int(s.get("stress_period", 0)) for s in specs.values()}
+    if len(sps) != 1:
+        raise ValueError(f"All {target} specs must use the same stress_period.")
+    sp = sps.pop()
+    gwf = get_gwf(model)
+    pkg = gwf.get_package(ptype)
+    if pkg is None:
+        raise ValueError(
+            f"No {ptype.upper()} package found; add it with "
+            f"add_boundary_package before parameterising {target}."
+        )
+    rec = pkg.stress_period_data.get_data(sp)
+    if rec is None or len(rec) == 0 or "cond" not in rec.dtype.names:
+        raise ValueError(
+            f"{ptype.upper()} has no records with a cond column for stress "
+            f"period {sp}."
+        )
+    ws = resolve_workspace(model)
+    snap = ws / f"{gwf.name}_{ptype}_sp{sp}_pristine.npy"
+    current = np.asarray(rec["cond"], dtype=float)
+    if snap.exists():
+        base = np.load(snap)
+        if base.shape != current.shape:
+            raise ValueError(
+                f"{ptype.upper()} cond shape {current.shape} does not match "
+                f"the pristine snapshot shape {base.shape}."
+            )
+    else:
+        base = current.copy()
+        np.save(snap, base)
+    index = {tuple(int(v) for v in cid): i for i, cid in enumerate(rec["cellid"])}
+
+    claimed: dict[int, str] = {}
+    parameters: list[dict] = []
+    initial_values: dict[str, float] = {}
+    for raw_key, spec in specs.items():
+        key = str(raw_key)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+            raise ValueError(
+                f"Parameter prefix '{key}' must contain only letters, digits and "
+                "underscores."
+            )
+        if spec.get("scope") != "cells":
+            raise ValueError(f"{target} specs cannot mix scope='cells' with other scopes.")
+        cells = spec.get("cells")
+        if not isinstance(cells, list) or not cells:
+            raise ValueError(f"Parameter '{key}' scope=cells requires a non-empty 'cells' list.")
+        positions = []
+        for cell in cells:
+            ck = tuple(int(v) for v in cell)
+            if ck not in index:
+                raise ValueError(
+                    f"Cell {list(cell)} has no {ptype.upper()} record in stress period {sp}."
+                )
+            positions.append(index[ck])
+        for pos in positions:
+            if pos in claimed:
+                raise ValueError(
+                    f"A {ptype.upper()} record is claimed by both '{claimed[pos]}' and '{key}'."
+                )
+            claimed[pos] = key
+        initial = float(spec.get("initial", float(np.mean(base[positions]))))
+        if not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"Parameter '{key}' initial must be a positive number.")
+        lower_factor = float(spec.get("lower_factor", 0.1))
+        upper_factor = float(spec.get("upper_factor", 10.0))
+        if lower_factor >= 1.0 or upper_factor <= 1.0:
+            raise ValueError(
+                f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+            )
+        initial_values[key] = initial
+        parameters.append(
+            {
+                "name": key,
+                "target": target,
+                "scope": "cells",
+                "layer": None,
+                "initial": initial,
+                "lower_bound": initial * lower_factor,
+                "upper_bound": initial * upper_factor,
+                "partrans": str(spec.get("partrans", "log")).lower(),
+            }
+        )
+
+    external_file = f"{gwf.name}.{ptype}_{sp}.dat"
+    out_rec = rec.copy()
+    out_rec["cond"] = base
+    pkg.stress_period_data.set_data({sp: {"filename": external_file, "data": out_rec}})
+    save_sim(model, gwf.simulation)
+    flush_model(model)
+
+    names = list(rec.dtype.names)
+    cond_pos = names.index("cond")
+    target_path = ws / external_file
+    lines = [
+        ln
+        for ln in target_path.read_text().replace("\r\n", "\n").split("\n")
+        if ln.strip()
+    ]
+    out = ["ptf ~"]
+    for li, ln in enumerate(lines):
+        fields = ln.split()
+        owner = claimed.get(li)
+        if owner is not None:
+            n_cell = len(fields) - (len(names) - 1)
+            fields[n_cell + cond_pos - 1] = "~" + f"{owner:^{_TPL_TOKEN_WIDTH}s}" + "~"
+        out.append("  ".join(fields))
+    tpl_path = ws / f"{external_file}.tpl"
+    tpl_path.write_text("\n".join(out) + "\n")
+    return {
+        "external_files": [external_file],
+        "templates": [
+            {
+                "tpl_path": str(tpl_path),
+                "target": str(target_path),
+                "initial_values": initial_values,
+            }
+        ],
+        "parameters": parameters,
+    }
+
+
+def _resolve_boundary_cond_target(model: str, specs: dict) -> dict:
+    """Resolve ``riv:cond`` / ``drn:cond`` / ``ghb:cond`` (R3.2).
+
+    One constant conductance for a stress period of the package's list data.
+    The base conductance must already be uniform (a varying field would be
+    flattened, so it is refused). The period's records are written to
+    ``<gwf>.<pkg>_<sp>.dat`` (``OPEN/CLOSE``) and the ``cond`` column of every
+    record is tokenised.
+    """
+    if any(isinstance(s, dict) and s.get("scope") == "cells" for s in specs.values()):
+        return _resolve_boundary_cond_cells_target(model, specs)
+    if len(specs) != 1:
+        raise ValueError(
+            "Boundary conductance with scope='all' takes exactly one parameter "
+            "per package; use scope='cells' for several spatial groups. "
+            f"Got {len(specs)}."
+        )
+    ((key, spec),) = specs.items()
+    key = str(key)
+    target = str(spec["target"])
+    ptype = _COND_TARGETS[target]
+    if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+        raise ValueError(
+            f"Parameter prefix '{key}' must contain only letters, digits and "
+            "underscores."
+        )
+    if spec.get("scope", "all") != "all":
+        raise ValueError(
+            f"Parameter '{key}': {target} requires scope='all', got "
+            f"'{spec.get('scope')}'."
+        )
+    sp = int(spec.get("stress_period", 0))
+    gwf = get_gwf(model)
+    pkg = gwf.get_package(ptype)
+    if pkg is None:
+        raise ValueError(
+            f"No {ptype.upper()} package found; add it with "
+            f"add_boundary_package before parameterising {target}."
+        )
+    rec = pkg.stress_period_data.get_data(sp)
+    if rec is None or len(rec) == 0 or "cond" not in rec.dtype.names:
+        raise ValueError(
+            f"{ptype.upper()} has no records with a cond column for stress "
+            f"period {sp}."
+        )
+    ws = resolve_workspace(model)
+    snap = ws / f"{gwf.name}_{ptype}_sp{sp}_pristine.npy"
+    current = np.asarray(rec["cond"], dtype=float)
+    if snap.exists():
+        base = np.load(snap)
+        if base.shape != current.shape:
+            raise ValueError(
+                f"{ptype.upper()} cond shape {current.shape} does not match "
+                f"the pristine snapshot shape {base.shape}."
+            )
+    else:
+        base = current.copy()
+        np.save(snap, base)
+    if not np.allclose(base, base[0], rtol=1e-9, atol=0.0):
+        raise ValueError(
+            f"{target} requires a uniform base conductance (the parameter is "
+            "one constant value); the current conductance varies between "
+            "cells, so it would be flattened."
+        )
+    initial = float(spec.get("initial", base[0]))
+    if not np.isfinite(initial) or initial <= 0:
+        raise ValueError(f"Parameter '{key}' initial must be a positive number.")
+    lower_factor = float(spec.get("lower_factor", 0.1))
+    upper_factor = float(spec.get("upper_factor", 10.0))
+    if lower_factor >= 1.0 or upper_factor <= 1.0:
+        raise ValueError(
+            f"Parameter '{key}': lower_factor must be < 1 and upper_factor > 1."
+        )
+    external_file = f"{gwf.name}.{ptype}_{sp}.dat"
+    out_rec = rec.copy()
+    out_rec["cond"] = base
+    pkg.stress_period_data.set_data({sp: {"filename": external_file, "data": out_rec}})
+    save_sim(model, gwf.simulation)
+    flush_model(model)
+
+    names = list(rec.dtype.names)
+    cond_pos = names.index("cond")
+    target_path = ws / external_file
+    lines = [
+        ln
+        for ln in target_path.read_text().replace("\r\n", "\n").split("\n")
+        if ln.strip()
+    ]
+    token = "~" + f"{key:^{_TPL_TOKEN_WIDTH}s}" + "~"
+    out = ["ptf ~"]
+    for ln in lines:
+        fields = ln.split()
+        n_cell = len(fields) - (len(names) - 1)
+        fields[n_cell + cond_pos - 1] = token
+        out.append("  ".join(fields))
+    tpl_path = ws / f"{external_file}.tpl"
+    tpl_path.write_text("\n".join(out) + "\n")
+    return {
+        "external_files": [external_file],
+        "templates": [
+            {
+                "tpl_path": str(tpl_path),
+                "target": str(target_path),
+                "initial_values": {key: initial},
+            }
+        ],
+        "parameters": [
+            {
+                "name": key,
+                "target": target,
+                "scope": "all",
+                "layer": None,
+                "initial": initial,
+                "lower_bound": initial * lower_factor,
+                "upper_bound": initial * upper_factor,
+                "partrans": str(spec.get("partrans", "log")).lower(),
+            }
+        ],
+    }
+
+
 # Target -> resolver. ``setup_calibration`` partitions a spec set by target and
 # resolves each group independently, so a single call assembles one .pst from
 # several targets (npf + csub) and the NPF coverage guard is evaluated per
@@ -3563,6 +4221,12 @@ _TARGET_RESOLVERS = {
     "csub:packagedata": _resolve_csub_packagedata_target,
     "csub:cg_theta": _resolve_csub_layer_array_target,
     "csub:cg_ske_cr": _resolve_csub_layer_array_target,
+    "sto:ss": _resolve_csub_layer_array_target,
+    "sto:sy": _resolve_csub_layer_array_target,
+    "rch:recharge": _resolve_rch_recharge_target,
+    "riv:cond": _resolve_boundary_cond_target,
+    "drn:cond": _resolve_boundary_cond_target,
+    "ghb:cond": _resolve_boundary_cond_target,
 }
 assert set(_SUPPORTED_TARGETS) == set(_TARGET_RESOLVERS)
 
@@ -3799,18 +4463,9 @@ def _impl_setup_calibration(
             )
         groups.setdefault(str(target), {})[name] = spec
 
-    templates: list[dict] = []
-    all_parameters: list[dict] = []
-    external_files: list[str] = []
-    for target, group in groups.items():
-        resolved = _TARGET_RESOLVERS[target](model, group)
-        templates.extend(resolved["templates"])
-        all_parameters.extend(resolved["parameters"])
-        external_files.extend(resolved["external_files"])
-    if not templates:
-        raise ValueError("parameterisation produced no calibration template.")
-
-    # Observation interface from the registered targets. ``"model"`` reads the
+    # Observation interface from the registered targets. Validated BEFORE any
+    # target is resolved (R4.1): resolving writes pristine snapshots, external
+    # arrays and templates, so a call rejected here leaves none behind. ``"model"`` reads the
     # model's obs CSV; ``"derived"`` reads the wrapper-derived subsidence CSV
     # built from the targets registered by ``import_subsidence_observations``.
     derived_report: dict | None = None
@@ -3846,6 +4501,17 @@ def _impl_setup_calibration(
             "setup_calibration supports obs_source='model' or 'derived', got "
             f"'{obs_source}'."
         )
+
+    templates: list[dict] = []
+    all_parameters: list[dict] = []
+    external_files: list[str] = []
+    for target, group in groups.items():
+        resolved = _TARGET_RESOLVERS[target](model, group)
+        templates.extend(resolved["templates"])
+        all_parameters.extend(resolved["parameters"])
+        external_files.extend(resolved["external_files"])
+    if not templates:
+        raise ValueError("parameterisation produced no calibration template.")
 
     # Forward-model command: the wrapper only when the default MF6 command
     # would be unsafe on Windows.
@@ -4764,6 +5430,7 @@ def _impl_setup_pest_control(
     pestpp_options: dict | None = None,
     obs_source: str = "explicit",
     _suppress_command_warning: bool = False,
+    unlisted_obs: str = "error",
 ) -> dict:
     """Build and write a PEST++ control file (.pst) for the model.
 
@@ -4813,6 +5480,12 @@ def _impl_setup_pest_control(
         ``"derived"`` is accepted as an alias for the explicit branch (the
         caller builds the interface from registered derived subsidence
         targets, Task 8).
+    unlisted_obs:
+        What to do with instruction-file tokens that have no ``obs_data``
+        entry.  ``"error"`` (default) raises; ``"zero_weight"`` keeps them in
+        the control file with weight 0 so they are read but do not contribute
+        to phi (for instruction files with more tokens than calibration
+        targets).
     pestpp_options:
         Optional PEST++ options written to the ++options section.  Special
         keys handled here (not written to ++options):
@@ -4834,6 +5507,10 @@ def _impl_setup_pest_control(
     """
     ws = resolve_workspace(model)
     pestpp_options = dict(pestpp_options or {})
+    if unlisted_obs not in ("error", "zero_weight"):
+        raise ValueError(
+            f"unlisted_obs must be 'error' or 'zero_weight', got '{unlisted_obs}'."
+        )
 
     # Flush staged model changes: pestpp invokes the forward model (MF6) which
     # reads the on-disk input set (7f-E1.2).
@@ -4937,12 +5614,14 @@ def _impl_setup_pest_control(
     obs_df = pst.observation_data
     obs_index = {str(n).lower(): n for n in obs_df.index}
     unmatched: list[str] = []
+    supplied: set[str] = set()
     for obs_name, attrs in obs_data.items():
         key = str(obs_name).lower()
         if key not in obs_index:
             unmatched.append(obs_name)
             continue
         canonical = obs_index[key]
+        supplied.add(canonical)
         obs_df.loc[canonical, "obsval"] = float(attrs.get("obsval", attrs.get("value", 0.0)))
         obs_df.loc[canonical, "weight"] = float(attrs.get("weight", 1.0))
         if "obgnme" in attrs:
@@ -4956,16 +5635,35 @@ def _impl_setup_pest_control(
             "tokens in the instruction file(s)."
         )
 
+    # Instruction tokens with no obs_data entry keep pyemu's generic_pst
+    # placeholder (obsval 1e10, weight 1), which swamps phi (~1e20 per
+    # observation) — never write those to the control file (R4.2).
+    unlisted = [n for n in obs_df.index if n not in supplied]
+    if unlisted and unlisted_obs == "error":
+        shown = ", ".join(str(n) for n in unlisted[:10])
+        more = f" (+{len(unlisted) - 10} more)" if len(unlisted) > 10 else ""
+        raise ValueError(
+            f"{len(unlisted)} observation name(s) in the instruction file(s) "
+            f"have no entry in obs_data: {shown}{more}. Supply an observed "
+            "value for each, or pass unlisted_obs='zero_weight' to keep them "
+            "in the control file with weight 0 (read but not fitted)."
+        )
+    if unlisted:
+        obs_df.loc[unlisted, "obsval"] = 0.0
+        obs_df.loc[unlisted, "weight"] = 0.0
+
     # Populate parameter bounds and initial values — validate alignment.
     par_df = pst.parameter_data
     par_index = {str(n).lower(): n for n in par_df.index}
     unmatched_par: list[str] = []
+    supplied_par: set[str] = set()
     for par_name, attrs in par_data.items():
         key = str(par_name).lower()
         if key not in par_index:
             unmatched_par.append(par_name)
             continue
         canonical = par_index[key]
+        supplied_par.add(canonical)
         parval1 = float(attrs.get("parval1", attrs.get("initial_value", 1.0)))
         # Safe numeric defaults (7e-A2.5): base/10–base×10 rather than the
         # old blanket 0.01–100, which stressed the Newton solve on real models
@@ -4986,6 +5684,19 @@ def _impl_setup_pest_control(
             f"file(s): {unmatched_par}. Available parameter names from the "
             f"template file(s): {available}. par_data keys must match the "
             "tokens in the template file(s)."
+        )
+
+    # Template tokens with no par_data entry keep pyemu's generic_pst
+    # placeholder (parval1 1.0, bounds 1.1e-10..1.1e10), which writes 1.0 into
+    # the model input — never write those to the control file (R4.2).
+    unlisted_par = [n for n in par_df.index if n not in supplied_par]
+    if unlisted_par:
+        shown = ", ".join(str(n) for n in unlisted_par[:10])
+        more = f" (+{len(unlisted_par) - 10} more)" if len(unlisted_par) > 10 else ""
+        raise ValueError(
+            f"{len(unlisted_par)} parameter name(s) in the template file(s) "
+            f"have no entry in par_data: {shown}{more}. Supply an initial value "
+            "for each (use partrans='fixed' to hold one constant)."
         )
 
     # Apply remaining PEST++ options. noptmax is native PEST control data,
@@ -5014,7 +5725,8 @@ def _impl_setup_pest_control(
         "model": model,
         "pst_file": str(pst_path),
         "n_observations": len(obs_df),
-        "n_observations_matched": len(obs_df) - len(unmatched),
+        "n_observations_matched": len(supplied),
+        "n_observations_zero_weight": len(unlisted),
         "n_adjustable_parameters": n_adjustable,
         "n_total_parameters": len(par_df),
         "model_command": list(pst.model_command),
@@ -5306,6 +6018,508 @@ def _impl_run_pestpp_ies(
     }
 
 
+_SEN_INSENSITIVE_FRACTION = 1e-3
+
+
+def _impl_run_pestpp_sen(
+    model: str,
+    pst_file: str,
+    method: str = "morris",
+    morris_r: int = 4,
+    morris_p: int = 4,
+    sobol_samples: int = 100,
+) -> dict:
+    """Run PESTPP-SEN (Morris or Sobol global sensitivity) (R2.5).
+
+    The control file is copied to ``<case>_sen.pst`` with the GSA options added,
+    so the caller's calibration control file is never modified. Morris returns
+    the parameters ranked by mu* (the mean absolute elementary effect, the usual
+    screening statistic) with sigma (a non-zero sigma flags interaction or
+    non-linearity), plus the per-observation-group breakdown; parameters whose
+    mu* is below 0.1 % of the largest are listed as ``insensitive``. Sobol
+    returns first-order (``s1``) and total (``st``) variance indices of phi for
+    each parameter, ranked by ``st``; ``st`` well above ``s1`` indicates
+    interaction. Sobol needs ``sobol_samples`` x (npar + 2) model runs.
+    """
+    if method not in ("morris", "sobol"):
+        raise ValueError(
+            f"method must be 'morris' or 'sobol', got '{method}'."
+        )
+    if morris_r < 2 or morris_p < 2:
+        raise ValueError("morris_r and morris_p must both be >= 2.")
+    if not 4 <= int(sobol_samples) <= 5000:
+        raise ValueError("sobol_samples must be between 4 and 5000.")
+
+    exe = _find_pestpp_binary("pestpp-sen")
+    ws = resolve_workspace(model)
+    src_pst = _resolve_pst_path(model, pst_file)
+    flush_model(model)
+
+    pst = pyemu.Pst(str(src_pst))
+    pst.pestpp_options["gsa_method"] = method
+    if method == "morris":
+        pst.pestpp_options["gsa_morris_r"] = int(morris_r)
+        pst.pestpp_options["gsa_morris_p"] = int(morris_p)
+    else:
+        pst.pestpp_options["gsa_sobol_samples"] = int(sobol_samples)
+    sen_pst = ws / f"{src_pst.stem}_sen.pst"
+    pst.write(str(sen_pst))
+
+    proc = subprocess.run(
+        [exe, sen_pst.name], cwd=str(ws), capture_output=True, text=True
+    )
+    if method == "sobol":
+        si_file = ws / f"{sen_pst.stem}.sobol.si.csv"
+        sti_file = ws / f"{sen_pst.stem}.sobol.sti.csv"
+        if proc.returncode != 0 or not si_file.exists() or not sti_file.exists():
+            raise RuntimeError(
+                f"pestpp-sen (sobol) did not complete (exit {proc.returncode}); "
+                f"no {si_file.name} was written. Output tail: "
+                f"{(proc.stdout or proc.stderr)[-600:]}"
+            )
+        si = pd.read_csv(si_file).set_index("output")
+        sti = pd.read_csv(sti_file).set_index("output")
+        if "phi" not in si.index or "phi" not in sti.index:
+            raise RuntimeError(f"{si_file.name} has no 'phi' row to rank parameters by.")
+        sobol_params: list[dict[str, Any]] = [
+            {
+                "name": str(p),
+                "s1": float(si.loc["phi", p]),
+                "st": float(sti.loc["phi", p]),
+            }
+            for p in si.columns
+        ]
+        sobol_params.sort(key=lambda r: float(r["st"]), reverse=True)
+        for i, row in enumerate(sobol_params):
+            row["rank"] = i + 1
+        top_st = float(sobol_params[0]["st"]) if sobol_params else 0.0
+        return {
+            "model": model,
+            "pst_file": str(sen_pst),
+            "method": "sobol",
+            "completed": True,
+            "sobol_samples": int(sobol_samples),
+            "parameters": sobol_params,
+            "insensitive": [
+                r["name"]
+                for r in sobol_params
+                if top_st > 0 and r["st"] < _SEN_INSENSITIVE_FRACTION * top_st
+            ],
+            "by_output": {
+                str(out): {
+                    str(p): {"s1": float(si.loc[out, p]), "st": float(sti.loc[out, p])}
+                    for p in si.columns
+                }
+                for out in si.index
+                if out in sti.index
+            },
+            "summary_file": str(si_file),
+            "note": (
+                "Indices are Monte-Carlo estimates; with few samples they are "
+                "noisy and can fall outside [0, 1]. Raise sobol_samples before "
+                "trusting a ranking."
+            ),
+        }
+    summary = ws / f"{sen_pst.stem}.msn"
+    if proc.returncode != 0 or not summary.exists():
+        raise RuntimeError(
+            f"pestpp-sen did not complete (exit {proc.returncode}); no "
+            f"{summary.name} was written. Output tail: "
+            f"{(proc.stdout or proc.stderr)[-600:]}"
+        )
+
+    df = pd.read_csv(summary)
+    df = df.sort_values("sen_mean_abs", ascending=False).reset_index(drop=True)
+    top = float(df["sen_mean_abs"].max()) if len(df) else 0.0
+    parameters = [
+        {
+            "rank": int(i) + 1,
+            "name": str(row["parameter_name"]),
+            "mu_star": float(row["sen_mean_abs"]),
+            "mu": float(row["sen_mean"]),
+            "sigma": float(row["sen_std_dev"]),
+            "n_samples": int(row["n_samples"]),
+        }
+        for i, row in df.iterrows()
+    ]
+    cutoff = _SEN_INSENSITIVE_FRACTION * top
+    insensitive = [
+        str(p["name"]) for p in parameters if top > 0 and float(p["mu_star"]) < cutoff  # type: ignore[arg-type]
+    ]
+
+    by_group: list[dict] = []
+    group_file = ws / f"{sen_pst.stem}.group.msn"
+    if group_file.exists():
+        gdf = pd.read_csv(group_file)
+        by_group = [
+            {
+                "parameter": str(r["parameter_name"]),
+                "obs_group": str(r["obs_group_name"]),
+                "mu_star": float(r["sen_mean_abs"]),
+                "sigma": float(r["sen_std_dev"]),
+            }
+            for _, r in gdf.iterrows()
+        ]
+
+    return {
+        "model": model,
+        "pst_file": str(sen_pst),
+        "method": method,
+        "completed": True,
+        "morris_r": int(morris_r),
+        "morris_p": int(morris_p),
+        "parameters": parameters,
+        "insensitive": insensitive,
+        "by_observation_group": by_group,
+        "summary_file": str(summary),
+    }
+
+
+def _impl_run_pestpp_sweep(
+    model: str,
+    pst_file: str,
+    num_samples: int = 20,
+    seed: int = 1,
+    parameter_csv: str | None = None,
+) -> dict:
+    """Run PESTPP-SWP over a set of parameter vectors (R2.5).
+
+    Without ``parameter_csv`` a Latin-hypercube sample of ``num_samples`` vectors
+    is drawn within the adjustable parameters' bounds (log10 space for log-
+    transformed parameters), so the sweep explores the plausible range. With a
+    CSV (columns = parameter names, one row per run) exactly those vectors are
+    run. Each run's simulated observations and phi are returned; the control
+    file is copied to ``<case>_swp.pst`` and the caller's is not modified.
+    """
+    if parameter_csv is None and not 2 <= int(num_samples) <= 2000:
+        raise ValueError("num_samples must be between 2 and 2000.")
+    exe = _find_pestpp_binary("pestpp-swp")
+    ws = resolve_workspace(model)
+    src_pst = _resolve_pst_path(model, pst_file)
+    flush_model(model)
+    pst = pyemu.Pst(str(src_pst))
+    par = pst.parameter_data
+    adj = par.loc[par.partrans.isin(["log", "none"])]
+    names = [str(n) for n in adj.index]
+    if not names:
+        raise ValueError("The control file has no adjustable parameters to sweep.")
+
+    param_path = ws / f"{src_pst.stem}_swp_params.csv"
+    if parameter_csv is None:
+        rng = np.random.default_rng(int(seed))
+        n = int(num_samples)
+        cols = {}
+        for pname in names:
+            lo = float(adj.loc[pname, "parlbnd"])
+            hi = float(adj.loc[pname, "parubnd"])
+            u = (rng.permutation(n) + rng.random(n)) / n
+            if adj.loc[pname, "partrans"] == "log" and lo > 0:
+                cols[pname] = 10 ** (np.log10(lo) + u * (np.log10(hi) - np.log10(lo)))
+            else:
+                cols[pname] = lo + u * (hi - lo)
+        sample_df = pd.DataFrame(cols)
+        sample_df.to_csv(param_path, index=True, index_label="run_id")
+    else:
+        sample_df = pd.read_csv(parameter_csv)
+        missing = [n for n in names if n not in sample_df.columns]
+        if missing:
+            raise ValueError(
+                f"parameter_csv is missing column(s) for adjustable parameter(s) {missing}."
+            )
+        if len(sample_df) == 0:
+            raise ValueError("parameter_csv has no rows.")
+        sample_df = sample_df[names]
+        sample_df.to_csv(param_path, index=True, index_label="run_id")
+
+    out_name = f"{src_pst.stem}_swp_out.csv"
+    pst.pestpp_options["sweep_parameter_csv_file"] = param_path.name
+    pst.pestpp_options["sweep_output_csv_file"] = out_name
+    swp_pst = ws / f"{src_pst.stem}_swp.pst"
+    pst.write(str(swp_pst))
+    proc = subprocess.run(
+        [exe, swp_pst.name], cwd=str(ws), capture_output=True, text=True
+    )
+    out_path = ws / out_name
+    if proc.returncode != 0 or not out_path.exists():
+        raise RuntimeError(
+            f"pestpp-swp did not complete (exit {proc.returncode}); no {out_name} "
+            f"was written. Output tail: {(proc.stdout or proc.stderr)[-600:]}"
+        )
+    out = pd.read_csv(out_path)
+    out.columns = [str(c).strip().lower() for c in out.columns]
+    obs_names = [str(n).lower() for n in pst.observation_data.index]
+    obs_cols = [c for c in obs_names if c in out.columns]
+    runs = []
+    for i, row in out.iterrows():
+        failed = int(row.get("failed_flag", 0)) != 0
+        runs.append(
+            {
+                "run": int(row.get("run_id", i)),
+                "failed": failed,
+                "parameters": {
+                    n: float(sample_df.iloc[int(i)][n]) for n in names
+                } if int(i) < len(sample_df) else {},
+                "phi": None if failed or "phi" not in out.columns else float(row["phi"]),
+                "observations": {} if failed else {c: float(row[c]) for c in obs_cols},
+            }
+        )
+    ok = [r for r in runs if not r["failed"]]
+    phis = [float(r["phi"]) for r in ok if r["phi"] is not None]  # type: ignore[arg-type]
+    return {
+        "model": model,
+        "pst_file": str(swp_pst),
+        "n_runs": len(runs),
+        "n_failed": len(runs) - len(ok),
+        "parameter_names": names,
+        "runs": runs,
+        "phi_range": {"min": min(phis), "max": max(phis)} if phis else None,
+        "parameter_file": str(param_path),
+        "output_file": str(out_path),
+    }
+
+
+def _impl_run_pestpp_opt(
+    model: str,
+    pst_file: str,
+    objective: str | dict,
+    decision_parameters: list[str],
+    constraints: dict,
+    direction: str = "max",
+) -> dict:
+    """Constrained optimisation with PESTPP-OPT (sequential linear programming).
+
+    ``decision_parameters`` are the control file's parameters that become
+    decision variables (the rest are held fixed); ``objective`` is a parameter
+    name or ``{parameter: coefficient}`` (a linear function of the decision
+    variables) to ``direction`` "max" or "min"; ``constraints`` maps a
+    simulated-observation name to ``{"type": "less_than" | "greater_than",
+    "value": rhs}``. The control file is copied to ``<case>_opt.pst``; yours is
+    not modified. Returns the optimal decision values, the objective value and
+    each constraint's simulated value, slack and whether it is active.
+    """
+    if direction not in ("max", "min"):
+        raise ValueError("direction must be 'max' or 'min'.")
+    if not decision_parameters:
+        raise ValueError("decision_parameters must name at least one parameter.")
+    if not constraints:
+        raise ValueError("constraints must name at least one observation.")
+    exe = _find_pestpp_binary("pestpp-opt")
+    ws = resolve_workspace(model)
+    src_pst = _resolve_pst_path(model, pst_file)
+    flush_model(model)
+    pst = pyemu.Pst(str(src_pst))
+    par = pst.parameter_data
+    obs = pst.observation_data
+    pnames = {str(n).lower(): str(n) for n in par.index}
+    onames = {str(n).lower(): str(n) for n in obs.index}
+
+    decvars = []
+    for name in decision_parameters:
+        if str(name).lower() not in pnames:
+            raise ValueError(
+                f"Decision parameter '{name}' is not in the control file. "
+                f"Parameters: {list(par.index)}."
+            )
+        decvars.append(pnames[str(name).lower()])
+    coefs = {objective: 1.0} if isinstance(objective, str) else dict(objective)
+    for name in coefs:
+        if str(name).lower() not in {d.lower() for d in decvars}:
+            raise ValueError(
+                f"The objective uses '{name}', which is not a decision parameter."
+            )
+
+    constraint_rows: list[tuple[str, str, float]] = []
+    for oname, spec in constraints.items():
+        if str(oname).lower() not in onames:
+            raise ValueError(
+                f"Constraint observation '{oname}' is not in the control file."
+            )
+        ctype = str(spec.get("type", "")).lower()
+        if ctype not in ("less_than", "greater_than"):
+            raise ValueError(
+                f"Constraint '{oname}' type must be 'less_than' or 'greater_than'."
+            )
+        if "value" not in spec:
+            raise ValueError(f"Constraint '{oname}' needs a 'value'.")
+        constraint_rows.append((onames[str(oname).lower()], ctype, float(spec["value"])))
+
+    for name in par.index:
+        if name in decvars:
+            par.loc[name, "partrans"] = "none"
+            par.loc[name, "pargp"] = "decvars"
+        else:
+            par.loc[name, "partrans"] = "fixed"
+    obs["weight"] = 0.0
+    for oname, ctype, rhs in constraint_rows:
+        obs.loc[oname, "obgnme"] = ctype
+        obs.loc[oname, "obsval"] = rhs
+        obs.loc[oname, "weight"] = 1.0
+    groups = sorted({ctype for _, ctype, _ in constraint_rows})
+    pst.add_pi_equation(
+        [pnames[str(n).lower()] for n in coefs],
+        pilbl="obj_fn",
+        coef_dict={pnames[str(n).lower()]: float(c) for n, c in coefs.items()},
+        rhs=0.0,
+        weight=0.0,
+        obs_group="obj_grp",
+    )
+    pst.pestpp_options["opt_dec_var_groups"] = "decvars"
+    pst.pestpp_options["opt_constraint_groups"] = ",".join(groups)
+    pst.pestpp_options["opt_obj_func"] = "obj_fn"
+    pst.pestpp_options["opt_direction"] = direction
+    pst.control_data.noptmax = 1
+    opt_pst = ws / f"{src_pst.stem}_opt.pst"
+    pst.write(str(opt_pst))
+
+    proc = subprocess.run(
+        [exe, opt_pst.name], cwd=str(ws), capture_output=True, text=True
+    )
+    par_file = ws / f"{opt_pst.stem}.par"
+    res_file = ws / f"{opt_pst.stem}.1.sim.rei"
+    if proc.returncode != 0 or not par_file.exists():
+        raise RuntimeError(
+            f"pestpp-opt did not complete (exit {proc.returncode}). Output tail: "
+            f"{(proc.stdout or proc.stderr)[-700:]}"
+        )
+    values = _parse_par_file(par_file)
+    optimal = {d: float(values[d.lower()]) for d in decvars if d.lower() in values}
+    if not optimal or any(abs(v) > 1e300 for v in optimal.values()):
+        raise ValueError(
+            "The optimisation problem is infeasible: no decision values satisfy the "
+            "constraints, as linearised at the control file's initial values. Relax "
+            "a constraint, widen the decision parameters' bounds, or start from "
+            "initial values closer to a feasible point (the linearisation is only "
+            "reliable near the starting point)."
+        )
+    objective_value = sum(
+        float(c) * optimal[pnames[str(n).lower()]] for n, c in coefs.items()
+    )
+    sim: dict[str, float] = {}
+    if res_file.exists():
+        res = pyemu.pst_utils.read_resfile(str(res_file))
+        sim = {str(n).lower(): float(v) for n, v in res["modelled"].items()}
+    report = []
+    for oname, ctype, rhs in constraint_rows:
+        value = sim.get(oname.lower())
+        slack = None
+        if value is not None:
+            slack = (rhs - value) if ctype == "less_than" else (value - rhs)
+        report.append(
+            {
+                "observation": oname,
+                "type": ctype,
+                "value": rhs,
+                "simulated": value,
+                "slack": slack,
+                "active": slack is not None and abs(slack) <= 1e-6 * max(1.0, abs(rhs)),
+            }
+        )
+    return {
+        "model": model,
+        "pst_file": str(opt_pst),
+        "direction": direction,
+        "optimal_decisions": optimal,
+        "objective_value": objective_value,
+        "constraints": report,
+        "parameter_file": str(par_file),
+        "note": (
+            "Sequential linear programming: constraints are linearised from "
+            "finite-difference runs, so check 'simulated' against the rhs and "
+            "re-run from the optimum if the model is strongly non-linear."
+        ),
+    }
+
+
+def _impl_apply_calibration_result(model: str, pst_file: str) -> dict:
+    """Write the calibrated parameter values back into the model's inputs (R3.1).
+
+    Reads the best estimate of a finished PEST++ run (GLM: the optimal
+    ``<case>.par``; IES: the mean of the final parameter ensemble) and
+    regenerates every model input file from its PEST template with those
+    values, so the model's own arrays hold the calibrated field and a forward
+    run, plot or export reflects the calibration. Zoned setups also rebuild
+    the K array from base × multiplier. pestpp-da runs are not supported: their
+    parameters are per-cycle.
+    """
+    ws = resolve_workspace(model)
+    pst_path = _resolve_pst_path(model, pst_file)
+    pst = pyemu.Pst(str(pst_path))
+    base_name = pst_path.stem
+    engine = _detect_pestpp_engine(ws, base_name)
+
+    if engine == "da":
+        raise ValueError(
+            "apply_calibration_result does not support pestpp-da runs: their "
+            "parameters are per assimilation cycle. Use summarise_da for the "
+            "posterior and re-run the model from it explicitly."
+        )
+    if engine == "ies":
+        ensemble = _read_ies_parameter_ensemble(ws, base_name)
+        values = {name: stats["mean"] for name, stats in ensemble.items()}
+        source = f"mean of the final ensemble {base_name}.<N>.par.csv"
+    else:
+        par_file = ws / f"{base_name}.par"
+        if not par_file.exists():
+            raise FileNotFoundError(
+                f"No calibration result found: {par_file.name} is missing in "
+                f"{ws}. Run pestpp-glm/ies (run_pestpp_glm, run_pestpp_ies or "
+                "start_calibration) to completion first."
+            )
+        values = _parse_par_file(par_file)
+        source = par_file.name
+    if not values:
+        raise FileNotFoundError(
+            f"No calibration result found for {pst_path.name} in {ws}: the run "
+            "produced no parameter estimates."
+        )
+
+    par_names = [str(n) for n in pst.parameter_data.index]
+    missing = [n for n in par_names if n.lower() not in values]
+    if missing:
+        raise ValueError(
+            f"The calibration result has no value for parameter(s) {missing[:10]}; "
+            "it does not match this control file."
+        )
+    parvals = {n: float(values[n.lower()]) for n in par_names}
+
+    # Persist unsaved edits first, then rewrite the external input files; the
+    # cached model is dropped so the next access reloads the calibrated arrays.
+    flush_model(model)
+    written: list[str] = []
+    for tpl_name, in_name in zip(
+        pst.model_input_data["pest_file"], pst.model_input_data["model_file"]
+    ):
+        tpl_path = ws / str(tpl_name)
+        target = ws / str(in_name)
+        pyemu.pst_utils.write_to_template(parvals, str(tpl_path), str(target))
+        _maybe_apply_zone_multipliers(model, target)
+        written.append(target.name)
+    invalidate(model)
+
+    meta = read_meta(model)
+    meta["calibration_applied"] = {
+        "pst_file": pst_path.name,
+        "engine": engine,
+        "source": source,
+        "parameters": parvals,
+        "files": written,
+    }
+    write_meta(model, meta)
+
+    return {
+        "model": model,
+        "engine": engine,
+        "source": source,
+        "parameters": parvals,
+        "files_written": written,
+        "next_step": (
+            "Run run_simulation (or start_run) to produce heads and budgets "
+            "from the calibrated field, then read_heads / plot_heads_map / "
+            "export_heads_to_raster / compare_to_observed."
+        ),
+    }
+
+
 def _impl_summarise_calibration(
     model: str,
     pst_file: str,
@@ -5443,9 +6657,19 @@ def _impl_summarise_calibration(
     final_phi = phi_progress[-1]["phi"] if phi_progress else None
     meta = read_meta(model)
     prior_phi = (meta.get("calibration") or {}).get("last_phi")
+    # ``improved`` compares with the previous calibration when one was
+    # recorded, otherwise with this run's own starting phi. With neither (one
+    # phi value, no baseline) it is unknown rather than a default True.
+    initial_phi = phi_progress[0]["phi"] if len(phi_progress) >= 2 else None
     improved = None
     if final_phi is not None:
-        improved = prior_phi is None or final_phi < prior_phi
+        if prior_phi is not None:
+            improved = final_phi < prior_phi
+        elif initial_phi is not None:
+            improved = final_phi < initial_phi
+    phi_reduction_pct = None
+    if final_phi is not None and initial_phi:
+        phi_reduction_pct = 100.0 * (initial_phi - final_phi) / initial_phi
 
     parameters_at_bounds: list[str] = []
     for est in par_estimates:
@@ -5472,6 +6696,8 @@ def _impl_summarise_calibration(
     verdict = {
         "improved": improved,
         "final_phi": final_phi,
+        "initial_phi": initial_phi,
+        "phi_reduction_pct": phi_reduction_pct,
         "prior_phi": prior_phi,
         "parameters_at_bounds": parameters_at_bounds,
         "identifiable": identifiable,
@@ -5701,7 +6927,11 @@ def register(mcp: FastMCP) -> None:
 
         scope is "all" (whole array), "layer" (with "layer": N), or "cells"
         (with "cells": [[layer,row,col], ...] — DIS — or [[layer,node], ...]
-        — DISV). Optional keys: lower_factor/upper_factor (default 0.1/10.0)
+        — DISV). Each such parameter writes ONE value into all its cells: if
+        those cells currently hold several distinct values the call fails
+        (use scope "zones" to keep the pattern) unless the spec sets
+        "allow_flatten": true. Optional keys: lower_factor/upper_factor
+        (default 0.1/10.0)
         set the bounds from initial; partrans defaults to "log". Parameter
         names are capped at 12 characters (PEST). The target may also be
         "npf:k33" (vertical conductivity), externalised to <gwf>_k33.dat with
@@ -5712,8 +6942,17 @@ def register(mcp: FastMCP) -> None:
         column x interbed per parameter (named <key>_<column>_<icsubno>,
         bounds default value x 0.05 / x 20); {"cg": {"target":
         "csub:cg_theta", "scope": "layer", "layer": 0, "initial": 0.35}}
-        parameterises a per-layer CSUB array (cg_theta / cg_ske_cr). Several
-        targets assemble into one .pst.
+        parameterises a per-layer CSUB array (cg_theta / cg_ske_cr). Storage:
+        {"ss": {"target": "sto:ss", "scope": "layer", "layer": 0, "initial":
+        1e-5}} (also "sto:sy"). Recharge: {"rech": {"target": "rch:recharge",
+        "scope": "all", "initial": 0.001, "stress_period": 0}} - one constant
+        rate; refused when the base recharge is not uniform. For spatially
+        varying recharge give each group {"target": "rch:recharge", "scope":
+        "cells", "cells": [[0, r, c], ...], "initial": ...}; cells in no group
+        keep their base value. Boundary
+        conductance: {"c": {"target": "drn:cond", "scope": "all", "initial":
+        1000}} (also "riv:cond", "ghb:cond"; uniform base required). Several targets
+        assemble into one .pst.
 
         scope may also be "zones" (with "layer": N): zones are derived from
         equal positive K values in that layer and each zone becomes a
@@ -5861,18 +7100,25 @@ def register(mcp: FastMCP) -> None:
         instruction_files: list[str],
         pestpp_options: dict | None = None,
         obs_source: str = "explicit",
+        unlisted_obs: str = "error",
     ) -> dict:
         """Generate a PEST++ control file (.pst) for the model.
 
         obs_data maps observation names to dicts with keys: obsval (or value),
         weight, obgnme.  par_data maps parameter names to dicts with keys:
         parval1 (or initial_value), parlbnd (or lower_bound), parubnd (or
-        upper_bound), pargp, partrans.
+        upper_bound), pargp, partrans.  Every parameter token in the template
+        file(s) must have a par_data entry (use partrans="fixed" to hold one
+        constant); a token without one is an error.
 
         The instruction file(s) must already exist and define the observation
         tokens (classic PEST `!name!` or pyemu pif/jif).  obs_data keys MUST
         match those tokens exactly (case-insensitive); a mismatch raises an
-        error instead of silently dropping observations.
+        error instead of silently dropping observations.  Every instruction
+        token must likewise have an obs_data entry: by default a token without
+        one is an error (unlisted_obs="error").  For an instruction file with
+        more tokens than calibration targets, pass unlisted_obs="zero_weight"
+        to keep the extra tokens with weight 0 (read but not fitted).
 
         obs_source: "explicit" (default) requires obs_data + instruction_files.
         "model" builds both from the observation targets registered by
@@ -5912,6 +7158,7 @@ def register(mcp: FastMCP) -> None:
                 instruction_files,
                 pestpp_options,
                 obs_source,
+                unlisted_obs=unlisted_obs,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -6052,6 +7299,148 @@ def register(mcp: FastMCP) -> None:
             if "not found" in msg.lower() or "binary" in msg.lower():
                 return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
             return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def run_pestpp_sen(
+        model: str,
+        pst_file: str,
+        method: str = "morris",
+        morris_r: int = 4,
+        morris_p: int = 4,
+        sobol_samples: int = 100,
+    ) -> dict:
+        """Global parameter sensitivity with PESTPP-SEN (method "morris" or
+        "sobol").
+
+        Morris runs the model for morris_r trajectories x (npar + 1) parameter
+        sets and returns the parameters ranked by mu* (mean absolute elementary
+        effect) with sigma (interaction / non-linearity) and the
+        per-observation-group breakdown; parameters with negligible mu* are
+        listed as insensitive. Sobol (sobol_samples x (npar + 2) runs) returns
+        first-order s1 and total st variance indices of phi per parameter,
+        ranked by st; st well above s1 means interaction. Use a few hundred
+        samples before trusting a Sobol ranking.
+        Use it before calibrating, to decide which parameters are worth
+        estimating. The control file is copied to <case>_sen.pst; yours is not
+        modified. Cost scales with the number of parameters, so zoned or
+        multiplier parameterisations are cheap and per-cell ones are not."""
+        try:
+            return _impl_run_pestpp_sen(
+                model, pst_file, method, morris_r, morris_p, sobol_samples
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "binary" in msg.lower() and "pestpp" in msg.lower():
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
+            return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def run_pestpp_sweep(
+        model: str,
+        pst_file: str,
+        num_samples: int = 20,
+        seed: int = 1,
+        parameter_csv: str | None = None,
+    ) -> dict:
+        """Run the model over many parameter vectors with PESTPP-SWP.
+
+        Without parameter_csv, draws a Latin-hypercube sample of num_samples
+        vectors within the adjustable parameters' bounds (log space for
+        log-transformed parameters) and returns each run's parameters, phi and
+        simulated observations plus the phi range. With parameter_csv (columns =
+        parameter names, one row per run) it runs exactly those vectors - use
+        it for scenario or what-if sets. Failed runs are flagged, not dropped.
+        The control file is copied to <case>_swp.pst; yours is not modified."""
+        try:
+            return _impl_run_pestpp_sweep(
+                model, pst_file, num_samples, seed, parameter_csv
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("FILE_NOT_FOUND", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "binary" in msg.lower() and "pestpp" in msg.lower():
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
+            return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def run_pestpp_opt(
+        model: str,
+        pst_file: str,
+        objective: str | dict,
+        decision_parameters: list[str],
+        constraints: dict,
+        direction: str = "max",
+    ) -> dict:
+        """Constrained management optimisation with PESTPP-OPT (linear
+        programming): e.g. the largest pumping or drainage that keeps heads
+        above a target.
+
+        decision_parameters are parameters of the control file (from
+        setup_calibration) that become decision variables; the rest are fixed.
+        objective is a parameter name or {parameter: coefficient} to maximise
+        or minimise (direction). constraints is {observation: {"type":
+        "less_than" | "greater_than", "value": rhs}} on simulated observations.
+        Returns the optimal decisions, objective value and each constraint's
+        simulated value, slack and whether it binds. Constraints are linearised,
+        so verify the optimum with a forward run. The control file is copied to
+        <case>_opt.pst; yours is not modified."""
+        try:
+            return _impl_run_pestpp_opt(
+                model, pst_file, objective, decision_parameters, constraints, direction
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err("FILE_NOT_FOUND", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "binary" in msg.lower() and "pestpp" in msg.lower():
+                return _err("BINARY_NOT_FOUND", msg, "Install PEST++ with: get-pestpp :")
+            return _err("PEST_ERROR", msg)
+        except Exception as exc:
+            return _err("PEST_ERROR", str(exc))
+
+    @mcp.tool()
+    def apply_calibration_result(model: str, pst_file: str) -> dict:
+        """Write the calibrated parameters of a finished PEST++ run back into
+        the model so it can be run, plotted and exported as the calibrated model.
+
+        Takes the best estimate (pestpp-glm: the optimal .par; pestpp-ies: the
+        mean of the final parameter ensemble) and regenerates the model's
+        input arrays from the PEST templates, including zone-multiplier K.
+        Follow with run_simulation, then read_heads / plot_heads_map /
+        export_heads_to_raster / compare_to_observed. pestpp-da runs are not
+        supported (per-cycle parameters). Call setup_calibration again to
+        restart from the base field."""
+        try:
+            return _impl_apply_calibration_result(model, pst_file)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except FileNotFoundError as exc:
+            return _err(
+                "OUTPUT_FILE_MISSING",
+                str(exc),
+                "Run pestpp-glm or pestpp-ies to completion first.",
+            )
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PEST_ERROR", str(exc))
 

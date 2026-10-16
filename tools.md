@@ -38,10 +38,11 @@ Translate processed spatial data (rasters, shapefiles, CSVs) into MODFLOW 6 mode
 |---|---|---|
 | `import_grid_from_shapefile` | `model: str`, `shapefile: str`, `nlay: int`, `layer_surfaces: list[str]`, `method: "disv" \| "dis" = "disv"`, `target_crs: str \| None` | Grid summary: cell count, layer count, CRS, bounding box |
 | `assign_top_from_raster` | `model: str`, `raster: str`, `layer: int = 0`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Array statistics (min, max, mean), `cells_assigned`, `cells_no_coverage`, optional `warning` |
-| `assign_k_from_zones` | `model: str`, `shapefile: str`, `k_field: str`, `layer: int \| list[int]`, `k33_field: str \| None`, `icelltype_field: str \| None` | Zone summary: zone count, cell count per zone, K range |
+| `assign_k_from_zones` | `model: str`, `shapefile: str`, `k_field: str`, `layer: int \| list[int]`, `k33_field: str \| None`, `icelltype_field: str \| None`, `unmatched: "error" \| "keep" \| "nearest" = "error"` | Zone summary: zone count, `cells_matched`, `cells_unmatched`, `active_cells_unmatched`, K range |
 | `assign_k_from_raster` | `model: str`, `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `k33_raster: str \| list[str] \| None`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Per-layer assignments, `cells_assigned`, `cells_no_coverage`, `k_range`, optional `warning` |
 | `assign_ic_from_raster` | `model: str`, `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `method: "mean" \| "min" \| "max" \| "nearest" \| "bilinear" = "nearest"`, `fill: "error" \| "median" \| "nearest" = "error"`, `coverage_tolerance: float = 0.1` | Per-layer assignments, `cells_assigned`, `cells_no_coverage`, `head_range`, optional `warning` |
 | `assign_array_from_raster` | `model: str`, `target: str` (`NPF.k` / `NPF.k33` / `IC.strt` / `STO.ss` / `STO.sy` / `RCHA.recharge` / `EVTA.surface` / `EVTA.rate` / `EVTA.depth`), `raster: str \| list[str]`, `layer: int \| list[int] = 0`, `stress_period: int = 0`, `method`, `fill`, `coverage_tolerance`, `rate_units: str \| None` | Per-layer or per-period assignment counts, written `value_range`, optional `warning` / `value_warnings`, `rate_units` when converted |
+| `import_boundary_from_shapefile` | `model: str`, `shapefile: str`, `package: "CHD" \| "WEL"`, `value_field: str \| None`, `value: float \| None`, `layer: int = 0`, `stress_period: int = 0`, `pname: str \| None` | Package summary: `n_features`, `n_cells`, `cells_inactive_skipped`, `value_range`. CHD from line/polygon features (every touched cell gets the head; several features on a cell average), WEL from points (nearest cell; wells sharing a cell sum; negative = extraction). Exactly one of `value_field`/`value`. Features are reprojected into the grid CRS (`CRS_UNKNOWN` when the grid has none); points about a cell or more outside the grid are `INVALID_INPUT`; inactive cells are skipped and counted. DIS only |
 | `import_river_from_shapefile` | `model: str`, `shapefile: str`, `package: "RIV" \| "DRN" \| "GHB"`, `stage_field: str \| None`, `cond_field: str \| None`, `depth_field: str \| None`, `stage_raster: str \| None`, `stage_offset: float = 1.0`, `coverage_tolerance: float = 0.1`, `stress_periods: list[int] \| None`, `bed_k: float \| None`, `bed_thickness: float \| None`, `channel_width: float \| None` | Stress period data summary: reach count, stage source, per-reach coverage count, package written |
 
 **Conductance is derived, not guessed (7f-H1.2):** pass a `cond_field`
@@ -63,7 +64,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 **No-data fill is explicit (7e-B11.3):** `fill` controls cells without raster coverage. Default `"error"` fails when more than `coverage_tolerance` (default 0.1) of cells are uncovered and otherwise median-fills with a `warning` field; `"median"` always median-fills; `"nearest"` fills from the nearest covered cell. `cells_no_coverage` is always reported.
 
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
-| `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None` | Observation summary: site count, record count, date range, written observation file path |
+| `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`sequential`) |
 | `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"`, `match: str = "nearest"`, `tolerance_days: float \| None`, `date_map: dict \| None` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`), `match`/`tolerance_days`/`date_map` |
 
 `import_obs_from_csv` persists the observation targets as model state
@@ -84,11 +85,11 @@ re-established before further calls (2026-08-30 rerun-5 finding).
 
 - `import_grid_from_shapefile` uses `flopy.utils.GridGen` (DISV) or derives a regular DIS grid from the polygon bounding box.
 - `assign_top_from_raster` uses `rasterio` to sample the raster at cell centroids and writes the result to the model's top or botm arrays.
-- `assign_k_from_zones` intersects cell centroids with zone polygons via `geopandas`; cells outside all zones retain their existing K.
+- `assign_k_from_zones` intersects cell centroids with zone polygons via `geopandas`. Active cells outside every polygon fail the call with `INVALID_INPUT` by default (`unmatched="error"`); `unmatched="keep"` leaves their existing K/K33/ICELLTYPE and `unmatched="nearest"` copies the values of the nearest matched cell. Inactive cells outside every polygon always keep their existing values, so no NaN is written into NPF. This also applies `icelltype_field` on DISV grids, which was previously ignored there.
 - `assign_k_from_raster` / `assign_ic_from_raster` sample a GeoTIFF at cell centroids (`nearest`/`bilinear`) or aggregate per cell (`mean`/`min`/`max`, regular DIS grids only) and write the K/k33 (NPF) or starting-head (IC) arrays per layer — the raster-based route for per-cell K fields (e.g. TX/CL GeoTIFF layers, or a fine K raster against a coarse model grid). Raster values must already be in the model's K units. Coverage/fill semantics match `assign_top_from_raster`; the K variant refuses non-positive/non-finite K in active cells. `raster` accepts one path reused across layers or a list of paths (one per layer); a mismatched list is refused, never silently remapped.
 - `assign_array_from_raster` is the catch-all for any other model array driven by a raster: an enumerated target table names the (package, array) pair — `NPF.k`/`NPF.k33`, `IC.strt`, `STO.ss`/`STO.sy` (per layer) and `RCHA.recharge`, `EVTA.surface`/`EVTA.rate`/`EVTA.depth` (per stress period, on the layer-0 footprint = topmost active cell per column, the MF6 default). Rate targets (`RCHA.recharge`, `EVTA.rate`) accept `rate_units` (e.g. `mm/yr`) and convert to m/d, recording the declared units. Odd values (negative ET rates, non-positive ET depth) are reported in `value_warnings`, never written silently. RCHA/EVTA packages are created on first use; NPF/IC/STO need their builder call first. This completes the file-based ingestion path — an agent names a file, never a payload of cell values.
 - `import_river_from_shapefile` intersects the river network with the model grid and snaps reaches to cell faces.
-- `import_obs_from_csv` matches observation sites to model cells by an explicit `cellid_col` cell-id column if provided (0-based node on DISU → written 1-based; `layer,row,col`/`layer,node` on DIS/DISV), otherwise by (x, y) coordinate if provided, otherwise sequentially. The explicit column is required where coordinates are ambiguous (DISU/DISV layers stack in x/y).
+- `import_obs_from_csv` matches observation sites to model cells by an explicit `cellid_col` cell-id column if provided (0-based node on DISU → written 1-based; `layer,row,col`/`layer,node` on DIS/DISV), otherwise by (x, y) coordinate (`x_col` + `y_col`, given together). One of the two is required: with neither, or with a named column that is not in the CSV, the call fails with `INVALID_INPUT` rather than guessing. In coordinate mode a site farther than about one cell diagonal from the nearest cell centre (usually a CRS or unit mistake) fails with `INVALID_INPUT` naming the sites and distances; `allow_outside=True` snaps them to the nearest cell and says so in `warning`. `append=True` adds this call's sites to the registered observation set instead of replacing it (same `obs_type`, no repeated site names) — register a multi-layer set one layer per call; the result reports `appended_to` and `sites_added`. `allow_sequential=True` opts into placeholder observations on consecutive cells in row order (not the sites' real locations); the result then carries `site_mapping: "sequential"` and a `warning`. The explicit column is required where coordinates are ambiguous (DISU/DISV layers stack in x/y).
 - `import_subsidence_observations` registers a **derived** time-series target under `derived_observations` in `.gwmcp_meta.json` — a measured subsidence CSV plus the recipe (`sim_source`) for the simulated series, which the calibration forward wrapper materialises as `<gwf>_subsidence.csv` before PEST++ reads it (`setup_calibration(obs_source="derived")`). `time_col` falls back to the first CSV column when the header does not name it (an unnamed date index works); `dates` are stored as ISO `YYYY-MM-DD` sorted ascending with non-finite values dropped. `match` picks how observed dates bind to simulated times — `"nearest"` (default) snaps each observed date to the closest simulated time, so a dated survey that never lands on a stress-period end still calibrates; `"exact"` keeps only coincident dates. `tolerance_days` caps the snap (None = one median output interval, 0 for a single simulated time) and `date_map` (observed → simulated) overrides the automatic match per date; `setup_calibration` reports the matched/skipped counts and the largest snap distance. It writes no MODFLOW 6 observation package because a derived series has no native MF6 observation type.
 
 ---
@@ -100,9 +101,9 @@ Create and configure MODFLOW 6 GWF models using FloPy. All tools operate on a na
 | Tool | Inputs | Returns |
 |---|---|---|
 | `create_model` | `name: str`, `workspace: str`, `units: str = "METERS"`, `time_units: str = "DAYS"` | Confirmation with workspace path |
-| `adopt_model` | `name: str`, `workspace: str`, `units: str = "METERS"`, `time_units: str = "DAYS"`, `allow_modify: bool = False` | Confirmation with workspace path + adopted model names + read-only status |
+| `adopt_model` | `name: str`, `workspace: str`, `units: str \| None = None`, `time_units: str \| None = None`, `allow_modify: bool = False` | Confirmation with workspace path + adopted model names + read-only status + `units`/`time_units` and `units_source` (`model files` / `argument` / `default`). Units are read from the DIS/DISV/DISU `LENGTH_UNITS` and TDIS `TIME_UNITS`; a `units`/`time_units` argument that contradicts the files is `INVALID_INPUT`, and is used only when the files declare none (else METERS/DAYS, with a `warning`) |
 | `adopt_mt3d_usgs_model` | `name: str`, `workspace: str = ""`, `units: str = "METERS"`, `time_units: str = "DAYS"`, `flow_nam: str \| None`, `transport_nam: str \| None`, `allow_modify: bool = False` | Confirmation: workspace path, `type: "mt3d-usgs"`, flow version, grid dimensions, discovered transport packages, `.UCN` file, read-only status |
-| `set_simulation` | `model: str`, `nper: int`, `perlen: list[float]`, `nstp: list[int]`, `ims_complexity: "simple" \| "moderate" \| "complex"` | Confirmation |
+| `set_simulation` | `model: str`, `nper: int`, `perlen: list[float]`, `nstp: list[int]`, `ims_complexity: "simple" | "moderate" | "complex"`, optional `start_date_time`, `newton`, `linear_acceleration`, `outer_maximum`, `under_relaxation`, `inner_maximum: int`, `outer_dvclose: float`, `inner_dvclose: float`, `relaxation_factor: float (0-1)` | Confirmation. The solver controls override the complexity preset |\| "moderate" \| "complex"` | Confirmation |
 | `set_model_crs` | `model: str`, `crs: str`, `xorigin: float \| None`, `yorigin: float \| None`, `angrot: float \| None` | Confirmation with the set CRS/offsets (7e-B11.1) |
 
 Grids built with `add_dis_package`/`add_disv_package` have no CRS until
@@ -141,7 +142,10 @@ stays 10 in a FEET model, while `k_units="m/d", k=10` becomes 32.808 ft/d);
 `add_boundary_package` accepts `rate_units` (m/d, m/yr, mm/d, mm/yr) for
 RCH/EVT/RCHA/EVTA rates, converting them into the model's length unit per its
 time unit. Declared units are recorded in `.gwmcp_meta.json` and reported by
-`summarise_model.units` (`{length, time, k, recharge}`). `add_csub_package`'s
+`summarise_model.units` (`{length, time, k, recharge, model_rate}`):
+`k`/`recharge` are the units the inputs were declared in, `model_rate` is the
+unit the stored arrays are in (the model's own length/time, e.g. `ft/d`), and
+an undeclared quantity is labelled with `model_rate`. `add_csub_package`'s
 `gammaw`/`beta` default to the model's unit system (METERS 9806.65 / 4.6512e-10;
 FEET 62.48 / 2.227e-8) rather than FloPy's SI defaults.
 
@@ -168,6 +172,27 @@ runs the flow model first and the heat model second. Post-process with
 The flow model is made FMI-ready automatically (`save_flows`,
 `save_specific_discharge`, `save_saturation` on NPF); a GWE model requires an
 SSM package whenever the flow model has boundary packages.
+
+**GWT solute transport (2026-10-15):** `add_gwt_model` creates a derived
+solute-transport simulation in `<workspace>/gwt/`, coupled to a flow run through
+FMI exactly like GWE (same flow-saving flags, BICGSTAB solver, flow run first
+then transport). Build it with `add_gwt_adv_package` (UPSTREAM/CENTRAL/TVD),
+`add_gwt_dsp_package` (alh/ath1/ath2/alv/atv/diffc), `add_gwt_mst_package`
+(porosity; optional linear/freundlich/langmuir sorption needing `bulk_density`
++ `distcoef`; first/zero-order decay needing `decay`), `add_gwt_ssm_package`
+(required when the flow model has boundaries; `sources=[("CHD", "AUX",
+"CONCENTRATION")]` takes inflow concentration from a flow package's
+`CONCENTRATION` auxiliary variable, declared with `auxiliary` on
+`add_boundary_package`), and the sources `add_gwt_cnc_package` (constant
+concentration) / `add_gwt_src_package` (mass loading). Grid and initial
+concentration use the shared tools with `component="gwt"`, and
+`add_oc_package(component="gwt")` writes the concentration file. Read results
+with `read_concentration` and `plot_concentration_map` (the same tools serve the
+legacy MT3D-USGS model; `type` in the result says which). Verified against the
+plug-flow front position `v = K·i/n` in `tests/test_gwt_support.py`; the
+closed-book gate (`ex-gwt-keating`, `test201_gwtbuy-henryCHD`) has not been run.
+Not yet covered: GWT boundary packages other than CNC/SRC (e.g. SFT/LKT/MWT/UZT)
+and the buoyancy (density-coupled) GWF-GWT exchange.
 
 **PRT particle tracking (v0.3.0, 2026-09-27):** `add_prt_model` adds a MODFLOW 6
 particle-tracking model as a **same-simulation** component — the GWF grid is
@@ -220,7 +245,7 @@ rather than an opaque key error. The v0.3.0 release gate is the closed-book
 `add_sto_package` defines aquifer storage (required for transient simulations). `steady_state` lists the **0-based** stress-period indices that are steady-state; all other periods run transient. Default `[0]` → first period steady, rest transient; `[]` → all periods transient. `sy` (specific yield) is required when any cell is convertible (`iconvert > 0`). **Without an STO package, a multi-time-step model runs as steady state** — `check_model` and `run_simulation` return a warning when they detect that configuration.
 
 `add_csub_package` defines the CSUB (subsidence) package. `packagedata` is a list of 11-field interbed records (`[icsubno, cellid, cdelay, pcs0, thick_frac, rnb, ssv_cc, sse_cr, theta, kv, h0]`, all indices 0-based and contiguous from `icsubno=0`), `{"filename": ...}` to reference a pre-externalised file that **must already exist** (then `ninterbeds` is required), or `{"filename": ..., "data": [...]}` to externalise the records to that file (flopy writes it immediately at construction; `ninterbeds` defaults to `len(data)`). `packagedata_filename` is recorded in the result/meta only when the referenced file exists on disk. `sgm`/`sgs`/`cg_theta`/`cg_ske_cr` accept a scalar or one value per layer. `ndelaycells` is **required** when any interbed has `cdelay="delay"` — it is never defaulted silently. `observations` maps a CSV name to `[(name, obs_type, index), ...]`: cell types (`compaction`, `preconstress`, `elastic-compaction`, `inelastic-compaction`; the `-cell` suffix is optional) take a cellid, interbed types (`interbed-compaction-pct`, `delay-preconstress`, `delay-head`) take a 0-based interbed number, or for the delay types a 0-based `(interbed, delay-cell)` pair (`delay-preconstress`/`delay-head` index 0 → interbed 1, delay cell 1); the registered output CSV (`obs_output_csv`/`obs_names`) is persisted in `.gwmcp_meta.json` under the `csub` block for post-processing. `filerecords` accepts `zdisplacement`, `package_convergence`, `strainib`, `compaction`. Re-adding replaces the existing CSUB package(s) unless distinct `pname` values are used.
-| `add_oc_package` | `model: str`, `head_filerecord: str \| None`, `budget_filerecord: str \| None`, `saverecord: list`, `printrecord: list \| None` | Confirmation |
+| `add_oc_package` | `model: str`, `head_filerecord: str \| None`, `budget_filerecord: str \| None`, `saverecord: list`, `printrecord: list | None`, `budgetcsv_filerecord: str | None` | Confirmation. `budgetcsv_filerecord` also writes the water budget as a CSV each time step |\| None` | Confirmation |
 | `summarise_model` | `model: str` | Structured summary: packages, grid dimensions (+ `n_active` when idomain present), stress periods, boundary types, storage (STO steady/transient periods), registered `observations` count, `components` (per-component model name/packages/grid type), `reloaded_from_disk` flag |
 | `model_status` | `model: str` | `{ runnable: bool, missing_required: list[str], missing_recommended: list[str], next_steps: list[str], warnings: list[str], components: list[str] }` — ordered build-order status (7e-C8) |
 | `list_model_files` | `model: str` | File list with sizes and types; flushes staged changes first and reports `flushed` |
@@ -262,7 +287,68 @@ tools — only the tools that build the model.
 
 ### Supported boundary packages for `add_boundary_package`
 
-`CHD` (constant head), `WEL` (well), `RIV` (river), `DRN` (drain), `RCH` (recharge, list-based), `RCHA` (recharge, array-based), `EVT` (evapotranspiration, list-based), `EVTA` (evapotranspiration, array-based), `GHB` (general head boundary), `SFR` (streamflow routing)
+`CHD` (constant head), `WEL` (well), `RIV` (river), `DRN` (drain), `RCH` (recharge, list-based), `RCHA` (recharge, array-based), `EVT` (evapotranspiration, list-based), `EVTA` (evapotranspiration, array-based), `GHB` (general head boundary)
+
+### `add_advanced_package` — SFR, MAW, LAK, UZF (2026-10-15)
+
+Feature-based packages take per-feature `packagedata` / `connectiondata` /
+`perioddata` instead of a stress-period cell list, so they have their own tool
+(`add_boundary_package("SFR")` now fails with a pointer here; it never worked,
+SFR has no `stress_period_data`). Cell ids are `[layer, row, col]` on DIS,
+0-based; records are in MODFLOW 6 column order:
+
+| Package | `packagedata` | `connectiondata` | `perioddata` |
+|---|---|---|---|
+| `SFR` | `[ifno, cellid, rlen, rwid, rgrd, rtp, rbth, rhk, man, ncon, ustrf, ndv]` | `[ifno, ic1, ic2, ...]` (negative = downstream) | `{0: [[ifno, "INFLOW", v], ...]}` |
+| `MAW` | `[ifno, radius, bottom, strt, condeqn, ngwfnodes]` | `[ifno, icon, cellid, scrn_top, scrn_bot, hk_skin, radius_skin]` | `{0: [[ifno, "RATE", v], ...]}` |
+| `LAK` | `[ifno, strt, nlakeconn]` | `[ifno, iconn, cellid, claktype, bedleak, belev, telev, connlen, connwidth]` | `{0: [[ifno, "RAINFALL", v], ...]}` |
+| `UZF` | `[ifno, cellid, landflag, ivertcon, surfdep, vks, thtr, thts, thti, eps]` | — | `{0: [[ifno, finf, pet, extdp, extwc, ha, hroot, rootact], ...]}` |
+
+`options` passes package keywords through (`simulate_et`, `unit_conversion`,
+LAK `outlets`/`tables`, SFR `diversions`, ...). The dimension counts (`nreaches`,
+`nmawwells`, `nlakes`/`noutlets`/`ntables`, `nuzfcells`) are derived from the
+data and reported in `counts`. An existing package of the same type (or the one
+named `pname`) is replaced, with a `warning`. SFR/MAW/LAK without
+`connectiondata`, or any package without `packagedata`, is `INVALID_INPUT`.
+Each package is covered by a real MODFLOW 6 run in
+`tests/test_advanced_packages.py`. Not covered: observation hooks on these
+packages, transport counterparts (SFT/LKT/MWT/UZT), and a shapefile-driven SFR
+network importer (`import_river_from_shapefile` still rejects SFR).
+
+### MODPATH 7 particle tracking (2026-10-15)
+
+`run_modpath(model, direction="forward", release_cells=None,
+release_layers=None, porosity=0.3, divisions=1, max_particles_returned=200)`
+tracks particles with MODPATH 7 over a **completed** MODFLOW 6 flow run (it
+reads the run's head, budget and `.grb` grid files; `OUTPUT_FILE_MISSING` names
+`run_simulation` when they are absent). `forward` shows where water goes,
+`backward` where it comes from (capture zones, travel time to a well).
+Particles start at the centre of each requested cell (`divisions` > 1 splits
+each cell into an even sub-grid): `release_cells` is `[[layer, row, col], ...]`
+on DIS or `[[layer, node], ...]` on DISV; without it every active cell of
+`release_layers` (default `[0]`) releases one. Returns `status_counts` (MODPATH
+end-point status, e.g. `no exit face (strong sink)`), `travel_time`
+`{min, max, mean}`, per-particle `start_cell`/`start`/`end`/`travel_time`/
+`status` (capped), and `endpoints_npy`/`pathlines_npy`. `plot_modpath_pathlines`
+draws the last run over the grid (start points green). DISU grids are rejected;
+needs the `mp7` binary (`get-modflow` installs it, `BINARY_NOT_FOUND`
+otherwise). Distinct from `add_prt_model`, which is MODFLOW 6's own
+same-simulation particle tracker.
+
+### `add_mvr_package` - water mover (2026-10-15)
+
+`add_mvr_package(model, packages, perioddata, options=None)` routes water
+between package features (a well discharging to a stream, a lake outlet to a
+reach). `packages` lists the participating flow packages by their `pname`;
+each must have been created with the mover option (`options={"mover": True}`
+on `add_advanced_package`, `kwargs={"mover": True}` on `add_boundary_package`).
+`perioddata` is `{period: [[provider, id, receiver, id, mvrtype, value], ...]}`
+with `mvrtype` `FACTOR`/`EXCESS`/`THRESHOLD`/`UPTO` and 0-based feature ids;
+`maxmvr` and `maxpackages` are derived. An unknown package, a package without
+the mover option, a record naming a package outside `packages` and an invalid
+`mvrtype` are all `INVALID_INPUT`. Verified by a real run (well to stream).
+Ghost-node correction (GNC) is **not** built: it needs a nested/unstructured
+grid and has no tool yet.
 
 ---
 
@@ -273,6 +359,7 @@ Execute MODFLOW 6 and retrieve run results.
 | Tool | Inputs | Returns |
 |---|---|---|
 | `check_model` | `model: str` | List of warnings and errors from FloPy model checker; flushes staged changes first (`flushed`) |
+| `run_modpath` | `model: str`, `direction: "forward" \| "backward" = "forward"`, `release_cells: list \| None`, `release_layers: list[int] \| None`, `porosity: float = 0.3`, `divisions: int = 1`, `max_particles_returned: int = 200` | MODPATH 7 particle tracking on a completed flow run: `status_counts`, `travel_time`, per-particle start/end/travel time, `endpoints_npy`/`pathlines_npy` (see MODPATH 7 section) |
 | `run_simulation` | `model: str`, `silent: bool = False`, `auto_fix: bool = False` | `{ success: bool, elapsed_s: float, convergence: str, listing_summary: str, flushed: bool, observation_fit: dict \| null, auto_fix_applied: list \| null }` |
 | `diagnose_convergence` | `model: str` | `{ converged: bool, failure_class: str, recommendations: list[str], evidence: dict, progress: dict }` |
 | `validate_model` | `model: str` | `{ findings: list[dict], clean: bool, flushed: bool }` — physical-plausibility findings, aggregated with a count per defect type |
@@ -284,6 +371,7 @@ exact changes in `auto_fix_applied: [{rung, changes: [{setting, from, to}]}]`;
 the model files reflect the final successful configuration. Adopted read-only
 models cannot be auto-fixed in place (clone them first).
 | `start_run` | `model: str` | `{ model, job_id, kind: "mf6", status: "running" }` — starts MODFLOW 6 in a background thread and returns a job id immediately (7e-A3) |
+| `start_task` | `model: str`, `task: str`, `arguments: dict | None` | `{ model, job_id, kind: "task:<task>", status: "running" }` — runs a heavy tool in the background for models where the call would outlast the client timeout. `task` is one of `check_model`, `export_model_spec`, `setup_da_control`, `assign_k_from_raster`, `assign_k_from_zones`, `assign_top_from_raster`, `assign_array_from_raster`, `import_obs_from_csv`, `flush_model`; `arguments` are that tool's keyword arguments without `model`, validated against its signature before the job starts (`INVALID_INPUT`). Tasks on the same model run one at a time. Poll with `get_job_status`; the finished result is the tool's normal result, failures appear as the job error |
 | `get_job_status` | `job_id: str` | `{ job_id, model, kind, status, elapsed_s, progress \| null, result \| null, error \| null }` |
 | `cancel_job` | `job_id: str` | `{ job_id, status: "cancelled" }` (or the job's terminal status if already finished) |
 | `get_run_log` | `model: str`, `tail: int = 100`, `component: str = "gwf"` | Last N lines of the MODFLOW listing file (.lst); a non-gwf component prefers its own `<model>.lst`, else mfsim.lst |
@@ -367,6 +455,12 @@ transitions: `running` → `succeeded` | `failed` | `cancelled`.
   parity with `run_pestpp_*` but is **advisory** — PEST++ has no local
   worker-count option, so it is echoed back rather than applied (parallel
   forward runs need PANTHER agents or an external run manager).
+- `get_job_status` also reports `idle_s` (seconds since the job's progress last
+  changed, measured from the first poll) and `possibly_stalled` (`idle_s` over
+  15 minutes), with a `stall_note` pointing at `cancel_job` and the synchronous
+  runner. It is a flag only — nothing is killed automatically, because one long
+  MF6 time step or PEST++ iteration looks the same as a hang. Not shown for
+  finished jobs.
 - `cancel_job(job_id)` terminates the underlying process **and its entire
   process tree** (`taskkill /T /F` on Windows, `killpg` on POSIX) — the
   PEST++ forward chain spawns `mf6.exe` grandchildren that would otherwise
@@ -459,6 +553,14 @@ that boundary (often CHD) is absorbing everything. Zero flow everywhere is
 reported as trivially `balanced=True`, `percent_discrepancy=0.0`, not a
 division-by-zero error.
 
+**Missing storage flows.** MODFLOW 6 writes the storage budget record
+(`STO-SS`/`STO-SY`) only when the STO package sets `SAVE_FLOWS`. For a
+transient model without it, `compute_water_balance` and `diagnose_water_balance`
+report `storage_flows_missing: true` (plus a `warning`), and
+`diagnose_water_balance` returns `balanced: null` with a `balance_note` instead
+of a spurious imbalance — the missing term is exactly the storage release, not
+a model error. Set `save_flows=True` on `add_sto_package` and rerun.
+
 ### Closed observation loop (7f-F)
 
 Observations enter the model via `import_obs_from_csv` and are now read back:
@@ -524,7 +626,7 @@ Set up and run PEST++ parameter estimation via pyEMU.
 |---|---|---|
 | `setup_calibration` | `model: str`, `parameterisation: dict`, `obs_source: str = "model"`, `noptmax: int = 10` | The generated PEST interface: `.pst`, template, instruction file, external array, forward wrapper, parameter table |
 | `setup_da_control` | `model: str`, `parameterisation: dict`, `cycles: list[int]`, `obs_cycles: dict`, `obs_weights: dict \| None = None`, `par_cycles: dict \| None = None`, `num_reals: int = 50`, `noptmax: int = 1`, `use_simulated_states: bool = True`, `da_options: dict \| None = None`, `prior_ensemble: dict \| None = None`, `prior_std: float \| None = None`, `state_head_bound: float \| None = None` | The generated DA-ready v2 PEST interface: `.pst`, K template/target, IC template, cycle tables, state-parameter count, `state_bounds` (per-site bound used), model command, prior ensemble file and `prior_ensemble_n_clipped` when a prior is requested |
-| `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"` | Path to generated `.pst` control file |
+| `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"`, `unlisted_obs: "error" \| "zero_weight" = "error"` | Path to generated `.pst` control file, `n_observations_matched`, `n_observations_zero_weight` |
 | `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" \| "da" = "glm"`, `num_reals: int \| None = None`, `num_workers: int = 1` | `{ model, job_id, kind, pst_file, status: "running", num_workers, parallelism }` — starts PEST++ in a background thread with live phi progress (7e-A3). For `method="da"`, progress is the per-cycle post-update phi from `<case>.global.phi.actual.csv` and `num_reals` maps to `da_num_reals`; when `num_reals` is omitted the PST's own option is preserved for IES/DA. `num_workers` is advisory (echoed, not applied — PEST++ has no local worker-count option) |
 
 ### Automated calibration setup — `setup_calibration` (7e-A2)
@@ -551,6 +653,12 @@ cap) to a spec dict:
   **0-based**, unlike observation cell ids which are 1-based on DISU), or
   `"zones"` (with `"layer": N`). Scopes must partition the array
   exactly for all/layer/cells; `zones` is the multiplier mode below.
+  An `all`/`layer`/`cells` parameter writes **one value** into every cell it
+  owns. If those active cells currently hold more than one distinct value the
+  call fails with `INVALID_INPUT` instead of discarding the spatial pattern
+  (also in `setup_da_control`, and for `npf:k33`); use `zones` or
+  `multiplier` to keep the pattern, or add `"allow_flatten": true` to that
+  parameter's spec to replace the field deliberately.
   `setup_da_control` additionally accepts `"multiplier"` (see the DA section):
   a **single** dimensionless factor over the whole existing K array. It cannot
   be combined with `all`/`layer`/`cells`, and is deliberately not accepted by
@@ -642,7 +750,14 @@ externalised and a wide-token template is written over the selected numeric
 columns; bounds default to value × 0.05 / × 20,
 with `partrans` `none` for `rnb`/`thick_frac` and `log` where positive-only),
 `csub:cg_theta` and `csub:cg_ske_cr` (scope `"layer"`, per-layer external arrays,
-one template per layer). Multi-target specs (e.g. `csub:packagedata` +
+one template per layer), and `sto:ss` / `sto:sy` (storage; same per-layer
+scheme, external files `<gwf>.sto_ss.dat` / `<gwf>.sto_sy.dat`; re-adding the STO
+package re-snapshots the base), and `rch:recharge` (one constant rate for a
+stress period, `stress_period` default 0; RCH list or RCHA array; the base must
+already be uniform or the call is refused rather than flattening the field;
+written to `<gwf>.rch_<sp>.dat`; `scope: "cells"` with a `cells` list per parameter gives spatial groups, cells not claimed keep their base recharge, groups may not overlap), and `riv:cond` / `drn:cond` / `ghb:cond` (one
+constant conductance for a stress period when `scope: "all"` (uniform base required), or spatial groups with `scope: "cells"` and a `cells` list per parameter, unclaimed records keeping their base conductance; written to
+`<gwf>.<pkg>_<sp>.dat`). Multi-target specs (e.g. `csub:packagedata` +
 `csub:cg_ske_cr` + `npf:k33`) assemble into one `.pst` with `derinclb > 0` on
 every group. The observation interface for CSUB is `obs_source="derived"`:
 `import_subsidence_observations` registers a measured subsidence CSV with the
@@ -667,7 +782,9 @@ l1 !dum! !o0002!
 
 Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token (skips the dummy column), `w` reads-and-discards a word, `!name!` reads the value into observation `name`. The header marker (`~` or `@`) is arbitrary. Keep one instruction line per line of the model output file. **CSV output files:** use `!dum!` (not `w`) to discard skipped columns — pestpp rejects `w` on comma-delimited lines ("EOL encountered while executing whitespace instruction"), e.g. `l1 !dum! !name! !dum! !name! …` for a header + comma-separated values row.
 
-**Templates:** must start with `ptf`/`jtf`. Parameter tokens must be **wide fixed-width** (`@          k          @`) — narrow tokens truncate substituted values to `1.0` and zero out the Jacobian.
+**Every instruction token needs an observed value.** A token in the instruction file(s) with no `obs_data` entry fails with `INVALID_INPUT` — it is never written with a placeholder value. For an instruction file with more tokens than calibration targets, pass `unlisted_obs="zero_weight"`: the extra tokens stay in the control file with weight 0 (read but not fitted) and are counted in `n_observations_zero_weight`.
+
+**Templates:** must start with `ptf`/`jtf`. Every parameter token needs a `par_data` entry (use `partrans="fixed"` to hold one constant); a token without one fails with `INVALID_INPUT` rather than being written with a placeholder value of 1.0. Parameter tokens must be **wide fixed-width** (`@          k          @`) — narrow tokens truncate substituted values to `1.0` and zero out the Jacobian.
 
 **Windows model command:** must be a direct executable or a space-free Python wrapper. pestpp cannot run `.bat`/`.cmd` wrappers (it hangs normalising `cmd /c`) nor executables whose path contains spaces; `setup_pest_control` warns when it detects either.
 
@@ -684,6 +801,10 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 
 **Known caveat (open, context-dependent):** a PEST++ calibration can still stall *under some conditions*. It has only been observed while a **background** `start_calibration` job runs inside the MCP server and the client polls it — two attempts launched ~2 forward runs then idled (~35–100 s launch gaps, once ~16 min idle) while the **synchronous** `run_pestpp_ies` on the identical `.pst`, in the same MCP tree, completed 389 forward runs in 2.73 min (0.42 s/run). It is **not reproducible in isolation**: the same `start_calibration` background job run from a plain script completes 364 runs in 90 s (0.25 s/run) with live progress, and the wrapper executes `mf6` in ~0.2 s in every case. So the background job runner and the forward wrapper are individually sound; the trigger is not yet root-caused (the earlier "VS Code process tree / job object" theory and a plain "background runner is broken" theory are both contradicted by evidence). Reliable path today: the synchronous runner (`run_pestpp_ies` / `run_pestpp_glm`), which may exceed the MCP client timeout (`-32001`) but completes server-side. See `tasks.md` 6d Target 9 rerun-6/rerun-7 findings.
 
+| `run_pestpp_sen` | `model: str`, `pst_file: str`, `method: "morris" | "sobol" = "morris"`, `morris_r: int = 4`, `morris_p: int = 4`, `sobol_samples: int = 100` | Global sensitivity. Morris: `parameters` ranked by `mu_star` (mean absolute elementary effect) with `mu`, `sigma` (interaction / non-linearity) and `n_samples`; `insensitive` (mu* below 0.1 % of the largest); `by_observation_group`; `summary_file`. Runs the model `morris_r × (npar + 1)` times, so cost scales with the parameter count. The control file is copied to `<case>_sen.pst`; the caller's is not modified. `method="sobol"` instead returns `parameters` as `{name, s1, st, rank}` (first-order and total variance indices of phi, ranked by `st`; `st` well above `s1` = interaction), `by_output`, `insensitive`, `sobol_samples`; it runs `sobol_samples × (npar + 2)` models and few samples give noisy indices. Other methods are `INVALID_INPUT` |
+| `run_pestpp_sweep` | `model: str`, `pst_file: str`, `num_samples: int = 20`, `seed: int = 1`, `parameter_csv: str | None` | Runs PESTPP-SWP over parameter vectors. Default: a Latin-hypercube sample of `num_samples` vectors inside the adjustable parameters' bounds (log space for log-transformed parameters, reproducible via `seed`); with `parameter_csv` (columns = parameter names, one row per run) exactly those vectors. Returns `runs` (`parameters`, `phi`, `observations`, `failed`), `n_failed`, `phi_range`, `parameter_file`, `output_file`. Failed runs are flagged, not dropped. The control file is copied to `<case>_swp.pst` |
+| `run_pestpp_opt` | `model: str`, `pst_file: str`, `objective: str | dict`, `decision_parameters: list[str]`, `constraints: dict`, `direction: "max" | "min" = "max"` | Constrained management optimisation with PESTPP-OPT (sequential linear programming), e.g. the largest pumping or drainage that keeps heads above a target. `decision_parameters` become decision variables (the other parameters are held fixed); `objective` is a parameter name or `{parameter: coefficient}`; `constraints` is `{observation: {"type": "less_than" | "greater_than", "value": rhs}}`. Returns `optimal_decisions`, `objective_value` and per-constraint `simulated`, `slack`, `active`. Constraints are linearised at the control file's initial values, so an infeasible start is reported as `INVALID_INPUT` (infeasible) and the optimum should be verified with a forward run. The control file is copied to `<case>_opt.pst` |
+| `apply_calibration_result` | `model: str`, `pst_file: str` | Writes the best estimate of a finished GLM/IES run back into the model: `engine`, `source`, applied `parameters`, `files_written`. Regenerates every input file from its PEST template (zoned setups rebuild K as base × multiplier), drops the cached model so the next access reloads the calibrated arrays, and records `calibration_applied` in the model metadata. Follow with `run_simulation` to get calibrated heads. pestpp-da runs are rejected (`INVALID_INPUT`); `OUTPUT_FILE_MISSING` when the run left no estimate |
 | `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
 | `summarise_da` | `model: str`, `pst_file: str`, `max_residuals: int = 500` | Per-cycle phi table (post-update ensemble mean from `<case>.global.phi.actual.csv`), final-cycle phi mean/std, posterior parameter statistics (`mean`/`std`/`min`/`max` from the **current run's** final `<case>.global.<cycle>.pe.csv`, excluding the `base` row), and residuals from that run's per-cycle base `.rei` (`residuals` capped at `max_residuals`, full table to CSV) |
 | `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
@@ -714,8 +835,10 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 **`summarise_da` is run-isolated:** the current run's cycle set is taken from its own (overwritten) per-cycle phi file, and the posterior ensemble and residuals are read from **that run's final cycle** — not from the highest cycle number present in the workspace. A second DA run with fewer cycles in a reused workspace therefore reports its own posterior and residuals rather than the earlier run's higher-cycle leftovers (the 6d rerun-4 finding F2: a 6-cycle control reporting run-1's `k=10.0` and its 2018-12-20 residuals). `summarise_calibration` does **not** summarise DA runs; use `summarise_da`. A workspace with **no** run outputs at all (no `<case>.global.phi.actual.csv` and no per-cycle `<case>.global.<cycle>.pe.csv`) fails loudly with `OUTPUT_FILE_MISSING` rather than returning an empty success — a partial no-update run that wrote the cycle phi is still summarised.
 
 `summarise_calibration` returns a **verdict** (7f-H4.2): `improved` (phi
-reduction versus the previous run — the prior phi is stored per model),
-`parameters_at_bounds`, `identifiable` (from the last
+below the previous run's when one was recorded — the prior phi is stored per
+model — otherwise below this run's own starting phi; `null` when there is only
+one phi value and no baseline, never a default `true`), `initial_phi`,
+`final_phi`, `phi_reduction_pct`, `parameters_at_bounds`, `identifiable` (from the last
 `check_parameter_sensitivity` run), and `fit_within_measurement_error`
 (`rmse <= measurement_error`).
 
@@ -749,7 +872,7 @@ file fails `OUTPUT_FILE_MISSING`.
 | `export_reproducible_script` | `model: str` | Path to a standalone `run.py` that rebuilds the model in pure flopy — no MCP dependency (7f-I5) |
 | `describe_model` | `model: str` | What the model is, where every number came from, and what is unverified |
 | `export_model_report` | `model: str` | Path to a Markdown report (description, provenance table, water balance, obs fit, plots, tool-call history) |
-| `clone_model` | `source: str`, `name: str`, `workspace: str = ""` | Copy the model to a new workspace (binary outputs not copied) |
+| `clone_model` | `source: str`, `name: str`, `workspace: str = ""`, `allow_modify: bool = True` | Copy the model to a new workspace — the whole tree, so external `OPEN/CLOSE` arrays in subdirectories come along; binary outputs are not copied. The clone is writable even when the source is a read-only adopted model (adopt the original untouched, work on clones); `allow_modify=False` keeps it read-only. Result includes `read_only` |
 | `compare_scenarios` | `model_a: str`, `model_b: str` | Head-difference statistics (incl. the max-difference cell), per-boundary budget deltas, observation-fit deltas — not arrays |
 
 ### Model spec schema (G1)

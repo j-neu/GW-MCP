@@ -21,6 +21,17 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+# Seconds without a change in a running job's progress before get_status flags
+# it ``possibly_stalled``. Informational only: a slow PEST++ iteration or one
+# long MF6 time step looks identical to a hang, so nothing is killed.
+STALL_AFTER_S = 900.0
+
+
+def _now() -> float:
+    """Monotonic clock (an indirection so tests can drive it)."""
+    return time.monotonic()
+
+
 STATUS_RUNNING = "running"
 STATUS_SUCCEEDED = "succeeded"
 STATUS_FAILED = "failed"
@@ -43,6 +54,9 @@ class Job:
     finished_at: float | None = None
     result: dict | None = None
     error: str | None = None
+    stall_after_s: float = STALL_AFTER_S
+    last_progress_key: str | None = field(default=None, repr=False)
+    last_progress_change: float = field(default=0.0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -145,13 +159,33 @@ def get_status(job_id: str) -> dict:
         "status": job.status,
         "elapsed_s": job.elapsed_s,
     }
-    if job.status == STATUS_RUNNING and job.progress_fn is not None:
-        try:
-            progress = job.progress_fn(job)
+    if job.status == STATUS_RUNNING:
+        progress: dict = {}
+        if job.progress_fn is not None:
+            try:
+                progress = job.progress_fn(job) or {}
+            except Exception:
+                progress = {}
             if progress:
                 result["progress"] = progress
-        except Exception:
-            pass
+        # Idle time = how long the observed progress has been unchanged. The
+        # first observation starts the clock (a job first polled late is not
+        # assumed idle since its start).
+        key = repr(sorted(progress.items(), key=lambda kv: str(kv[0])))
+        now = _now()
+        if job.last_progress_key is None or key != job.last_progress_key:
+            job.last_progress_key = key
+            job.last_progress_change = now
+        idle = round(now - job.last_progress_change, 2)
+        result["idle_s"] = idle
+        result["possibly_stalled"] = idle > job.stall_after_s
+        if result["possibly_stalled"]:
+            result["stall_note"] = (
+                f"No change in progress for {idle:.0f} s. A single long step "
+                "can look like this; if it persists, call cancel_job and use "
+                "the synchronous runner (run_pestpp_glm / run_pestpp_ies / "
+                "run_simulation), which is the reliable path."
+            )
     if job.status in (STATUS_SUCCEEDED, STATUS_FAILED):
         result["result"] = job.result
     if job.error:

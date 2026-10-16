@@ -21,6 +21,7 @@ from groundwater_mcp.utils.model_store import (
     clear_component_sims,
     clear_csub_base_snapshot,
     clear_k_base_snapshot,
+    clear_sto_base_snapshot,
     component_map,
     consume_reload_flag,
     detect_components,
@@ -61,6 +62,18 @@ _BOUNDARY_PKG_CLASSES: dict[str, type] = {
 # List-based boundary packages (stress_period_data = list of cell records).
 # Array-based packages (RCHA/EVTA) take a full-grid array per stress period.
 _ARRAY_BOUNDARY_PKGS = {"RCHA", "EVTA"}
+
+# Advanced (feature-based) packages: per-feature packagedata + connectiondata +
+# perioddata instead of a stress-period cell list, added with
+# ``add_advanced_package``. ``counts`` derives the dimension keywords the
+# FloPy class requires from the data.
+_ADVANCED_PKG_CLASSES: dict[str, type] = {
+    "SFR": mf6.ModflowGwfsfr,
+    "MAW": mf6.ModflowGwfmaw,
+    "LAK": mf6.ModflowGwflak,
+    "UZF": mf6.ModflowGwfuzf,
+}
+_ADVANCED_NEEDS_CONNECTIONS = {"SFR", "MAW", "LAK"}
 
 # Model length unit → metres.
 _LENGTH_TO_METRES: dict[str, float] = {
@@ -178,6 +191,20 @@ def _convert_rate(
 # ---------------------------------------------------------------------------
 
 
+def _gwt_tool(impl, model: str, **kwargs) -> dict:
+    """Run a GWT package implementation and map its failures to tool errors."""
+    try:
+        return impl(model, **kwargs)
+    except KeyError as exc:
+        return _err("MODEL_NOT_FOUND", str(exc), "Call add_gwt_model first.")
+    except ModelReadOnlyError as exc:
+        return _err("MODEL_ADOPTED_READONLY", str(exc))
+    except ValueError as exc:
+        return _err("INVALID_INPUT", str(exc))
+    except Exception as exc:
+        return _err("PACKAGE_ERROR", str(exc))
+
+
 def _err(code: str, message: str, suggestion: str = "") -> dict:
     return {"error": True, "code": code, "message": message, "suggestion": suggestion}
 
@@ -254,11 +281,62 @@ def _impl_create_model(
     }
 
 
+_LENGTH_ABBREV = {"FEET": "ft", "METERS": "m", "CENTIMETERS": "cm"}
+_TIME_ABBREV = {"SECONDS": "s", "MINUTES": "min", "HOURS": "h", "DAYS": "d", "YEARS": "yr"}
+
+
+class UnitsMismatchError(ValueError):
+    """Units passed to adopt_model contradict the units the model declares."""
+
+
+_MF6_LENGTH_UNITS = ("FEET", "METERS", "CENTIMETERS")
+_MF6_TIME_UNITS = ("SECONDS", "MINUTES", "HOURS", "DAYS", "YEARS")
+
+
+def _declared_units(sim) -> tuple[str | None, str | None]:
+    """(LENGTH_UNITS, TIME_UNITS) the simulation's files declare, or None.
+
+    Length comes from the first GWF model's DIS/DISV/DISU, time from TDIS;
+    MF6's ``UNKNOWN`` (or no option at all) is reported as None.
+    """
+    length = time = None
+    for model_name in sim.model_names:
+        gwf = sim.get_model(model_name)
+        if getattr(gwf, "model_type", "") != "gwf6":
+            continue
+        grid = get_dis(gwf) or get_disv(gwf) or get_disu(gwf)
+        raw = grid.length_units.get_data() if grid is not None else None
+        if raw and str(raw).upper() in _MF6_LENGTH_UNITS:
+            length = str(raw).upper()
+        break
+    raw_time = sim.tdis.time_units.get_data() if sim.tdis is not None else None
+    if raw_time and str(raw_time).upper() in _MF6_TIME_UNITS:
+        time = str(raw_time).upper()
+    return length, time
+
+
+def _resolve_adopted_unit(
+    kind: str, keyword: str, declared: str | None, given: str | None, default: str
+) -> tuple[str, str]:
+    """Pick one adopted-model unit and say where it came from."""
+    if declared is not None:
+        if given is not None and given.upper() != declared:
+            raise UnitsMismatchError(
+                f"The model files declare {keyword} {declared}, but {kind}="
+                f"'{given}' was passed. Omit {kind} (it is read from the "
+                f"files) or pass '{declared}'."
+            )
+        return declared, "model files"
+    if given is not None:
+        return given.upper(), "argument"
+    return default, "default"
+
+
 def _impl_adopt_model(
     name: str,
     workspace: str,
-    units: str,
-    time_units: str,
+    units: str | None = None,
+    time_units: str | None = None,
     allow_modify: bool = False,
 ) -> dict:
     """Register an existing MODFLOW 6 simulation on disk as a model.
@@ -301,6 +379,16 @@ def _impl_adopt_model(
             "contain a runnable input set (mfsim.nam + package files)."
         )
     sim = mf6.MFSimulation.load(sim_ws=str(model_dir), verbosity_level=0)
+    # The files' own LENGTH_UNITS/TIME_UNITS are authoritative: the stored
+    # units drive every later k/rate/CSUB conversion, so a METERS default on a
+    # FEET model mis-scales them all by 3.28 (GMS rerun-2, R4.2).
+    declared_length, declared_time = _declared_units(sim)
+    length_unit, length_source = _resolve_adopted_unit(
+        "units", "LENGTH_UNITS", declared_length, units, "METERS"
+    )
+    time_unit, time_source = _resolve_adopted_unit(
+        "time_units", "TIME_UNITS", declared_time, time_units, "DAYS"
+    )
     restore_oc_period_records(sim, model_dir)
     cache_sim(name, sim)
     # Preserve separate-simulation components (e.g. a saved GWE heat model):
@@ -312,8 +400,8 @@ def _impl_adopt_model(
                 components.setdefault(cname, value)
     _write_meta(model_dir, {
         "name": name,
-        "units": units.upper(),
-        "time_units": time_units.upper(),
+        "units": length_unit,
+        "time_units": time_unit,
         "adopted": True,
         "allow_modify": bool(allow_modify),
         "components": components,
@@ -321,11 +409,22 @@ def _impl_adopt_model(
     result: dict = {
         "model": name,
         "workspace": str(model_dir),
-        "units": units.upper(),
-        "time_units": time_units.upper(),
+        "units": length_unit,
+        "time_units": time_unit,
         "adopted": True,
         "model_names": list(sim.model_names),
+        "units_source": {"length": length_source, "time": time_source},
     }
+    undeclared = [
+        kw for kw, src in (("LENGTH_UNITS", length_source), ("TIME_UNITS", time_source))
+        if src != "model files"
+    ]
+    if undeclared:
+        result["warning"] = (
+            f"The model files do not declare {' or '.join(undeclared)}; using "
+            f"{length_unit}/{time_unit} from the arguments or defaults. Unit "
+            "conversions (k_units, rate_units, CSUB defaults) assume these."
+        )
     if allow_modify:
         result["allow_modify"] = True
     else:
@@ -708,30 +807,34 @@ def _ensure_flow_saving_for_fmi(gwf, model: str) -> None:
     _write_meta(ws, meta)
 
 
-def _impl_add_gwe_model(
+def _add_fmi_transport_model(
     model: str,
+    key: str,
+    model_cls: type,
+    fmi_cls: type,
+    label: str,
     flow_model: str | None = None,
     perioddata: list | None = None,
     time_units: str | None = None,
 ) -> dict:
-    """Create a derived GWE heat simulation coupled to a flow run via FMI.
+    """Create a derived transport simulation (``gwe`` heat / ``gwt`` solute)
+    coupled to a completed flow run through the Flow Model Interface.
 
-    The heat model lives in ``<workspace>/gwe/`` and reads the flow run's head
-    and budget files through ``ModflowGwefmi``. Run the flow model first, then
-    the heat model. Packages are added with the ``add_gwe_*`` tools. Omit
-    ``perioddata`` to mirror the flow TDIS (including its time units).
+    The transport model lives in ``<workspace>/<key>/`` and reads the flow
+    run's head and budget files. Run the flow model first, then the transport
+    model. Omit ``perioddata`` to mirror the flow TDIS (including its time
+    units).
     """
-    key = "gwe"
     if flow_model is not None and flow_model != model:
         raise ValueError(
-            "flow_model must be the same registered model; the derived heat "
-            "simulation is built inside this model's workspace."
+            "flow_model must be the same registered model; the derived "
+            f"{label} simulation is built inside this model's workspace."
         )
     flow_name = model
     if is_readonly(model):
         raise ModelReadOnlyError(
             f"Model '{model}' was registered with adopt_model and is read-only; "
-            "add_gwe_model cannot modify its flow input set."
+            f"add_{key}_model cannot modify its flow input set."
         )
     flow_sim = get_sim(flow_name)
     gwf = get_model(flow_name, "gwf")
@@ -743,40 +846,66 @@ def _impl_add_gwe_model(
     pd = perioddata if perioddata is not None else mirror["perioddata"]
     tu = time_units if time_units is not None else mirror.get("time_units")
 
-    heat_ws = ws / "gwe"
-    heat_ws.mkdir(parents=True, exist_ok=True)
+    comp_ws = ws / key
+    comp_ws.mkdir(parents=True, exist_ok=True)
     comp_name = _component_model_name(model, key, set(flow_sim.model_names))
 
-    hsim = mf6.MFSimulation(sim_name=f"{model}_gwe", version="mf6", sim_ws=str(heat_ws))
+    csim = mf6.MFSimulation(sim_name=f"{model}_{key}", version="mf6", sim_ws=str(comp_ws))
     tdis_kwargs: dict = {"nper": len(pd), "perioddata": pd}
     if tu is not None:
         tdis_kwargs["time_units"] = tu
     if mirror.get("start_date_time"):
         tdis_kwargs["start_date_time"] = mirror["start_date_time"]
-    mf6.ModflowTdis(hsim, **tdis_kwargs)
-    # GWE matrices are asymmetric — the solver must use BICGSTAB.
-    mf6.ModflowIms(hsim, complexity="SIMPLE", linear_acceleration="BICGSTAB")
-    gwe = mf6.ModflowGwe(hsim, modelname=comp_name, model_nam_file=f"{comp_name}.nam")
+    mf6.ModflowTdis(csim, **tdis_kwargs)
+    # Transport matrices are asymmetric — the solver must use BICGSTAB.
+    mf6.ModflowIms(csim, complexity="SIMPLE", linear_acceleration="BICGSTAB")
+    cmodel = model_cls(csim, modelname=comp_name, model_nam_file=f"{comp_name}.nam")
 
     hds, cbc = _flow_output_filenames(gwf)
-    mf6.ModflowGwefmi(
-        gwe,
+    fmi_cls(
+        cmodel,
         packagedata=[("GWFHEAD", f"../{hds}", None), ("GWFBUDGET", f"../{cbc}", None)],
     )
 
     _ensure_flow_saving_for_fmi(gwf, flow_name)
-    cache_component_sim(model, key, hsim)
+    cache_component_sim(model, key, csim)
     meta = _read_meta(ws)
-    meta.setdefault("components", {})[key] = {"model": comp_name, "workspace": "gwe"}
+    meta.setdefault("components", {})[key] = {"model": comp_name, "workspace": key}
     _write_meta(ws, meta)
     written = save_sim(model, flow_sim)
     return {
         "model": model,
         "component": key,
         "component_model": comp_name,
-        "workspace": str(heat_ws),
+        "workspace": str(comp_ws),
         "written": written,
     }
+
+
+def _impl_add_gwe_model(
+    model: str,
+    flow_model: str | None = None,
+    perioddata: list | None = None,
+    time_units: str | None = None,
+) -> dict:
+    """Create a derived GWE heat simulation coupled to a flow run via FMI."""
+    return _add_fmi_transport_model(
+        model, "gwe", mf6.ModflowGwe, mf6.ModflowGwefmi, "heat",
+        flow_model, perioddata, time_units,
+    )
+
+
+def _impl_add_gwt_model(
+    model: str,
+    flow_model: str | None = None,
+    perioddata: list | None = None,
+    time_units: str | None = None,
+) -> dict:
+    """Create a derived GWT solute-transport simulation coupled to a flow run."""
+    return _add_fmi_transport_model(
+        model, "gwt", mf6.ModflowGwt, mf6.ModflowGwtfmi, "solute",
+        flow_model, perioddata, time_units,
+    )
 
 
 def _ensure_flow_saving_for_prt(model: str) -> None:
@@ -1051,6 +1180,132 @@ def _impl_add_gwe_esl_package(
     return {"model": model, "package": "ESL", "written": save_sim(model, gwe.simulation)}
 
 
+def _replace_gwt_package(model: str, tool: str, key: str, cls: type, **kwargs) -> dict:
+    """Add (replacing any existing) a GWT package and report it."""
+    _require_writable(model, tool)
+    gwt = get_model(model, "gwt")
+    existing = gwt.get_package(key)
+    if existing is not None:
+        gwt.remove_package(existing)
+    cls(gwt, **kwargs)
+    return {"model": model, "package": key.upper(), "written": save_sim(model, gwt.simulation)}
+
+
+def _impl_add_gwt_adv_package(model: str, scheme: str = "TVD") -> dict:
+    """Add the GWT advection package (UPSTREAM, CENTRAL or TVD)."""
+    if str(scheme).upper() not in ("UPSTREAM", "CENTRAL", "TVD"):
+        raise ValueError(f"scheme must be UPSTREAM, CENTRAL or TVD, got '{scheme}'.")
+    out = _replace_gwt_package(
+        model, "add_gwt_adv_package", "adv", mf6.ModflowGwtadv, scheme=scheme
+    )
+    out["scheme"] = scheme
+    return out
+
+
+def _impl_add_gwt_dsp_package(
+    model: str,
+    alh: float | list | None = None,
+    ath1: float | list | None = None,
+    ath2: float | list | None = None,
+    alv: float | list | None = None,
+    atv: float | list | None = None,
+    diffc: float | list | None = None,
+) -> dict:
+    """Add the GWT dispersion package: dispersivities and molecular diffusion."""
+    kwargs = {
+        n: v for n, v in (
+            ("alh", alh), ("ath1", ath1), ("ath2", ath2),
+            ("alv", alv), ("atv", atv), ("diffc", diffc),
+        ) if v is not None
+    }
+    return _replace_gwt_package(
+        model, "add_gwt_dsp_package", "dsp", mf6.ModflowGwtdsp, **kwargs
+    )
+
+
+def _impl_add_gwt_mst_package(
+    model: str,
+    porosity: float | list,
+    decay: float | list | None = None,
+    decay_sorbed: float | list | None = None,
+    bulk_density: float | list | None = None,
+    distcoef: float | list | None = None,
+    sorption: str | None = None,
+    first_order_decay: bool = False,
+    zero_order_decay: bool = False,
+    save_flows: bool = False,
+) -> dict:
+    """Add the GWT mobile storage and transfer package: porosity, sorption and
+    decay."""
+    if sorption is not None and str(sorption).lower() not in ("linear", "freundlich", "langmuir"):
+        raise ValueError(
+            f"sorption must be linear, freundlich or langmuir, got '{sorption}'."
+        )
+    if sorption is not None and (bulk_density is None or distcoef is None):
+        raise ValueError("sorption needs both bulk_density and distcoef.")
+    if (first_order_decay or zero_order_decay) and decay is None:
+        raise ValueError("decay is required when first_order_decay/zero_order_decay is set.")
+    kwargs: dict = {"porosity": porosity, "save_flows": save_flows}
+    for name, value in (
+        ("decay", decay), ("decay_sorbed", decay_sorbed),
+        ("bulk_density", bulk_density), ("distcoef", distcoef), ("sorption", sorption),
+    ):
+        if value is not None:
+            kwargs[name] = value
+    if first_order_decay:
+        kwargs["first_order_decay"] = True
+    if zero_order_decay:
+        kwargs["zero_order_decay"] = True
+    return _replace_gwt_package(
+        model, "add_gwt_mst_package", "mst", mf6.ModflowGwtmst, **kwargs
+    )
+
+
+def _impl_add_gwt_ssm_package(model: str, sources: list | None = None) -> dict:
+    """Add the GWT source-sink mixing package (required when the flow model has
+    boundary packages). ``sources`` is [(pname, srctype, auxname)]."""
+    _require_writable(model, "add_gwt_ssm_package")
+    get_model(model, "gwt")
+    kwargs: dict = {}
+    if sources:
+        flow = get_model(model, "gwf")
+        available = {str(p).lower() for p in flow.get_package_list()}
+        for src in sources:
+            if str(src[0]).lower() not in available:
+                raise ValueError(
+                    f"SSM source package '{src[0]}' is not a package on the flow "
+                    f"model. Available: {sorted(flow.get_package_list())}."
+                )
+        kwargs["sources"] = sources
+    return _replace_gwt_package(
+        model, "add_gwt_ssm_package", "ssm", mf6.ModflowGwtssm, **kwargs
+    )
+
+
+def _impl_add_gwt_cnc_package(
+    model: str, stress_period_data: dict, save_flows: bool = False
+) -> dict:
+    """Add constant-concentration cells (``[[cellid, concentration], ...]`` per
+    stress period)."""
+    spd = {int(k): v for k, v in stress_period_data.items()}
+    return _replace_gwt_package(
+        model, "add_gwt_cnc_package", "cnc", mf6.ModflowGwtcnc,
+        stress_period_data=spd, save_flows=save_flows,
+    )
+
+
+def _impl_add_gwt_src_package(
+    model: str, stress_period_data: dict, save_flows: bool = False
+) -> dict:
+    """Add mass source loading (``[[cellid, mass_rate], ...]`` per stress
+    period)."""
+    spd = {int(k): v for k, v in stress_period_data.items()}
+    return _replace_gwt_package(
+        model, "add_gwt_src_package", "src", mf6.ModflowGwtsrc,
+        stress_period_data=spd, save_flows=save_flows,
+    )
+
+
 def _remove_solution_package(sim, pkg) -> None:
     """Remove a solution package without flopy's solution-group ``TypeError``.
 
@@ -1113,9 +1368,20 @@ def _impl_set_simulation(
     linear_acceleration: str | None = None,
     outer_maximum: int | None = None,
     under_relaxation: str | None = None,
+    inner_maximum: int | None = None,
+    outer_dvclose: float | None = None,
+    inner_dvclose: float | None = None,
+    relaxation_factor: float | None = None,
 ) -> dict:
     if len(perlen) != nper or len(nstp) != nper:
         raise ValueError(f"len(perlen) and len(nstp) must equal nper={nper}.")
+    if inner_maximum is not None and int(inner_maximum) <= 0:
+        raise ValueError("inner_maximum must be a positive integer.")
+    for label, val in (("outer_dvclose", outer_dvclose), ("inner_dvclose", inner_dvclose)):
+        if val is not None and float(val) <= 0:
+            raise ValueError(f"{label} must be positive.")
+    if relaxation_factor is not None and not 0.0 <= float(relaxation_factor) <= 1.0:
+        raise ValueError("relaxation_factor must be between 0 and 1.")
     if start_date_time is not None:
         start_date_time = str(start_date_time).strip()
         if not start_date_time:
@@ -1164,6 +1430,14 @@ def _impl_set_simulation(
         # MF6 IMS UNDER_RELAXATION is a keyword string ("simple"/"complex"),
         # not a boolean flag.
         ims_kwargs["under_relaxation"] = str(under_relaxation)
+    if inner_maximum is not None:
+        ims_kwargs["inner_maximum"] = int(inner_maximum)
+    if outer_dvclose is not None:
+        ims_kwargs["outer_dvclose"] = float(outer_dvclose)
+    if inner_dvclose is not None:
+        ims_kwargs["inner_dvclose"] = float(inner_dvclose)
+    if relaxation_factor is not None:
+        ims_kwargs["relaxation_factor"] = float(relaxation_factor)
     ims = mf6.ModflowIms(sim, **ims_kwargs)
     # A same-simulation explicit component (PRT) is solved by its own EMS, so
     # the flow IMS covers only the flow model(s) and is listed before the EMS.
@@ -1257,6 +1531,17 @@ def _impl_set_model_crs(
     }
 
 
+def _apply_length_units(kwargs: dict, model: str) -> None:
+    """Write the model's declared length unit into a grid package's kwargs.
+
+    Without it MF6 runs the model with UNKNOWN length units, and a later
+    ``adopt_model`` of the same files cannot recover them (R4.2).
+    """
+    units = str(_read_meta(resolve_workspace(model)).get("units", "")).upper()
+    if units in _MF6_LENGTH_UNITS:
+        kwargs["length_units"] = units
+
+
 def _impl_add_dis_package(
     model: str,
     nlay: int,
@@ -1286,6 +1571,7 @@ def _impl_add_dis_package(
     }
     if idomain is not None:
         dis_kwargs["idomain"] = idomain
+    _apply_length_units(dis_kwargs, model)
     dis_cls = grid_class_for(component, "dis")
     if dis_cls is None:
         raise ValueError(f"Component '{component}' has no DIS grid class.")
@@ -1342,16 +1628,17 @@ def _impl_add_disv_package(
     disv_cls = grid_class_for(component, "disv")
     if disv_cls is None:
         raise ValueError(f"Component '{component}' has no DISV grid class.")
-    disv_cls(
-        gwf,
-        nlay=nlay,
-        ncpl=ncpl,
-        nvert=nvert,
-        vertices=vertices,
-        cell2d=cell2d,
-        top=top,
-        botm=botm,
-    )
+    disv_kwargs: dict = {
+        "nlay": nlay,
+        "ncpl": ncpl,
+        "nvert": nvert,
+        "vertices": vertices,
+        "cell2d": cell2d,
+        "top": top,
+        "botm": botm,
+    }
+    _apply_length_units(disv_kwargs, model)
+    disv_cls(gwf, **disv_kwargs)
     written = save_sim(model, gwf.simulation)
     return {
         "model": model,
@@ -1479,6 +1766,7 @@ def _impl_add_disu_package(
     disu_cls = grid_class_for(component, "disu")
     if disu_cls is None:
         raise ValueError(f"Component '{component}' has no DISU grid class.")
+    _apply_length_units(kwargs, model)
     disu_cls(gwf, **kwargs)
     written = save_sim(model, gwf.simulation)
     return {
@@ -1619,6 +1907,8 @@ def _impl_add_sto_package(
         sto_kwargs["transient"] = {transient_start: True}
 
     mf6.ModflowGwfsto(gwf, **sto_kwargs)
+    # A deliberately changed STO invalidates setup_calibration's ss/sy snapshots.
+    clear_sto_base_snapshot(model, gwf.name)
     written = save_sim(model, sim)
 
     transient_periods = [i for i in range(nper) if i not in set(steady_state)]
@@ -2127,6 +2417,12 @@ def _impl_add_boundary_package(
     pname: str | None = None,
 ) -> dict:
     pkg_name = package.upper()
+    if pkg_name in _ADVANCED_PKG_CLASSES:
+        raise ValueError(
+            f"{pkg_name} is a feature-based package (packagedata / "
+            "connectiondata / perioddata), not a stress-period cell list. "
+            "Use add_advanced_package instead."
+        )
     if pkg_name not in _BOUNDARY_PKG_CLASSES:
         raise ValueError(
             f"Unsupported package '{pkg_name}'. "
@@ -2196,6 +2492,11 @@ def _impl_add_boundary_package(
         mf6.ModflowGwfevta(gwf, rate=spd, **pkg_kwargs)
     else:
         pkg_cls(gwf, stress_period_data=spd, **pkg_kwargs)
+    if pkg_name in ("RCH", "RCHA", "RIV", "DRN", "GHB"):
+        # Changed on purpose: drop setup_calibration's base snapshots.
+        stem = "rch" if pkg_name.startswith("RCH") else pkg_name.lower()
+        for snap in resolve_workspace(model).glob(f"{gwf.name}_{stem}_sp*_pristine.npy"):
+            snap.unlink()
     written = save_sim(model, gwf.simulation)
 
     if pkg_name in _ARRAY_BOUNDARY_PKGS:
@@ -2226,6 +2527,200 @@ def _impl_add_boundary_package(
                 "and re-add each boundary in its own call."
             )
     return result
+
+
+def _tuple_records(records) -> list:
+    """Convert nested lists in feature records to tuples (JSON has no tuples;
+    FloPy reads a cell id as a tuple)."""
+    return [
+        tuple(tuple(v) if isinstance(v, list) else v for v in rec) for rec in records
+    ]
+
+
+def _impl_add_advanced_package(
+    model: str,
+    package: str,
+    packagedata: list,
+    connectiondata: list | None = None,
+    perioddata: dict | None = None,
+    options: dict | None = None,
+    pname: str | None = None,
+    save_flows: bool = True,
+) -> dict:
+    """Add a feature-based package: SFR (streams), MAW (multi-aquifer wells),
+    LAK (lakes) or UZF (unsaturated zone).
+
+    ``packagedata`` and ``connectiondata`` hold one record per feature /
+    connection in the MODFLOW 6 column order; ``perioddata`` is
+    ``{period: [[feature_id, keyword, value, ...], ...]}``. ``options`` are
+    package keywords passed through (``simulate_et``, ``unit_conversion``,
+    ``outlets``/``tables`` for LAK, ``diversions`` for SFR, ...). The
+    dimension counts (nreaches, nmawwells, nlakes/noutlets/ntables,
+    nuzfcells) are derived from the data.
+    """
+    pkg_name = package.upper()
+    if pkg_name not in _ADVANCED_PKG_CLASSES:
+        raise ValueError(
+            f"Unsupported advanced package '{package}'. "
+            f"Choose from: {', '.join(_ADVANCED_PKG_CLASSES)}. List-based "
+            "boundaries (CHD/WEL/RIV/...) use add_boundary_package."
+        )
+    if not packagedata:
+        raise ValueError(f"{pkg_name} needs packagedata (one record per feature).")
+    if pkg_name in _ADVANCED_NEEDS_CONNECTIONS and not connectiondata:
+        raise ValueError(
+            f"{pkg_name} needs connectiondata (the connections between its "
+            "features and the grid / each other)."
+        )
+    _require_writable(model, "add_advanced_package")
+
+    opts = dict(options or {})
+    kwargs: dict = {"packagedata": _tuple_records(packagedata), **opts}
+    if connectiondata:
+        kwargs["connectiondata"] = _tuple_records(connectiondata)
+    if perioddata:
+        kwargs["perioddata"] = {
+            int(k): _tuple_records(v) for k, v in perioddata.items()
+        }
+    for key in ("outlets", "tables", "diversions"):
+        if key in kwargs and kwargs[key]:
+            kwargs[key] = _tuple_records(kwargs[key])
+
+    n = len(packagedata)
+    counts = {
+        "SFR": {"nreaches": n},
+        "MAW": {"nmawwells": n},
+        "LAK": {
+            "nlakes": n,
+            "noutlets": len(opts.get("outlets") or []),
+            "ntables": len(opts.get("tables") or []),
+        },
+        "UZF": {"nuzfcells": n},
+    }[pkg_name]
+    kwargs.update(counts)
+    if pname:
+        kwargs["pname"] = pname
+    kwargs.setdefault("save_flows", save_flows)
+
+    gwf = get_gwf(model)
+    existing = _packages_of_type(gwf, pkg_name.lower())
+    targets = (
+        [p for p in existing if _pkg_nam_name(p).lower() == pname.lower()]
+        if pname
+        else existing
+    )
+    for pkg in targets:
+        gwf.remove_package(pkg)
+    _ADVANCED_PKG_CLASSES[pkg_name](gwf, **kwargs)
+    written = save_sim(model, gwf.simulation)
+    result: dict = {
+        "model": model,
+        "package": pkg_name,
+        "pname": pname,
+        "counts": counts,
+        "stress_periods": sorted(kwargs.get("perioddata", {})),
+        "written": written,
+    }
+    if targets:
+        result["warning"] = (
+            f"A previous {pkg_name} package was removed and replaced by this call."
+        )
+    return result
+
+
+_MVR_TYPES = ("FACTOR", "EXCESS", "THRESHOLD", "UPTO")
+
+
+def _impl_add_mvr_package(
+    model: str,
+    packages: list,
+    perioddata: dict,
+    options: dict | None = None,
+) -> dict:
+    """Add the water mover (MVR): route water from one package's feature to
+    another's (a well discharging to a stream, a lake outlet to a reach, ...).
+
+    ``packages`` lists the flow packages taking part, by their package name
+    (the ``pname`` they were added with, e.g. ``wel_0``, ``sfr_0``); each must
+    have been created with the mover option (``{"mover": True}``).
+    ``perioddata`` is ``{period: [[provider, id, receiver, id, mvrtype,
+    value], ...]}`` with mvrtype FACTOR, EXCESS, THRESHOLD or UPTO.
+    ``maxmvr`` and ``maxpackages`` are derived.
+    """
+    _require_writable(model, "add_mvr_package")
+    if not packages:
+        raise ValueError("packages must name the flow packages the mover connects.")
+    if not perioddata:
+        raise ValueError("perioddata needs at least one mover record.")
+
+    gwf = get_gwf(model)
+    by_name = {
+        str(n).lower(): gwf.get_package(n) for n in gwf.get_package_list()
+    }
+    names = [str(p) for p in packages]
+    for name in names:
+        pkg = by_name.get(name.lower())
+        if pkg is None:
+            raise ValueError(
+                f"Package '{name}' is not on the flow model. Available: "
+                f"{sorted(by_name)}."
+            )
+        mover = getattr(pkg, "mover", None)
+        enabled = mover.get_data() if mover is not None and hasattr(mover, "get_data") else None
+        if not enabled:
+            raise ValueError(
+                f"Package '{name}' was not created with the mover option; "
+                "re-add it with options={'mover': True} (add_advanced_package) "
+                "or kwargs={'mover': True} (add_boundary_package)."
+            )
+
+    allowed = {n.lower() for n in names}
+    spd: dict[int, list] = {}
+    for period, records in perioddata.items():
+        rows = []
+        for rec in records:
+            if len(rec) != 6:
+                raise ValueError(
+                    "Each mover record is [provider, id, receiver, id, "
+                    f"mvrtype, value]; got {list(rec)!r}."
+                )
+            prov, pid, recv, rid, mtype, value = rec
+            for who in (prov, recv):
+                if str(who).lower() not in allowed:
+                    raise ValueError(
+                        f"Mover record names '{who}', which is not in packages "
+                        f"{names}."
+                    )
+            if str(mtype).upper() not in _MVR_TYPES:
+                raise ValueError(
+                    f"mvrtype must be one of {', '.join(_MVR_TYPES)}, got '{mtype}'."
+                )
+            rows.append(
+                (str(prov), int(pid), str(recv), int(rid), str(mtype).upper(), float(value))
+            )
+        spd[int(period)] = rows
+
+    counts = {
+        "maxmvr": max(len(rows) for rows in spd.values()),
+        "maxpackages": len(names),
+    }
+    existing = gwf.get_package("mvr")
+    if existing is not None:
+        gwf.remove_package(existing)
+    mf6.ModflowGwfmvr(
+        gwf,
+        packages=[(n,) for n in names],
+        perioddata=spd,
+        **counts,
+        **(options or {}),
+    )
+    return {
+        "model": model,
+        "package": "MVR",
+        "counts": counts,
+        "stress_periods": sorted(spd),
+        "written": save_sim(model, gwf.simulation),
+    }
 
 
 def _validate_disu_boundary_cellids(spd: dict) -> None:
@@ -2307,6 +2802,7 @@ def _impl_add_oc_package(
     saverecord: list | None,
     printrecord: list | None,
     component: str = "gwf",
+    budgetcsv_filerecord: str | None = None,
 ) -> dict:
     key = component.lower()
     spec = spec_for(key)
@@ -2331,6 +2827,8 @@ def _impl_add_oc_package(
     oc_kwargs["saverecord"] = save_rec
     if printrecord is not None:
         oc_kwargs["printrecord"] = printrecord
+    if budgetcsv_filerecord is not None:
+        oc_kwargs["budgetcsv_filerecord"] = budgetcsv_filerecord
 
     pkg = comp.get_package("oc")
     if pkg is not None:
@@ -2421,7 +2919,7 @@ def _impl_summarise_model(model: str) -> dict:
             pass
 
     boundary_types = [
-        pkg for pkg in _BOUNDARY_PKG_CLASSES
+        pkg for pkg in (*_BOUNDARY_PKG_CLASSES, *_ADVANCED_PKG_CLASSES)
         if gwf.get_package(pkg.lower()) is not None
     ]
 
@@ -2448,12 +2946,21 @@ def _impl_summarise_model(model: str) -> dict:
         }
 
     # Declared units per quantity (7f-H1.3): what was declared, not assumed.
+    # Values are stored in the model's own length/time units, so an
+    # undeclared quantity is labelled with those — not a fixed "m/d" (R4.2).
     declared = meta.get("declared_units", {})
+    length_unit = str(meta.get("units", "METERS")).upper()
+    time_unit = str(meta.get("time_units", "DAYS")).upper()
+    model_rate = (
+        f"{_LENGTH_ABBREV.get(length_unit, length_unit.lower())}/"
+        f"{_TIME_ABBREV.get(time_unit, time_unit.lower())}"
+    )
     units = {
-        "length": meta.get("units", "METERS"),
-        "time": meta.get("time_units", "DAYS"),
-        "k": declared.get("k", "m/d"),
-        "recharge": declared.get("recharge", "m/d"),
+        "length": length_unit,
+        "time": time_unit,
+        "k": declared.get("k", model_rate),
+        "recharge": declared.get("recharge", model_rate),
+        "model_rate": model_rate,
     }
 
     components_info: dict[str, dict] = {}
@@ -2523,7 +3030,8 @@ def _compute_model_status(model: str) -> dict:
     has_oc = gwf.get_package("oc") is not None
     has_sto = gwf.get_package("sto") is not None
     has_boundary = any(
-        gwf.get_package(pkg.lower()) is not None for pkg in _BOUNDARY_PKG_CLASSES
+        gwf.get_package(pkg.lower()) is not None
+        for pkg in (*_BOUNDARY_PKG_CLASSES, *_ADVANCED_PKG_CLASSES)
     )
 
     needs_sto = False
@@ -2665,8 +3173,8 @@ def register(mcp) -> None:
     def adopt_model(
         name: str,
         workspace: str,
-        units: str = "METERS",
-        time_units: str = "DAYS",
+        units: str | None = None,
+        time_units: str | None = None,
         allow_modify: bool = False,
     ) -> dict:
         """Register an existing MODFLOW 6 simulation on disk as a model.
@@ -2684,9 +3192,17 @@ def register(mcp) -> None:
         builder calls are refused with MODEL_ADOPTED_READONLY so a real
         published model cannot be silently rewritten. Pass ``allow_modify=True``
         to opt out; check_model / run_simulation / summarise_model /
-        read_heads always work on read-only adopted models."""
+        read_heads always work on read-only adopted models.
+
+        Units are read from the files (DIS/DISV/DISU LENGTH_UNITS, TDIS
+        TIME_UNITS) and reported in ``units_source``; leave ``units`` /
+        ``time_units`` unset. A value that contradicts the files is
+        INVALID_INPUT. They are used only when the files declare none
+        (otherwise METERS/DAYS, with a ``warning``)."""
         try:
             return _impl_adopt_model(name, workspace, units, time_units, allow_modify)
+        except UnitsMismatchError as exc:
+            return _err("INVALID_INPUT", str(exc))
         except ValueError as exc:
             return _err("MODEL_EXISTS", str(exc), "Use a different model name.")
         except FileNotFoundError as exc:
@@ -2743,8 +3259,16 @@ def register(mcp) -> None:
         linear_acceleration: str | None = None,
         outer_maximum: int | None = None,
         under_relaxation: str | None = None,
+        inner_maximum: int | None = None,
+        outer_dvclose: float | None = None,
+        inner_dvclose: float | None = None,
+        relaxation_factor: float | None = None,
     ) -> dict:
         """Configure simulation time discretisation (TDIS) and solver (IMS).
+
+        ``inner_maximum``, ``outer_dvclose``, ``inner_dvclose`` and
+        ``relaxation_factor`` (0-1, for the ILU preconditioner) override the
+        complexity preset's solver controls when given.
 
         ``start_date_time`` is an optional ISO-8601 date/datetime (e.g.
         "1935-01-25") that anchors the elapsed model time axis to calendar
@@ -2767,6 +3291,10 @@ def register(mcp) -> None:
                 linear_acceleration,
                 outer_maximum,
                 under_relaxation,
+                inner_maximum,
+                outer_dvclose,
+                inner_dvclose,
+                relaxation_factor,
             )
         except UnknownComponentError as exc:
             return _err("INVALID_INPUT", str(exc))
@@ -3157,15 +3685,18 @@ def register(mcp) -> None:
         saverecord: list | None = None,
         printrecord: list | None = None,
         component: str = "gwf",
+        budgetcsv_filerecord: str | None = None,
     ) -> dict:
         """Add an Output Control (OC) package.
 
         ``component="gwf"`` (default) writes the head/budget filerecords;
-        ``component="gwe"`` writes the GWE temperature/budget filerecords."""
+        ``component="gwe"`` writes the GWE temperature/budget filerecords.
+        ``budgetcsv_filerecord`` (e.g. "model.budget.csv") also writes the
+        water budget as a CSV each time step."""
         try:
             return _impl_add_oc_package(
                 model, head_filerecord, budget_filerecord, saverecord, printrecord,
-                component=component,
+                component=component, budgetcsv_filerecord=budgetcsv_filerecord,
             )
         except UnknownComponentError as exc:
             return _err("INVALID_INPUT", str(exc))
@@ -3291,6 +3822,194 @@ def register(mcp) -> None:
             return _err("INVALID_INPUT", str(exc))
         except Exception as exc:
             return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_advanced_package(
+        model: str,
+        package: str,
+        packagedata: list,
+        connectiondata: list | None = None,
+        perioddata: dict | None = None,
+        options: dict | None = None,
+        pname: str | None = None,
+        save_flows: bool = True,
+    ) -> dict:
+        """Add a feature-based flow package: SFR (stream network), MAW
+        (multi-aquifer well), LAK (lake) or UZF (unsaturated zone).
+
+        These take per-feature records rather than a stress-period cell list, in
+        MODFLOW 6 column order (cell ids are [layer, row, col] on DIS, 0-based):
+
+        - SFR packagedata: [ifno, cellid, rlen, rwid, rgrd, rtp, rbth, rhk,
+          man, ncon, ustrf, ndv]; connectiondata: [ifno, ic1, ic2, ...] with
+          negative numbers for downstream reaches; perioddata
+          {0: [[ifno, "INFLOW", value], ...]}.
+        - MAW packagedata: [ifno, radius, bottom, strt, condeqn, ngwfnodes];
+          connectiondata: [ifno, icon, cellid, scrn_top, scrn_bot, hk_skin,
+          radius_skin]; perioddata {0: [[ifno, "RATE", value], ...]}.
+        - LAK packagedata: [ifno, strt, nlakeconn]; connectiondata: [ifno,
+          iconn, cellid, claktype, bedleak, belev, telev, connlen, connwidth];
+          perioddata {0: [[ifno, "RAINFALL", value], ...]}; outlets/tables go
+          in ``options``.
+        - UZF packagedata: [ifno, cellid, landflag, ivertcon, surfdep, vks,
+          thtr, thts, thti, eps]; perioddata {0: [[ifno, finf, pet, extdp,
+          extwc, ha, hroot, rootact], ...]}; keywords such as simulate_et go in
+          ``options``.
+
+        Dimension counts are derived from the data. Replaces an existing
+        package of the same type (or the one named ``pname``)."""
+        try:
+            return _impl_add_advanced_package(
+                model, package, packagedata, connectiondata, perioddata,
+                options, pname, save_flows,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_mvr_package(
+        model: str,
+        packages: list,
+        perioddata: dict,
+        options: dict | None = None,
+    ) -> dict:
+        """Add the water mover (MVR): route water between flow-package features
+        (a well discharging to a stream, a lake outlet to a reach, ...).
+
+        ``packages`` lists the participating flow packages by package name (the
+        ``pname`` they were added with); each must have been created with
+        mover enabled (add_advanced_package options={"mover": True}, or
+        add_boundary_package kwargs={"mover": True}). ``perioddata`` is
+        {period: [[provider, id, receiver, id, mvrtype, value], ...]} with
+        mvrtype FACTOR, EXCESS, THRESHOLD or UPTO and 0-based feature ids.
+        maxmvr / maxpackages are derived from the data."""
+        try:
+            return _impl_add_mvr_package(model, packages, perioddata, options)
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("PACKAGE_ERROR", str(exc))
+
+    @mcp.tool()
+    def add_gwt_model(
+        model: str,
+        flow_model: str | None = None,
+        perioddata: list | None = None,
+        time_units: str | None = None,
+    ) -> dict:
+        """Create a derived GWT solute-transport simulation coupled to a flow run.
+
+        The transport model lives in ``<workspace>/gwt/`` and reads the flow
+        run's head/budget files through the Flow Model Interface (the same
+        pattern as add_gwe_model). Build it with grid/IC (``component="gwt"`` on
+        add_dis_package/add_disv_package/add_ic_package), add_gwt_adv_package,
+        add_gwt_dsp_package, add_gwt_mst_package, add_gwt_ssm_package and the
+        sources (add_gwt_cnc_package / add_gwt_src_package, or aux
+        concentrations on flow boundaries via add_gwt_ssm_package), then
+        ``add_oc_package(component="gwt")`` for the concentration file.
+        run_simulation runs flow first, then transport; read it with
+        read_concentration and plot_concentration_map. Omit ``perioddata`` to
+        mirror the flow TDIS."""
+        try:
+            return _impl_add_gwt_model(
+                model, flow_model=flow_model, perioddata=perioddata, time_units=time_units
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("GWT_BUILD_FAILED", str(exc))
+
+    @mcp.tool()
+    def add_gwt_adv_package(model: str, scheme: str = "TVD") -> dict:
+        """Add the GWT advection package. ``scheme`` is UPSTREAM, CENTRAL or
+        TVD (TVD limits numerical dispersion without oscillation)."""
+        return _gwt_tool(_impl_add_gwt_adv_package, model, scheme=scheme)
+
+    @mcp.tool()
+    def add_gwt_dsp_package(
+        model: str,
+        alh: float | list | None = None,
+        ath1: float | list | None = None,
+        ath2: float | list | None = None,
+        alv: float | list | None = None,
+        atv: float | list | None = None,
+        diffc: float | list | None = None,
+    ) -> dict:
+        """Add the GWT dispersion package: longitudinal/transverse
+        dispersivities (alh, ath1, ath2, alv, atv) and effective molecular
+        diffusion (diffc). Values are scalars or per-cell arrays."""
+        return _gwt_tool(
+            _impl_add_gwt_dsp_package, model,
+            alh=alh, ath1=ath1, ath2=ath2, alv=alv, atv=atv, diffc=diffc,
+        )
+
+    @mcp.tool()
+    def add_gwt_mst_package(
+        model: str,
+        porosity: float | list,
+        decay: float | list | None = None,
+        decay_sorbed: float | list | None = None,
+        bulk_density: float | list | None = None,
+        distcoef: float | list | None = None,
+        sorption: str | None = None,
+        first_order_decay: bool = False,
+        zero_order_decay: bool = False,
+        save_flows: bool = False,
+    ) -> dict:
+        """Add the GWT mobile storage and transfer package: porosity (required),
+        optional linear/freundlich/langmuir sorption (needs bulk_density and
+        distcoef) and first- or zero-order decay (needs decay)."""
+        return _gwt_tool(
+            _impl_add_gwt_mst_package, model, porosity=porosity, decay=decay,
+            decay_sorbed=decay_sorbed, bulk_density=bulk_density, distcoef=distcoef,
+            sorption=sorption, first_order_decay=first_order_decay,
+            zero_order_decay=zero_order_decay, save_flows=save_flows,
+        )
+
+    @mcp.tool()
+    def add_gwt_ssm_package(model: str, sources: list | None = None) -> dict:
+        """Add the GWT source-sink mixing package, required when the flow model
+        has boundary packages. ``sources`` is [(flow package name, srctype,
+        auxname)], e.g. [("CHD", "AUX", "CONCENTRATION")] to take the inflow
+        concentration from the flow package's CONCENTRATION auxiliary variable
+        (declare it with auxiliary="CONCENTRATION" in add_boundary_package)."""
+        return _gwt_tool(_impl_add_gwt_ssm_package, model, sources=sources)
+
+    @mcp.tool()
+    def add_gwt_cnc_package(
+        model: str, stress_period_data: dict, save_flows: bool = False
+    ) -> dict:
+        """Add constant-concentration cells: {period: [[cellid, concentration],
+        ...]}. cellid is [layer, row, col] on DIS."""
+        return _gwt_tool(
+            _impl_add_gwt_cnc_package, model,
+            stress_period_data=stress_period_data, save_flows=save_flows,
+        )
+
+    @mcp.tool()
+    def add_gwt_src_package(
+        model: str, stress_period_data: dict, save_flows: bool = False
+    ) -> dict:
+        """Add mass source loading: {period: [[cellid, mass_rate], ...]}
+        (mass per time into the cell)."""
+        return _gwt_tool(
+            _impl_add_gwt_src_package, model,
+            stress_period_data=stress_period_data, save_flows=save_flows,
+        )
 
     @mcp.tool()
     def add_prt_model(model: str) -> dict:

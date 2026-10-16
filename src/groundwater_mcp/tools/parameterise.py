@@ -1056,11 +1056,24 @@ def _impl_assign_k_from_zones(
     layer: int | list[int],
     k33_field: str | None,
     icelltype_field: str | None,
+    unmatched: str = "error",
 ) -> dict:
-    """Assign K arrays to model layers from geological zone polygons."""
+    """Assign K arrays to model layers from geological zone polygons.
+
+    ``unmatched`` decides what active cells outside every polygon get:
+    ``"error"`` (default) refuses the call, ``"keep"`` leaves their existing
+    values, ``"nearest"`` copies the values of the nearest matched cell.
+    Inactive cells outside every polygon always keep their existing values,
+    so no NaN is ever written into NPF.
+    """
     import geopandas as gpd
 
     from groundwater_mcp.utils.spatial import grid_centroids, intersect_points_with_polygons
+
+    if unmatched not in ("error", "keep", "nearest"):
+        raise ValueError(
+            f"unmatched must be 'error', 'keep' or 'nearest', got '{unmatched}'."
+        )
 
     gwf = get_gwf(model)
     mg = gwf.modelgrid
@@ -1072,7 +1085,22 @@ def _impl_assign_k_from_zones(
                 f"Column '{col}' not found in shapefile. Available: {list(gdf.columns)}"
             )
 
-    ncells_per_layer = mg.ncpl if hasattr(mg, "ncpl") else (mg.nrow * mg.ncol)
+    npf_pkg = gwf.get_package("npf")
+    if npf_pkg is None:
+        raise RuntimeError("NPF package not found. Run add_npf_package first.")
+    dis_pkg = get_dis(gwf)
+    disv_pkg = get_disv(gwf)
+    if dis_pkg is not None:
+        nlay = int(dis_pkg.nlay.data)
+        layer_shape: tuple[int, ...] = (int(dis_pkg.nrow.data), int(dis_pkg.ncol.data))
+    elif disv_pkg is not None:
+        nlay = int(disv_pkg.nlay.data)
+        layer_shape = (int(disv_pkg.ncpl.data),)
+    else:
+        raise RuntimeError("No DIS or DISV package found.")
+    layers = _checked_layers(layer, nlay)
+
+    ncells_per_layer = int(np.prod(layer_shape))
     xc_all, yc_all = grid_centroids(mg)
     xc = xc_all[:ncells_per_layer]
     yc = yc_all[:ncells_per_layer]
@@ -1082,69 +1110,55 @@ def _impl_assign_k_from_zones(
     values = intersect_points_with_polygons(xc, yc, gdf, value_cols, points_crs=model_crs)
 
     k_vals = values[k_field]
-    n_unmatched = int(np.isnan(k_vals).sum())
+    matched = np.isfinite(k_vals)
+    n_unmatched = int((~matched).sum())
+    if not matched.any():
+        raise ValueError(
+            "No cell centroid falls inside any zone polygon; check that the "
+            "shapefile covers the model grid."
+        )
 
-    # Determine which layers to update
-    layers = layer if isinstance(layer, list) else [layer]
+    # Active cells outside every polygon have no value to take. Refuse rather
+    # than write NaN, which crashes MF6's NPF prepcheck with an opaque
+    # floating-invalid error (mf6brabant rerun-2, R4.2).
+    active_unmatched = {
+        lyr: _active_layer_mask(dis_pkg, disv_pkg, lyr, layer_shape).reshape(-1) & ~matched
+        for lyr in layers
+    }
+    n_active_unmatched = sum(int(m.sum()) for m in active_unmatched.values())
+    if n_active_unmatched and unmatched == "error":
+        raise ValueError(
+            f"{n_active_unmatched} active cells in layer(s) {layers} fall outside "
+            "every zone polygon. Pass unmatched='keep' to leave their existing "
+            "values, unmatched='nearest' to copy the nearest zone's values, or "
+            "extend the zone polygons to cover the active model area."
+        )
+    if unmatched == "nearest" and n_unmatched:
+        from scipy.spatial import cKDTree
 
-    dis_pkg = get_dis(gwf)
-    disv_pkg = get_disv(gwf)
-    npf_pkg = gwf.get_package("npf")
+        tree = cKDTree(np.column_stack([xc[matched], yc[matched]]))
+        _, nearest = tree.query(np.column_stack([xc[~matched], yc[~matched]]))
+        for col in value_cols:
+            vals = values[col].astype(float)
+            vals[~matched] = vals[matched][nearest]
+            values[col] = vals
 
-    if npf_pkg is None:
-        raise RuntimeError("NPF package not found. Run add_npf_package first.")
-
-    if dis_pkg is not None:
-        nrow = int(dis_pkg.nrow.data)
-        ncol = int(dis_pkg.ncol.data)
-        nlay = int(dis_pkg.nlay.data)
-        k_array = npf_pkg.k.array.copy()
-        if k33_field:
-            k33_array = (
-                npf_pkg.k33.array.copy() if npf_pkg.k33.array is not None else k_array.copy()
-            )
-        if icelltype_field:
-            ict_array = npf_pkg.icelltype.array.copy()
-
+    def _assign(field, col: str, as_int: bool = False):
+        arr = np.asarray(field.array).copy()
         for lyr in layers:
-            if lyr >= nlay:
-                raise ValueError(
-                    f"Layer {lyr} out of range for model with {nlay} layers."
-                )
-            k_array[lyr] = k_vals.reshape(nrow, ncol)
-            if k33_field:
-                k33_array[lyr] = values[k33_field].reshape(nrow, ncol)
-            if icelltype_field:
-                ict_array[lyr] = values[icelltype_field].reshape(nrow, ncol).astype(int)
+            take = matched | (active_unmatched[lyr] if unmatched == "nearest" else False)
+            current = arr[lyr].reshape(-1)
+            current[take] = values[col][take]
+            arr[lyr] = current.reshape(layer_shape)
+        field.set_data(arr.astype(int) if as_int else arr)
 
-        npf_pkg.k.set_data(k_array)
-        if k33_field:
-            npf_pkg.k33.set_data(k33_array)
-        if icelltype_field:
-            npf_pkg.icelltype.set_data(ict_array)
-
-    elif disv_pkg is not None:
-        nlay = int(disv_pkg.nlay.data)
-        k_array = npf_pkg.k.array.copy()
-
-        for lyr in layers:
-            if lyr >= nlay:
-                raise ValueError(
-                    f"Layer {lyr} out of range for model with {nlay} layers."
-                )
-            k_array[lyr] = k_vals
-            if k33_field:
-                k33_array = (
-                    npf_pkg.k33.array.copy()
-                    if npf_pkg.k33.array is not None
-                    else k_array.copy()
-                )
-                k33_array[lyr] = values[k33_field]
-                npf_pkg.k33.set_data(k33_array)
-
-        npf_pkg.k.set_data(k_array)
-    else:
-        raise RuntimeError("No DIS or DISV package found.")
+    if k33_field and npf_pkg.k33.array is None:
+        npf_pkg.k33.set_data(np.asarray(npf_pkg.k.array).copy())
+    _assign(npf_pkg.k, k_field)
+    if k33_field:
+        _assign(npf_pkg.k33, k33_field)
+    if icelltype_field:
+        _assign(npf_pkg.icelltype, icelltype_field, as_int=True)
 
     written = save_sim(model, gwf.simulation)
     clear_k_base_snapshot(model, gwf.name)
@@ -1156,6 +1170,8 @@ def _impl_assign_k_from_zones(
         "zone_count": len(gdf),
         "cells_matched": int(ncells_per_layer - n_unmatched),
         "cells_unmatched": n_unmatched,
+        "unmatched": unmatched,
+        "active_cells_unmatched": n_active_unmatched,
         "k_range": {"min": float(np.nanmin(k_vals)), "max": float(np.nanmax(k_vals))},
         "written": written,
     }
@@ -1401,6 +1417,157 @@ def _impl_assign_ic_from_raster(
     return result
 
 
+def _impl_import_boundary_from_shapefile(
+    model: str,
+    shapefile: str,
+    package: str,
+    value_field: str | None = None,
+    value: float | None = None,
+    layer: int = 0,
+    stress_period: int = 0,
+    pname: str | None = None,
+) -> dict:
+    """Add a CHD or WEL package from a shapefile.
+
+    CHD takes lines or polygons (every cell they touch gets the head: a stage
+    attribute or one constant); WEL takes points (the nearest cell, with wells
+    sharing a cell summed). The value is the head (CHD) or the pumping rate
+    (WEL, negative = extraction, in the model's length^3/time units).
+    """
+    import geopandas as gpd
+
+    from groundwater_mcp.tools.builder import _impl_add_boundary_package
+    from groundwater_mcp.utils.spatial import CRSError, intersect_lines_with_dis_grid
+
+    pkg_name = package.upper()
+    if pkg_name not in ("CHD", "WEL"):
+        raise ValueError(
+            f"import_boundary_from_shapefile supports CHD or WEL, got '{package}'. "
+            "River/drain/GHB lines use import_river_from_shapefile."
+        )
+    if (value_field is None) == (value is None):
+        raise ValueError("Give exactly one of value_field (attribute) or value (constant).")
+    constant = float(value) if value is not None else 0.0
+
+    gwf = get_gwf(model)
+    mg = gwf.modelgrid
+    dis_pkg = get_dis(gwf)
+    if dis_pkg is None:
+        raise RuntimeError("import_boundary_from_shapefile currently supports DIS grids only.")
+    nlay = int(dis_pkg.nlay.data)
+    if not (0 <= layer < nlay):
+        raise ValueError(f"layer {layer} out of range for model with {nlay} layers.")
+
+    gdf = gpd.read_file(shapefile)
+    if value_field is not None and value_field not in gdf.columns:
+        raise ValueError(
+            f"Column '{value_field}' not found in the shapefile. "
+            f"Available: {list(gdf.columns)}"
+        )
+    if gdf.empty:
+        raise ValueError("The shapefile has no features.")
+    if mg.crs is None and gdf.crs is not None:
+        raise CRSError(
+            "The model grid has no CRS but the shapefile declares "
+            f"'{gdf.crs}'. Set a CRS on the model grid first so coordinates are "
+            "compared in a known space."
+        )
+    if gdf.crs is not None and mg.crs is not None and not gdf.crs.equals(mg.crs):
+        gdf = gdf.to_crs(mg.crs)
+
+    geom_types = set(gdf.geom_type)
+    is_point = geom_types <= {"Point", "MultiPoint"}
+    if pkg_name == "WEL" and not is_point:
+        raise ValueError(
+            "WEL needs point features (one rate per well); got "
+            f"{sorted(geom_types)}. Use CHD for lines and polygons."
+        )
+
+    cell_values: dict[tuple[int, int], list[float]] = {}
+    if is_point:
+        from groundwater_mcp.utils.spatial import grid_centroids
+
+        xc_all, yc_all = grid_centroids(mg)
+        per_layer = int(mg.nrow) * int(mg.ncol)
+        xc, yc = xc_all[:per_layer], yc_all[:per_layer]
+        snap_tol = _site_snap_tolerance(mg, xc, yc)
+        ncol = int(mg.ncol)
+        outside = []
+        for geom, row in zip(gdf.geometry, gdf.itertuples(index=False)):
+            val = float(getattr(row, value_field)) if value_field else constant
+            for pt in getattr(geom, "geoms", [geom]):
+                dist = np.hypot(xc - pt.x, yc - pt.y)
+                nearest = int(np.argmin(dist))
+                if float(dist[nearest]) > snap_tol:
+                    outside.append((pt.x, pt.y))
+                    continue
+                cell_values.setdefault((nearest // ncol, nearest % ncol), []).append(val)
+        if outside:
+            raise ValueError(
+                f"{len(outside)} point(s) lie outside the model grid (e.g. "
+                f"{outside[0]}); check the shapefile's coordinate system."
+            )
+    else:
+        attr = [value_field] if value_field else []
+        reaches = intersect_lines_with_dis_grid(shapefile, mg, attr)
+        if not reaches:
+            raise ValueError("No features intersect the model grid; check the CRS and extent.")
+        for hit in reaches:
+            val = float(hit[value_field]) if value_field else constant
+            _, r, c = hit["cellid"]
+            cell_values.setdefault((r, c), []).append(val)
+
+    # One record per cell: wells sharing a cell add up, constant heads average.
+    merged = {
+        cell: (float(np.sum(v)) if pkg_name == "WEL" else float(np.mean(v)))
+        for cell, v in cell_values.items()
+    }
+    idomain = getattr(dis_pkg, "idomain", None)
+    active = (
+        np.asarray(idomain.array)[layer] > 0
+        if idomain is not None and idomain.array is not None
+        else None
+    )
+    skipped = 0
+    records: list[list] = []
+    kept_values: list[float] = []
+    for (r, c), v in sorted(merged.items()):
+        if active is not None and not active[r, c]:
+            skipped += 1
+            continue
+        records.append([[layer, r, c], v])
+        kept_values.append(v)
+    if not records:
+        raise ValueError("Every intersected cell is inactive; nothing to add.")
+
+    out = _impl_add_boundary_package(
+        model, pkg_name, {stress_period: records}, None, pname=pname
+    )
+    _record_provenance(
+        model, pkg_name, shapefile, "import_boundary_from_shapefile",
+        value_field=value_field,
+    )
+    result: dict = {
+        "model": model,
+        "package": pkg_name,
+        "n_features": int(len(gdf)),
+        "n_cells": len(records),
+        "cells_inactive_skipped": skipped,
+        "layer": layer,
+        "stress_period": stress_period,
+        "value_range": {"min": min(kept_values), "max": max(kept_values)},
+        "written": out.get("written"),
+    }
+    warnings = []
+    if skipped:
+        warnings.append(f"{skipped} cell(s) were inactive and skipped.")
+    if out.get("warning"):
+        warnings.append(out["warning"])
+    if warnings:
+        result["warning"] = " ".join(warnings)
+    return result
+
+
 def _impl_import_river_from_shapefile(
     model: str,
     shapefile: str,
@@ -1562,6 +1729,26 @@ def _impl_import_river_from_shapefile(
     return result
 
 
+def _site_snap_tolerance(mg, xc, yc) -> float:
+    """Distance beyond which a site is not 'in or at the edge of' the grid.
+
+    One full cell diagonal for a regular grid; for vertex/unstructured grids
+    twice the median spacing of neighbouring cell centres.
+    """
+    try:
+        delr = np.asarray(mg.delr, dtype=float)
+        delc = np.asarray(mg.delc, dtype=float)
+        return float(np.hypot(delr.max(), delc.max()))
+    except Exception:  # noqa: BLE001 - vertex grid: no delr/delc
+        from scipy.spatial import cKDTree
+
+        pts = np.column_stack([xc, yc])
+        if len(pts) < 2:
+            return float("inf")
+        d, _ = cKDTree(pts).query(pts, k=2)
+        return float(2.0 * np.median(d[:, 1]))
+
+
 def _impl_import_obs_from_csv(
     model: str,
     csv_file: str,
@@ -1573,8 +1760,17 @@ def _impl_import_obs_from_csv(
     y_col: str | None,
     layer: int,
     cellid_col: str | None = None,
+    allow_sequential: bool = False,
+    append: bool = False,
+    allow_outside: bool = False,
 ) -> dict:
-    """Read head/flow observations from CSV and write a MODFLOW 6 OBS file."""
+    """Read head/flow observations from CSV and write a MODFLOW 6 OBS file.
+
+    By default the model's observation set is replaced. With ``append=True``
+    the sites of this call are added to the sites already registered (same
+    ``obs_type``, no repeated site names), so a multi-layer observation set
+    can be registered one layer per call.
+    """
     from pathlib import Path
 
     import flopy.mf6 as mf6
@@ -1608,10 +1804,33 @@ def _impl_import_obs_from_csv(
                 f"Column '{col}' not found in CSV. Available: {list(df.columns)}"
             )
 
+    # A site-mapping column that was asked for but is absent must not fall
+    # through to a different mapping mode — that registers every site on the
+    # wrong cell without an error (R4.2).
+    for mapping_col in [cellid_col, x_col, y_col]:
+        if mapping_col and mapping_col not in df.columns:
+            raise ValueError(
+                f"Column '{mapping_col}' not found in CSV. Available: {list(df.columns)}"
+            )
+    if not cellid_col and bool(x_col) != bool(y_col):
+        raise ValueError(
+            "x_col and y_col must be given together to map sites by coordinate."
+        )
+    if not cellid_col and not x_col and not allow_sequential:
+        raise ValueError(
+            "No site-to-cell mapping given: pass x_col and y_col (site "
+            "coordinates) or cellid_col (explicit cell ids). To register "
+            "placeholder observations on consecutive cells in row order "
+            "instead — not the sites' real locations — pass "
+            "allow_sequential=True."
+        )
+
     sites = df[site_col].unique()
     site_to_cellid: dict[str, tuple[int, ...] | int] = {}
+    outside_sites: set[str] = set()
 
-    if cellid_col and cellid_col in df.columns:
+    if cellid_col:
+        site_mapping = "cellid"
         # Explicit cell ids (e.g. a gauge→cell map). Needed when coordinates are
         # ambiguous — DISU/DISV layers stack in x/y, so nearest-centroid cannot
         # distinguish them.
@@ -1638,7 +1857,8 @@ def _impl_import_obs_from_csv(
                         f"Could not parse cell id {raw!r} for site {site!r}."
                     )
                 site_to_cellid[site] = tuple(parts) if len(parts) > 1 else parts[0]
-    elif x_col and y_col and x_col in df.columns and y_col in df.columns:
+    elif x_col and y_col:
+        site_mapping = "coordinates"
         # Map each site to a cell by its mean (x, y) coordinate
         site_coords = df.groupby(site_col)[[x_col, y_col]].mean()
 
@@ -1661,6 +1881,26 @@ def _impl_import_obs_from_csv(
             xc = xc_all[:ncells_per_layer]
             yc = yc_all[:ncells_per_layer]
 
+        # A site more than ~a cell beyond the grid is almost always a CRS or
+        # unit mistake; snapping it to the nearest edge cell would register
+        # the observation on the wrong cell without any error (R4.2).
+        reach = _site_snap_tolerance(mg, xc, yc)
+        outside = []
+        for site, sx, sy in zip(site_coords.index, xcoords, ycoords):
+            d = float(np.min(np.hypot(xc - sx, yc - sy)))
+            if d > reach:
+                outside.append((site, d))
+        if outside and not allow_outside:
+            shown = ", ".join(f"{s} ({d:,.0f} m)" for s, d in outside[:5])
+            raise ValueError(
+                f"{len(outside)} site(s) lie outside the model grid: {shown}"
+                f"{' ...' if len(outside) > 5 else ''} — farther than {reach:,.0f} m "
+                "from the nearest cell centre. Check that x_col/y_col are in the "
+                "grid's coordinate system and units, or pass allow_outside=True "
+                "to snap them to the nearest cell."
+            )
+        outside_sites = {str(s) for s, _ in outside}
+
         for site, sx, sy in zip(site_coords.index, xcoords, ycoords):
             dist = np.hypot(xc - sx, yc - sy)
             nearest = int(np.argmin(dist))
@@ -1677,6 +1917,7 @@ def _impl_import_obs_from_csv(
             else:
                 site_to_cellid[site] = (layer, nearest)
     else:
+        site_mapping = "sequential"
         # No coordinates — create placeholder observations keyed by site name,
         # sequentially through the cell ids. DIS cell ids are
         # (layer, row, col); DISV cell ids are (layer, node) — a 3-tuple is
@@ -1705,6 +1946,32 @@ def _impl_import_obs_from_csv(
     records = []
     used_obs_names: set[str] = set()
     site_obs_name: dict[str, str] = {}
+    previous_entries: list[dict] = []
+    if append:
+        previous = read_meta(model).get("observations") or {}
+        if previous.get("sites"):
+            if str(previous.get("type", "")).upper() != obs_type_str:
+                raise ValueError(
+                    f"append=True requires the same obs_type as the registered "
+                    f"observations ({previous.get('type')}), got {obs_type_str}."
+                )
+            previous_entries = list(previous["sites"])
+            registered = {
+                str(e.get("original_site", e["site"])) for e in previous_entries
+            }
+            repeated = sorted(registered & {str(s) for s in sites})
+            if repeated:
+                raise ValueError(
+                    f"Site(s) {repeated[:5]} are already registered; append=True "
+                    "adds new sites. Rename them or import without append to "
+                    "replace the observation set."
+                )
+            for entry in previous_entries:
+                cid = entry["cellid"]
+                records.append(
+                    (entry["site"], obs_type_str, cid if isinstance(cid, int) else tuple(cid))
+                )
+                used_obs_names.add(str(entry["site"]).lower())
     for site in sites:
         cid = site_to_cellid[site]
         obsname = _safe_obs_name(str(site), used_obs_names)
@@ -1774,7 +2041,7 @@ def _impl_import_obs_from_csv(
         "layer": int(layer),
         "obs_file": f"{gwf.name}.obs",
         "output_csv": obs_filename,
-        "sites": site_entries,
+        "sites": previous_entries + site_entries,
     }
     meta.setdefault("provenance", {})["observations"] = {
         "source": csv_file,
@@ -1783,17 +2050,35 @@ def _impl_import_obs_from_csv(
     }
     write_meta(model, meta)
 
-    return {
+    result = {
         "model": model,
         "obs_type": obs_type_str,
-        "site_count": len(sites),
+        "site_count": len(previous_entries) + len(sites),
         "total_records": len(df),
         "obs_file": str(obs_file),
         "summary_file": str(summary_path),
+        "site_mapping": site_mapping,
         "site_cellid_map": {s: _cellid_as_json(cid) for s, cid in site_to_cellid.items()},
         "obs_names": dict(site_obs_name),
         "written": written,
     }
+    if append:
+        result["appended_to"] = len(previous_entries)
+        result["sites_added"] = len(sites)
+    if site_mapping == "coordinates" and outside_sites:
+        extra = (
+            f"{len(outside_sites)} site(s) lie outside the model grid and were "
+            f"snapped to their nearest cell (allow_outside=True): "
+            f"{sorted(outside_sites)[:5]}."
+        )
+        result["warning"] = extra
+    if site_mapping == "sequential":
+        result["warning"] = (
+            "Sites were registered as placeholder observations on consecutive "
+            "cells in row order, not at their real locations; simulated values "
+            "and residuals for these sites are not meaningful as a fit."
+        )
+    return result
 
 
 def _impl_import_subsidence_observations(
@@ -2096,16 +2381,22 @@ def register(mcp) -> None:
         layer: int | list[int] = 0,
         k33_field: str | None = None,
         icelltype_field: str | None = None,
+        unmatched: str = "error",
     ) -> dict:
         """Assign hydraulic conductivity arrays from geological zone polygons.
 
-        Cell centroids are spatially joined to zone polygons. Cells outside all
-        zones retain their existing K value and are reported as unmatched.
+        Cell centroids are spatially joined to zone polygons. Active cells
+        outside every polygon are an error by default (unmatched="error");
+        unmatched="keep" leaves their existing K/K33/ICELLTYPE, and
+        unmatched="nearest" copies the values of the nearest matched cell.
+        Inactive cells outside every polygon always keep their existing values.
+        The result reports cells_unmatched and active_cells_unmatched.
         Requires NPF package to already exist (run add_npf_package first).
         """
         try:
             return _impl_assign_k_from_zones(
-                model, shapefile, k_field, layer, k33_field, icelltype_field
+                model, shapefile, k_field, layer, k33_field, icelltype_field,
+                unmatched,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -2295,6 +2586,50 @@ def register(mcp) -> None:
             return _err("ARRAY_ASSIGN_FAILED", str(exc))
 
     @mcp.tool()
+    def import_boundary_from_shapefile(
+        model: str,
+        shapefile: str,
+        package: str,
+        value_field: str | None = None,
+        value: float | None = None,
+        layer: int = 0,
+        stress_period: int = 0,
+        pname: str | None = None,
+    ) -> dict:
+        """Add a constant-head (CHD) or well (WEL) boundary from a shapefile.
+
+        CHD: line or polygon features; every cell they touch gets the head,
+        taken from ``value_field`` or the constant ``value`` (cells hit by
+        several features get the mean). WEL: point features, each assigned to
+        its nearest cell, with wells sharing a cell summed; ``value`` /
+        ``value_field`` is the pumping rate (negative = extraction, model
+        length^3/time units). Give exactly one of value_field and value.
+        Features are reprojected into the grid's CRS; points more than about a
+        cell outside the grid are an error rather than being snapped. Cells
+        that are inactive are skipped and counted. DIS grids only. Rivers,
+        drains and GHB use import_river_from_shapefile."""
+        try:
+            return _impl_import_boundary_from_shapefile(
+                model, shapefile, package, value_field, value, layer,
+                stress_period, pname,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except CRSError as exc:
+            return _err(
+                "CRS_UNKNOWN", str(exc),
+                "Set a CRS on the model grid or reproject the shapefile.",
+            )
+        except RuntimeError as exc:
+            return _err("PACKAGE_MISSING", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("BOUNDARY_IMPORT_FAILED", str(exc))
+
+    @mcp.tool()
     def import_river_from_shapefile(
         model: str,
         shapefile: str,
@@ -2312,7 +2647,11 @@ def register(mcp) -> None:
     ) -> dict:
         """Build RIV, DRN, or GHB stress period data from a river/drain shapefile.
 
-        Intersects the river network with the model grid. Stage, conductance,
+        Intersects the river network with the model grid. By default the reaches
+        are written for stress period 0 only; MODFLOW 6 reuses a list package's
+        data for every later period that has no block of its own, so they stay
+        active for the whole run. Pass stress_periods=[0, 5, ...] only to
+        re-state the reaches at specific periods. Stage, conductance,
         and depth values are read from the shapefile attributes if provided,
         otherwise defaults are used (stage=0, depth=1 m). Currently supports
         DIS grids only.
@@ -2380,12 +2719,27 @@ def register(mcp) -> None:
         y_col: str | None = None,
         layer: int = 0,
         cellid_col: str | None = None,
+        allow_sequential: bool = False,
+        append: bool = False,
+        allow_outside: bool = False,
     ) -> dict:
         """Import head or flow observations from a CSV file.
 
+        In coordinate mode a site farther than about one cell beyond the grid
+        fails with INVALID_INPUT (usually a CRS or unit mistake) unless
+        ``allow_outside=True``, which snaps it to the nearest cell and warns.
+
+        Each call replaces the model's observation set unless ``append=True``,
+        which adds this call's sites to those already registered (same
+        obs_type, site names not already used) — register a multi-layer
+        observation set one layer per call.
+
         Sites are mapped to model cells by an explicit ``cellid_col`` cell-id
-        column if provided, otherwise by (x, y) coordinate (nearest centroid) if
-        x_col and y_col are provided, otherwise by sequential order. The
+        column if provided, otherwise by (x, y) coordinate (nearest centroid)
+        from x_col and y_col. One of the two is required: with neither, the call
+        fails with INVALID_INPUT unless ``allow_sequential=True``, which
+        registers placeholder observations on consecutive cells in row order
+        (not the sites' real locations) and says so in ``warning``. The
         explicit column is required when coordinates are ambiguous (DISU/DISV
         layers stack in x/y): on DISU it holds a 0-based node id. Coordinate
         mode also works on grids that carry cell geometry. Works on structured
@@ -2396,7 +2750,7 @@ def register(mcp) -> None:
         try:
             return _impl_import_obs_from_csv(
                 model, csv_file, obs_type, site_col, date_col, value_col, x_col,
-                y_col, layer, cellid_col,
+                y_col, layer, cellid_col, allow_sequential, append, allow_outside,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

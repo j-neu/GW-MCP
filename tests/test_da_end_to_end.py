@@ -383,7 +383,14 @@ def test_mcp_only_sequential_da_run_disu(tmp_path):
         "setup_da_control",
         {
             "model": _MODEL_DISU,
-            "parameterisation": {"k": {"target": "npf:k", "scope": "all", "initial": 10.0}},
+            "parameterisation": {
+                "k": {
+                    "target": "npf:k",
+                    "scope": "all",
+                    "initial": 10.0,
+                    "allow_flatten": True,
+                }
+            },
             "cycles": [0, 1],
             "obs_cycles": {"D1": {0: 0.6, 1: 0.7}, "D2": {0: 0.4, 1: 0.5}},
             "num_reals": 5,
