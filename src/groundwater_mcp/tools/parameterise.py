@@ -1837,6 +1837,86 @@ def _site_snap_tolerance(mg, xc, yc) -> float:
         return float(2.0 * np.median(d[:, 1]))
 
 
+def _site_screens(
+    df, site_col: str, top_col: str | None, bot_col: str | None
+) -> dict | None:
+    """Each site's (screen top, screen bottom) elevation, or None when no
+    screen columns are given (R3.12)."""
+    import pandas as pd
+
+    if not top_col and not bot_col:
+        return None
+    if not (top_col and bot_col):
+        raise ValueError("screen_top_col and screen_bot_col must be given together.")
+    for col in (top_col, bot_col):
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found in CSV. Available: {list(df.columns)}")
+    screens: dict = {}
+    bad: list[str] = []
+    for site, grp in df.groupby(site_col, sort=False):
+        top = pd.to_numeric(grp[top_col], errors="coerce")
+        bot = pd.to_numeric(grp[bot_col], errors="coerce")
+        if top.isna().any() or bot.isna().any():
+            bad.append(f"{site} (missing or non-numeric)")
+            continue
+        if top.nunique() > 1 or bot.nunique() > 1:
+            bad.append(f"{site} (more than one screen)")
+            continue
+        t, b = float(top.iloc[0]), float(bot.iloc[0])
+        if not t > b:
+            bad.append(f"{site} (top {t:g} not above bottom {b:g})")
+            continue
+        screens[site] = (t, b)
+    if bad:
+        raise ValueError(f"Invalid screen interval for site(s): {bad[:5]}.")
+    return screens
+
+
+def _screen_layers(gwf, nearest_by_site: dict, screens: dict) -> tuple[dict, dict]:
+    """Layer and per-layer transmissivity shares of each site's screen.
+
+    A layer's share is K x (screened thickness in that layer) over the sum
+    for the whole screen, counting active cells only; the site goes to the
+    layer with the largest share.
+    """
+    mg = gwf.modelgrid
+    nlay = int(mg.nlay)
+    top_botm = np.asarray(mg.top_botm, dtype=float).reshape(nlay + 1, -1)
+    try:
+        k = np.asarray(gwf.npf.k.array, dtype=float).reshape(nlay, -1)
+    except Exception:  # noqa: BLE001 - no NPF yet: thickness alone
+        k = np.ones((nlay, top_botm.shape[1]))
+    idomain = getattr(mg, "idomain", None)
+    active = (
+        np.ones((nlay, top_botm.shape[1]), dtype=bool)
+        if idomain is None
+        else np.asarray(idomain).reshape(nlay, -1) > 0
+    )
+    layers: dict = {}
+    shares: dict = {}
+    bad: list[str] = []
+    for site, node in nearest_by_site.items():
+        s_top, s_bot = screens[site]
+        trans = {}
+        for lyr in range(nlay):
+            overlap = min(s_top, top_botm[lyr, node]) - max(s_bot, top_botm[lyr + 1, node])
+            if overlap > 0 and active[lyr, node]:
+                trans[lyr] = overlap * max(float(k[lyr, node]), 0.0)
+        total = sum(trans.values())
+        if not trans or total <= 0:
+            bad.append(str(site))
+            continue
+        shares[site] = {lyr: t / total for lyr, t in trans.items() if t > 0}
+        layers[site] = max(trans, key=lambda lyr: trans[lyr])
+    if bad:
+        raise ValueError(
+            f"Screen of site(s) {bad[:5]} lies in no active model layer (above the "
+            "model top, below the bottom, or only in inactive cells). Check the "
+            "screen elevations are in the model's datum and units."
+        )
+    return layers, shares
+
+
 def _impl_import_obs_from_csv(
     model: str,
     csv_file: str,
@@ -1853,6 +1933,8 @@ def _impl_import_obs_from_csv(
     allow_outside: bool = False,
     std_col: str | None = None,
     std: float | None = None,
+    screen_top_col: str | None = None,
+    screen_bot_col: str | None = None,
 ) -> dict:
     """Read head/flow observations from CSV and write a MODFLOW 6 OBS file.
 
@@ -1860,6 +1942,11 @@ def _impl_import_obs_from_csv(
     the sites of this call are added to the sites already registered (same
     ``obs_type``, no repeated site names), so a multi-layer observation set
     can be registered one layer per call.
+
+    ``screen_top_col`` / ``screen_bot_col`` (R3.12) give each site's screen
+    top and bottom elevation; the site then goes to the layer its screen draws
+    the most transmissivity from (K x screened thickness, active cells only)
+    instead of ``layer``. Needs coordinate mapping on a DIS or DISV grid.
 
     ``std_col`` (a per-record column) and ``std`` (one value, also filling
     empty cells of ``std_col``) give each record's measurement standard
@@ -1911,6 +1998,19 @@ def _impl_import_obs_from_csv(
         raise ValueError(
             "x_col and y_col must be given together to map sites by coordinate."
         )
+    site_screens = _site_screens(df, site_col, screen_top_col, screen_bot_col)
+    if site_screens is not None:
+        if cellid_col or not x_col:
+            raise ValueError(
+                "screen_top_col/screen_bot_col assign the layer of a site mapped by "
+                "coordinates: pass x_col and y_col (not cellid_col or sequential "
+                "placement)."
+            )
+        if get_disu(gwf) is not None:
+            raise ValueError(
+                "Screen-interval layer assignment needs a layered grid (DIS or "
+                "DISV); on DISU give each site's node with cellid_col."
+            )
     if not cellid_col and not x_col and not allow_sequential:
         raise ValueError(
             "No site-to-cell mapping given: pass x_col and y_col (site "
@@ -2011,9 +2111,15 @@ def _impl_import_obs_from_csv(
             )
         outside_sites = {str(s) for s, _ in outside}
 
-        for site, sx, sy in zip(site_coords.index, xcoords, ycoords):
-            dist = np.hypot(xc - sx, yc - sy)
-            nearest = int(np.argmin(dist))
+        nearest_by_site = {
+            site: int(np.argmin(np.hypot(xc - sx, yc - sy)))
+            for site, sx, sy in zip(site_coords.index, xcoords, ycoords)
+        }
+        if site_screens is not None:
+            site_mapping = "coordinates+screen"
+            site_layer, screen_shares = _screen_layers(gwf, nearest_by_site, site_screens)
+        for site, nearest in nearest_by_site.items():
+            lyr = site_layer[site] if site_screens is not None else layer
             if disu_pkg is not None:
                 # 1-based DISU node number (FloPy does not add 1 for a scalar
                 # DISU OBS cellid).
@@ -2022,10 +2128,10 @@ def _impl_import_obs_from_csv(
                 ncol = int(dis_pkg.ncol.data)
                 row_idx = nearest // ncol
                 col_idx = nearest % ncol
-                cellid: tuple[int, ...] = (layer, row_idx, col_idx)
+                cellid: tuple[int, ...] = (lyr, row_idx, col_idx)
                 site_to_cellid[site] = cellid
             else:
-                site_to_cellid[site] = (layer, nearest)
+                site_to_cellid[site] = (lyr, nearest)
     else:
         site_mapping = "sequential"
         # No coordinates — create placeholder observations keyed by site name,
@@ -2164,6 +2270,9 @@ def _impl_import_obs_from_csv(
         }
         if record_std is not None:
             entry["stds"] = [float(v) for v in record_std[site_df.index].tolist()]
+        if site_screens is not None:
+            entry["screen"] = list(site_screens[site])
+            entry["layer"] = int(site_to_cellid[site][0])  # type: ignore[index]
         if obsname != str(site):
             entry["original_site"] = str(site)
         site_entries.append(entry)
@@ -2176,7 +2285,7 @@ def _impl_import_obs_from_csv(
     meta = read_meta(model)
     meta["observations"] = {
         "type": obs_type_str,
-        "layer": int(layer),
+        "layer": "screen" if site_screens is not None else int(layer),
         "obs_file": f"{gwf.name}.obs",
         "output_csv": obs_filename,
         "sites": previous_entries + site_entries,
@@ -2205,13 +2314,28 @@ def _impl_import_obs_from_csv(
     if append:
         result["appended_to"] = len(previous_entries)
         result["sites_added"] = len(sites)
-    if site_mapping == "coordinates" and outside_sites:
+    if site_mapping.startswith("coordinates") and outside_sites:
         extra = (
             f"{len(outside_sites)} site(s) lie outside the model grid and were "
             f"snapped to their nearest cell (allow_outside=True): "
             f"{sorted(outside_sites)[:5]}."
         )
         result["warning"] = extra
+    if site_screens is not None:
+        multi = {
+            str(s): {str(lyr): share for lyr, share in shares.items()}
+            for s, shares in screen_shares.items()
+            if len(shares) > 1
+        }
+        if multi:
+            result["multi_layer_screens"] = multi
+            result["screen_warning"] = (
+                f"{len(multi)} screen(s) span several layers: {sorted(multi)[:5]}. "
+                "Each is observed in the layer with the largest transmissivity share "
+                "(multi_layer_screens); the measured head is a mix of the layers, so "
+                "the difference is part of the structural error. Split the site or "
+                "give it a larger measurement std if the layer heads differ much."
+            )
     if site_mapping == "sequential":
         result["warning"] = (
             "Sites were registered as placeholder observations on consecutive "
@@ -3126,6 +3250,8 @@ def register(mcp) -> None:
         allow_outside: bool = False,
         std_col: str | None = None,
         std: float | None = None,
+        screen_top_col: str | None = None,
+        screen_bot_col: str | None = None,
     ) -> dict:
         """Import head or flow observations from a CSV file.
 
@@ -3142,6 +3268,15 @@ def register(mcp) -> None:
         which adds this call's sites to those already registered (same
         obs_type, site names not already used) — register a multi-layer
         observation set one layer per call.
+
+        Well screens: ``screen_top_col`` and ``screen_bot_col`` name columns
+        with each site's screen top and bottom ELEVATION (model datum and
+        units, one screen per site). Each site then goes to the layer its
+        screen draws the most transmissivity from (K x screened thickness in
+        active cells) and ``layer`` is ignored. Needs x_col/y_col on a DIS or
+        DISV grid. A screen spanning several layers is listed in
+        ``multi_layer_screens`` with each layer's share and a
+        ``screen_warning``; a screen in no active layer is INVALID_INPUT.
 
         Sites are mapped to model cells by an explicit ``cellid_col`` cell-id
         column if provided, otherwise by (x, y) coordinate (nearest centroid)
@@ -3168,7 +3303,7 @@ def register(mcp) -> None:
             return _impl_import_obs_from_csv(
                 model, csv_file, obs_type, site_col, date_col, value_col, x_col,
                 y_col, layer, cellid_col, allow_sequential, append, allow_outside,
-                std_col, std,
+                std_col, std, screen_top_col, screen_bot_col,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

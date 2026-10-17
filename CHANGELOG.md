@@ -54,6 +54,12 @@ release.
   same series. A synthetic pumping test recovers K and Ss with pestpp-glm
   (7.996 / 1.017e-3 against 8 / 1e-3). Previously every site was collapsed
   to the mean of its records and compared with the first time step.
+- **Well-screen layer assignment:** `import_obs_from_csv` takes
+  `screen_top_col`/`screen_bot_col` (screen elevations) and puts each site in
+  the layer its screen draws the most transmissivity from (K x screened
+  thickness, active cells only), instead of one `layer` for the whole call.
+  Screens spanning several layers are reported with each layer's share
+  (`multi_layer_screens`); a screen in no active layer is refused.
 - **Flow observations:** `import_flow_observations` registers baseflow,
   river/drain exchange, spring, boundary or well flows on a RIV/DRN/GHB/CHD/WEL
   package (whole package or chosen cells, via MF6 boundnames and package

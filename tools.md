@@ -64,7 +64,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 **No-data fill is explicit (7e-B11.3):** `fill` controls cells without raster coverage. Default `"error"` fails when more than `coverage_tolerance` (default 0.1) of cells are uncovered and otherwise median-fills with a `warning` field; `"median"` always median-fills; `"nearest"` fills from the nearest covered cell. `cells_no_coverage` is always reported.
 
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
-| `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False`, `std_col: str \| None = None`, `std: float \| None = None` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`sequential`) |
+| `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False`, `std_col: str \| None = None`, `std: float \| None = None`, `screen_top_col: str \| None = None`, `screen_bot_col: str \| None = None` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`coordinates+screen`/`sequential`), `multi_layer_screens` + `screen_warning` when a screen spans layers |
 | `import_flow_observations` | `model: str`, `csv_file: str`, `package: str` (RIV/DRN/GHB/CHD/WEL), `site_col`, `date_col`, `value_col`, `std_col: str \| None`, `std: float \| None`, `rel_std: float \| None`, `targets: dict \| None`, `pname: str \| None`, `direction: str = "out_of_aquifer"`, `append: bool = False` | `site_count`, `total_records`, `direction`, `output_csv`, `targets` (per site: `obs_name`, `n_cells`) |
 | `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"`, `match: str = "nearest"`, `tolerance_days: float \| None`, `date_map: dict \| None` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`), `match`/`tolerance_days`/`date_map` |
 
@@ -609,6 +609,22 @@ cell's head as −1e30. `compare_to_observed` and `run_simulation.observation_fi
 leave such sites out of the statistics and list them in `dry_sites` (with a
 `warning`); if every site is dry the result is `OBSERVATION_CELLS_DRY`.
 `import_obs_from_csv` refuses a site on an inactive cell (idomain ≤ 0).
+
+**Screen-interval layer assignment (R3.12, 2026-10-17):** with
+`screen_top_col` and `screen_bot_col` (screen top and bottom elevation, one
+screen per site) each site is placed in the layer its screen draws the most
+transmissivity from: K x the screened thickness in that layer, at the site's
+cell, counting active cells only. `layer` is then ignored, so one call
+registers a multi-layer well set. Needs coordinate mapping on DIS or DISV.
+A screen spanning several layers is listed in `multi_layer_screens`
+(`{site: {layer: share}}`) with a `screen_warning`: MF6 reports one cell's
+head, while the well measures a mix, and the difference is structural
+error. Screens above the top, below the bottom, inverted, missing or only
+in inactive cells are `INVALID_INPUT`. The registered site entry stores
+`screen` and `layer`. Not covered: a transmissivity-weighted multi-layer
+head (fixed weights, as MODFLOW-2005 HOB), and clipping the screen to the
+saturated thickness of a convertible layer (the geometric layer thickness
+is used).
 
 **Dry cells during a calibration run (R3.11, 2026-10-17):** without Newton,
 MF6 writes -1e30 for a dry cell's head, and PEST++ read it straight from the
