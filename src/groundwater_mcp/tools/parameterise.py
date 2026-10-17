@@ -1976,6 +1976,32 @@ def _impl_import_obs_from_csv(
             else:
                 site_to_cellid[site] = (layer, i)
 
+    # A site on an inactive cell has no simulated head: MF6 stops on the OBS
+    # file only at run time, so refuse it here, naming the sites.
+    idomain = getattr(mg, "idomain", None)
+    if idomain is not None:
+        flat_idomain = np.asarray(idomain).reshape(-1)
+        cells_per_layer = flat_idomain.size // max(int(getattr(mg, "nlay", 1) or 1), 1)
+        inactive = []
+        for site, cid in site_to_cellid.items():
+            if isinstance(cid, tuple) and len(cid) == 3:
+                ncol = int(get_dis(gwf).ncol.data)
+                flat = cid[0] * cells_per_layer + cid[1] * ncol + cid[2]
+            elif isinstance(cid, tuple) and len(cid) == 2:
+                flat = cid[0] * cells_per_layer + cid[1]
+            elif isinstance(cid, tuple):
+                flat = int(cid[0]) - 1  # 1-based DISU node
+            else:
+                flat = int(cid) - 1  # 1-based DISU node
+            if 0 <= flat < flat_idomain.size and flat_idomain[flat] <= 0:
+                inactive.append(str(site))
+        if inactive:
+            raise ValueError(
+                f"{len(inactive)} observation site(s) fall on inactive cells "
+                f"(idomain <= 0): {inactive[:10]}. Check the site coordinates / "
+                "cell ids and the layer, or drop these sites."
+            )
+
     # Write MODFLOW 6 OBS file
     obs_file = ws / f"{gwf.name}.obs"
 

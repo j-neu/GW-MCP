@@ -603,6 +603,21 @@ observation names in the continuous obs CSV (`W1..W29`), while
 site names against the obs-CSV columns case-insensitively (exact match
 preferred), so a lowercase-imported CSV works without re-importing.
 
+**Dry and inactive observation cells (R3.8, 2026-10-17):** MF6 reports a dry
+cell's head as −1e30. `compare_to_observed` and `run_simulation.observation_fit`
+leave such sites out of the statistics and list them in `dry_sites` (with a
+`warning`); if every site is dry the result is `OBSERVATION_CELLS_DRY`.
+`import_obs_from_csv` refuses a site on an inactive cell (idomain ≤ 0).
+
+**Calibration setup checks (R3.8):** `setup_calibration` returns
+`solver_warning` when the IMS head closure is looser than 1e-4 (the MF6
+presets close to 1e-3 / 0.01 / 0.1 m for SIMPLE / MODERATE / COMPLEX, which
+is coarser than the head change a 1 % derivative perturbation produces), and
+`identifiability_warning` when K and recharge are both estimated from
+steady-state heads (only their ratio is constrained). Default bounds of the
+fraction targets are capped (`sto:sy` 0.5, porosity 0.7) and reported in
+`bounds_capped`.
+
 **Transient head time series (R3.7, 2026-10-17):** on a model with more than
 one time step, a site's dated records are a time series, not one value. Each
 record is matched to the nearest time step: a calendar date through

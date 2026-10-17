@@ -637,14 +637,21 @@ def _read_simulated_observation_series(model: str) -> dict:
     return {site: df[col].to_numpy(dtype=float) for site, col in columns.items()}
 
 
-def _observation_pairs(model: str) -> tuple[list[dict], Path]:
+# MF6 writes +1e30 (inactive) / -1e30 (dry) for a head it cannot compute.
+_OBS_SENTINEL = 1e29
+
+
+def _observation_pairs(model: str) -> tuple[list[dict], Path, list[str]]:
     """Observed/simulated pairs for the registered targets.
 
     One output time (steady state): one pair per site, the mean of its
     records against the simulated value. Several (transient, R3.7): one pair
     per site and matched time step, records matched by date exactly as the
     calibration interface does, so a fit statistic and a calibration agree
-    on what is compared. Raises ``FileNotFoundError`` before a run.
+    on what is compared. A simulated value that is MF6's dry/inactive
+    sentinel is not a head: those pairs are dropped and the site is listed in
+    the third return value instead of entering the fit as a 1e30 residual.
+    Raises ``FileNotFoundError`` before a run.
     """
     obs = _registered_observations(model)
     if obs is None:
@@ -671,7 +678,7 @@ def _observation_pairs(model: str) -> tuple[list[dict], Path]:
                     "observed": float(np.mean(values)),
                     "simulated": float(df[columns[site]].iloc[idx]),
                 })
-        return pairs, csv_path
+        return _drop_sentinels(pairs, csv_path)
     for entry in entries:
         site = str(entry["site"])
         values = [float(v) for v in entry.get("values", [])]
@@ -683,7 +690,13 @@ def _observation_pairs(model: str) -> tuple[list[dict], Path]:
             "observed": float(np.mean(values)),
             "simulated": float(df[columns[site]].iloc[-1]),
         })
-    return pairs, csv_path
+    return _drop_sentinels(pairs, csv_path)
+
+
+def _drop_sentinels(pairs: list[dict], csv_path: Path) -> tuple[list[dict], Path, list[str]]:
+    kept = [p for p in pairs if abs(p["simulated"]) < _OBS_SENTINEL]
+    dry = sorted({p["site"] for p in pairs if abs(p["simulated"]) >= _OBS_SENTINEL})
+    return kept, csv_path, dry
 
 
 def _compute_obs_fit(model: str) -> dict | None:
@@ -698,7 +711,7 @@ def _compute_obs_fit(model: str) -> dict | None:
     if obs is None:
         return None
     try:
-        rows, csv_path = _observation_pairs(model)
+        rows, csv_path, dry = _observation_pairs(model)
     except (FileNotFoundError, ValueError):
         return None
     if not rows:
@@ -730,6 +743,7 @@ def _compute_obs_fit(model: str) -> dict | None:
         "obs_csv": str(csv_path),
         "time": last_time,
         "worst_sites": worst,
+        "dry_sites": dry,
     }
 
 
@@ -2298,9 +2312,16 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
             "Run import_obs_from_csv first to register sites.",
         )
     try:
-        rows, csv_path = _observation_pairs(model)
+        rows, csv_path, dry = _observation_pairs(model)
     except FileNotFoundError as exc:
         return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
+    if not rows and dry:
+        return _err(
+            "OBSERVATION_CELLS_DRY",
+            f"Every observation cell is dry or inactive in this run: {dry[:10]}.",
+            "Check the water table against the cell bottoms (or use the Newton "
+            "formulation so cells do not dry out) before comparing.",
+        )
     if not rows:
         raise FileNotFoundError(
             f"None of the registered sites appear in the observation CSV {csv_path}."
@@ -2363,6 +2384,12 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
         "residuals": residuals[:cap],
         "n_residuals_total": n,
         "worst_sites": residuals[:5],
+        "dry_sites": dry,
+        **(
+            {"warning": f"{len(dry)} observation site(s) are dry or inactive in this "
+                        f"run and were left out: {dry[:10]}."}
+            if dry else {}
+        ),
     }
 
 

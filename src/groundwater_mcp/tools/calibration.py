@@ -5006,6 +5006,7 @@ def _impl_setup_calibration_zoned(
     }
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_practice_checks(model, result, norm["parameters"])
     if any(z["initial"] != 1.0 for z in norm["zones"]):
         result["warning"] = (
             "One or more zone multipliers have initial != 1.0, so the initial "
@@ -5127,6 +5128,7 @@ def _impl_setup_calibration_pilot_points(
     }
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_practice_checks(model, result, norm["parameters"])
     if len(norm["parameters"]) > len(obs_data):
         result["note"] = (
             f"{len(norm['parameters'])} pilot points vs {len(obs_data)} observations: "
@@ -5135,6 +5137,72 @@ def _impl_setup_calibration_pilot_points(
             "consider regularisation."
         )
     return result
+
+
+# MF6 IMS outer_dvclose of the complexity presets (read from mfsim.lst).
+_IMS_PRESET_DVCLOSE = {"SIMPLE": 1e-3, "MODERATE": 1e-2, "COMPLEX": 1e-1}
+_CALIBRATION_MAX_DVCLOSE = 1e-4
+
+
+def _solver_closure_warning(model: str) -> str | None:
+    """Warn when the head closure is too loose for finite-difference derivatives.
+
+    PEST++ derivatives come from runs with a parameter perturbed by ~1 %; the
+    head change that causes is often millimetres, so a solver that stops
+    within 0.01 m (MF6's MODERATE preset) returns derivatives that are mostly
+    convergence noise. The usual advice is a closure well below the expected
+    head change, about 1e-5 m.
+    """
+    ims = get_gwf(model).simulation.get_package("ims")
+    if isinstance(ims, list):
+        ims = ims[0] if ims else None
+    if ims is None:
+        return None
+    value = None
+    try:
+        value = ims.outer_dvclose.get_data()
+    except Exception:  # noqa: BLE001 — an unset option reads as absent
+        value = None
+    if value is None:
+        try:
+            preset = str(ims.complexity.get_data() or "SIMPLE").upper()
+        except Exception:  # noqa: BLE001
+            preset = "SIMPLE"
+        value = _IMS_PRESET_DVCLOSE.get(preset, 1e-3)
+    value = float(value)
+    if value <= _CALIBRATION_MAX_DVCLOSE:
+        return None
+    return (
+        f"The solver head closure (IMS outer_dvclose = {value:g}) is looser than "
+        f"{_CALIBRATION_MAX_DVCLOSE:g}: the head change from a 1 % parameter "
+        "perturbation can be smaller than that, so the Jacobian is dominated by "
+        "convergence noise. Tighten it before calibrating, e.g. "
+        "set_simulation(..., outer_dvclose=1e-5, inner_dvclose=1e-6)."
+    )
+
+
+# Upper bounds for dimensionless fractions: the generic initial x factor bounds
+# (x10, x20 for CSUB packagedata) let specific yield or porosity run past 1,
+# which no aquifer material has. A bound above the cap is lowered to it.
+_FRACTION_BOUND_CAPS = {"sto:sy": 0.5, "csub:cg_theta": 0.7, ("csub:packagedata", "theta"): 0.7}
+
+
+def _clamp_physical_bounds(target: str, p: dict) -> None:
+    cap = _FRACTION_BOUND_CAPS.get(target)
+    if target == "csub:packagedata":
+        cap = _FRACTION_BOUND_CAPS.get((target, str(p.get("column"))))
+    if cap is None:
+        return
+    initial = float(p["initial"])
+    if not 0.0 < initial < 1.0:
+        raise ValueError(
+            f"Parameter '{p['name']}' ({target}) is a fraction; its initial "
+            f"value must be between 0 and 1, got {initial:g}."
+        )
+    cap = min(0.99, max(cap, initial * 1.2))
+    if float(p["upper_bound"]) > cap:
+        p["upper_bound"] = cap
+        p["upper_bound_note"] = f"capped at {cap:g} (physical fraction)"
 
 
 def _impl_setup_calibration(
@@ -5312,6 +5380,8 @@ def _impl_setup_calibration(
     external_files: list[str] = []
     for target, group in groups.items():
         resolved = _TARGET_RESOLVERS[target](model, group)
+        for p in resolved["parameters"]:
+            _clamp_physical_bounds(target, p)
         templates.extend(resolved["templates"])
         all_parameters.extend(resolved["parameters"])
         external_files.extend(resolved["external_files"])
@@ -5400,7 +5470,29 @@ def _impl_setup_calibration(
         result["derived_observations"] = derived_report
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_practice_checks(model, result, all_parameters)
+    steady = len(_model_output_times(model)) <= 1 or get_gwf(model).get_package("sto") is None
+    k_targets = {"npf:k", "npf:k33"} & set(groups)
+    if obs_source == "model" and steady and k_targets and "rch:recharge" in groups:
+        result["identifiability_warning"] = (
+            "K and recharge are estimated together from steady-state heads only. "
+            "Heads then constrain only their ratio (recharge / K): scaling both by "
+            "the same factor gives the same heads, so the estimates are "
+            "non-unique. Add a flow observation (baseflow, spring or river "
+            "exchange), fix one of the two from independent data, or use "
+            "transient data."
+        )
     return result
+
+
+def _attach_practice_checks(model: str, result: dict, parameters: list[dict]) -> None:
+    """Add the solver-closure warning and any capped bounds to a setup result."""
+    solver = _solver_closure_warning(model)
+    if solver:
+        result["solver_warning"] = solver
+    capped = {p["name"]: p["upper_bound_note"] for p in parameters if "upper_bound_note" in p}
+    if capped:
+        result["bounds_capped"] = capped
 
 
 # ---------------------------------------------------------------------------

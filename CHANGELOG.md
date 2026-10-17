@@ -101,6 +101,16 @@ release.
 
 ### Fixed — silent wrong answers now fail loudly
 
+- **Calibration defaults checked against modelling practice:** default
+  bounds no longer let specific yield or porosity exceed 1 (Sy 0.2 used to
+  get an upper bound of 2.0, porosity 0.35 up to 7.0). A dry observation cell
+  no longer enters `compare_to_observed` as a 1e30 residual; it is listed in
+  `dry_sites`. `setup_calibration` warns when the solver closure is too loose
+  for finite-difference derivatives (MF6's MODERATE preset closes to 0.01 m),
+  and when K and recharge are estimated together from steady heads alone.
+  `import_obs_from_csv` refuses sites on inactive cells instead of letting
+  MF6 fail at run time.
+
 - `import_grid_from_shapefile` rejects a `layer_surfaces` list that is not
   `nlay + 1` long; it used to ignore it and build flat default layers.
 - `import_river_from_shapefile` takes a `layer` and skips reaches on inactive
