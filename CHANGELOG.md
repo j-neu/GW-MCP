@@ -118,6 +118,13 @@ release.
 
 ### Fixed — silent wrong answers now fail loudly
 
+- **Dry observation cells in a PEST++ run:** MF6's -1e30 for a dry cell went
+  straight into phi (~1e60). On a non-Newton model with head observations on
+  convertible cells the forward wrapper now writes the cell bottom instead
+  and logs the site; setup reports `dry_cell_handling` and warns when the
+  last run already had dry observation cells. Checked with pestpp-glm: a dry
+  site costs (observed - bottom)^2 x w^2.
+
 - **pestpp-glm froze small parameters:** the derivative-increment floor
   (`derinclb`) was a fixed 0.01 on every group, larger than a recharge of
   4e-4, so the perturbed value passed its bound and pestpp-glm reported

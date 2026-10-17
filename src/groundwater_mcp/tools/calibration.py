@@ -1462,8 +1462,14 @@ def _impl_check_parameter_sensitivity(
         return series
 
     base_sim = _read_sim()
+    # A dry/inactive cell (MF6's +-1e30) has no head to perturb (R3.11).
+    dry_sites = sorted(
+        k for k, v in base_sim.items() if v.size and np.any(np.abs(v) >= 1e29)
+    )
     base_values = {
-        k: v for k, v in base_sim.items() if v.size and np.all(np.abs(v) > 1e-12)
+        k: v
+        for k, v in base_sim.items()
+        if v.size and np.all(np.abs(v) > 1e-12) and k not in dry_sites
     }
     if not base_values:
         return _err(
@@ -1506,7 +1512,9 @@ def _impl_check_parameter_sensitivity(
         rel = [
             float(np.max(np.abs(sim[site] - base) / np.abs(base)))
             for site, base in base_values.items()
-            if site in sim and sim[site].shape == base.shape
+            if site in sim
+            and sim[site].shape == base.shape
+            and np.all(np.abs(sim[site]) < 1e29)
         ]
         results[name] = {
             "sensitivity": float(np.mean(rel)) if rel else None,
@@ -1532,6 +1540,7 @@ def _impl_check_parameter_sensitivity(
         "delta": delta,
         "n_forward_runs": len(parameters) + 1,
         "parameters": results,
+        **({"dry_sites": dry_sites} if dry_sites else {}),
     }
 
 
@@ -3527,6 +3536,108 @@ def _derived_wrapper_source(model: str) -> tuple[str, str]:
     return "import csv\nimport datetime\n", f"DERIVED = {specs!r}\n" + _DERIVED_WRAPPER_BODY
 
 
+def _uses_newton(gwf) -> bool:
+    try:
+        opts = gwf.name_file.newtonoptions.get_data()
+    except Exception:  # noqa: BLE001 — no option block
+        return False
+    return opts is not None and "newton" in str(opts).lower()
+
+
+def _obs_cell_flat_index(gwf, cid) -> int | None:
+    """Flat (0-based) cell index of a registered observation cell id: DIS
+    ``[layer, row, col]``, DISV ``[layer, cell]``, DISU a 1-based node."""
+    mg = gwf.modelgrid
+    n = int(np.asarray(mg.botm).size)
+    nlay = max(int(getattr(mg, "nlay", 1) or 1), 1)
+    per_layer = n // nlay
+    if isinstance(cid, (list, tuple)) and len(cid) == 3:
+        flat = int(cid[0]) * per_layer + int(cid[1]) * int(mg.ncol) + int(cid[2])
+    elif isinstance(cid, (list, tuple)) and len(cid) == 2:
+        flat = int(cid[0]) * per_layer + int(cid[1])
+    elif isinstance(cid, (list, tuple)):
+        flat = int(cid[0]) - 1
+    else:
+        flat = int(cid) - 1
+    return flat if 0 <= flat < n else None
+
+
+def _dry_obs_fill_plan(model: str) -> dict[str, dict[str, float]]:
+    """Head observation columns whose cell can go dry, with the cell bottom
+    the forward wrapper writes in place of MF6's dry sentinel (R3.11).
+
+    ``{obs_csv: {COLUMN: bottom}}``; empty for a Newton model (MF6 then
+    reports a finite head, no sentinel) or when no observation cell is
+    convertible (NPF icelltype 0 never dries).
+    """
+    obs = read_meta(model).get("observations") or {}
+    if not obs.get("sites") or str(obs.get("type", "HEAD")).upper() != "HEAD":
+        return {}
+    gwf = get_gwf(model)
+    npf = gwf.get_package("npf")
+    if npf is None or _uses_newton(gwf):
+        return {}
+    botm = np.asarray(gwf.modelgrid.botm, dtype=float).reshape(-1)
+    icell = np.asarray(npf.icelltype.array).reshape(-1)
+    if icell.size != botm.size:  # one value per layer
+        icell = np.repeat(icell, botm.size // max(icell.size, 1))
+    cols: dict[str, float] = {}
+    for entry in obs["sites"]:
+        flat = _obs_cell_flat_index(gwf, entry["cellid"])
+        if flat is not None and int(icell[flat]) != 0:
+            cols[str(entry["site"]).upper()] = float(botm[flat])
+    return {str(obs["output_csv"]): cols} if cols else {}
+
+
+# Stdlib-only step run by the forward wrapper after a successful MF6 run: in
+# the planned head columns a |value| >= 1e29 (MF6's dry/inactive sentinel)
+# becomes the cell bottom, and the columns replaced are listed in DRY_LOG.
+_DRY_FILL_BODY = (
+    "replaced = []\n"
+    "for name, cols in DRY_FILL.items():\n"
+    "    path = os.path.join(WS, name)\n"
+    "    try:\n"
+    "        with open(path) as fh:\n"
+    "            lines = fh.read().splitlines()\n"
+    "    except OSError:\n"
+    "        continue\n"
+    "    if not lines:\n"
+    "        continue\n"
+    "    index = {h.strip().strip('\"').upper(): i for i, h in enumerate(lines[0].split(','))}\n"
+    "    out = [lines[0]]\n"
+    "    for line in lines[1:]:\n"
+    "        tok = line.split(',')\n"
+    "        for col, bottom in cols.items():\n"
+    "            i = index.get(col)\n"
+    "            if i is None or i >= len(tok):\n"
+    "                continue\n"
+    "            try:\n"
+    "                value = float(tok[i])\n"
+    "            except ValueError:\n"
+    "                continue\n"
+    "            if abs(value) >= 1e29:\n"
+    "                tok[i] = repr(float(bottom))\n"
+    "                replaced.append(col)\n"
+    "        out.append(','.join(tok))\n"
+    "    with open(path, 'w') as fh:\n"
+    "        fh.write('\\n'.join(out) + '\\n')\n"
+    "with open(DRY_LOG, 'w') as fh:\n"
+    "    fh.write(' '.join(sorted(set(replaced))) + '\\n')\n"
+)
+
+
+def _dry_fill_wrapper_source(model: str) -> str:
+    plan = _dry_obs_fill_plan(model)
+    if not plan:
+        return ""
+    log = f"{get_gwf(model).name}_dry_obs.txt"
+    return (
+        f"DRY_FILL = {plan!r}\n"
+        f"DRY_LOG = os.path.join(WS, {log!r})\n"
+        + _DRY_FILL_BODY
+    )
+
+
 def _generate_forward_wrapper(
     model: str, multiply_k: bool = False, pilot_points: bool = False
 ) -> dict:
@@ -3617,14 +3728,17 @@ def _generate_forward_wrapper(
     )
 
     derived_imports, derived_step = _derived_wrapper_source(model)
+    # The dry-cell fill (R3.11) runs first: the derived step reads heads only
+    # through CSUB output, never the head obs CSV.
+    post_steps = _dry_fill_wrapper_source(model) + derived_step
 
     def _tail(rc_expr: str) -> str:
-        # Run the derived-series step only after a successful model run, then
-        # propagate the MF6 return code.
+        # Run the post-MF6 steps (dry-cell fill, derived series) only after a
+        # successful model run, then propagate the MF6 return code.
         body = f"sys.exit({rc_expr})\n"
-        if derived_step:
+        if post_steps:
             indented = "\n".join(
-                ("    " + line) if line else line for line in derived_step.splitlines()
+                ("    " + line) if line else line for line in post_steps.splitlines()
             )
             body = (
                 f"if {rc_expr} == 0:\n" + indented + "\n" + f"sys.exit({rc_expr})\n"
@@ -3808,6 +3922,8 @@ def _needs_forward_wrapper(model: str) -> bool:
     except RuntimeError:
         pass
     try:
+        if _dry_obs_fill_plan(model):
+            return True  # R3.11: the wrapper replaces the dry-cell sentinel
         return bool(read_meta(model).get("derived_observations"))
     except Exception:
         return False
@@ -5738,6 +5854,33 @@ def _attach_practice_checks(model: str, result: dict, parameters: list[dict]) ->
     capped = {p["name"]: p["upper_bound_note"] for p in parameters if "upper_bound_note" in p}
     if capped:
         result["bounds_capped"] = capped
+    plan = _dry_obs_fill_plan(model)
+    if plan:
+        n_sites = sum(len(cols) for cols in plan.values())
+        result["dry_cell_handling"] = {
+            "mode": "cell_bottom",
+            "n_sites": n_sites,
+            "note": (
+                f"{n_sites} head observation(s) are on convertible cells. If one "
+                "goes dry in a PEST++ run, the forward wrapper reports the cell "
+                "bottom instead of MF6's -1e30 (which made phi ~1e60) and lists "
+                f"the site in {get_gwf(model).name}_dry_obs.txt. The Newton "
+                "formulation (set_simulation newton=True) avoids drying."
+            ),
+        }
+    try:
+        from groundwater_mcp.tools.postprocess import _observation_pairs
+
+        _, _, dry = _observation_pairs(model)
+    except Exception:  # noqa: BLE001 — no run yet / no head targets
+        dry = []
+    if dry:
+        result["dry_warning"] = (
+            f"{len(dry)} observation cell(s) were dry in the last run: {dry[:10]}. "
+            "A calibration cannot fit a head there (it sees only the cell "
+            "bottom). Check the water table against the layer bottoms and the "
+            "observation layers, or use the Newton formulation."
+        )
 
 
 # ---------------------------------------------------------------------------

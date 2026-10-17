@@ -610,6 +610,20 @@ leave such sites out of the statistics and list them in `dry_sites` (with a
 `warning`); if every site is dry the result is `OBSERVATION_CELLS_DRY`.
 `import_obs_from_csv` refuses a site on an inactive cell (idomain ≤ 0).
 
+**Dry cells during a calibration run (R3.11, 2026-10-17):** without Newton,
+MF6 writes -1e30 for a dry cell's head, and PEST++ read it straight from the
+obs CSV (phi ~1e60, broken derivatives). When a head observation sits on a
+convertible cell (NPF icelltype != 0) of a non-Newton model, the calibration
+setup now always uses the forward wrapper, and after each successful MF6
+run the wrapper writes the cell bottom in place of the sentinel (the
+highest head a dry cell can have, so the residual stays finite and grows as
+the cell dries further). The sites replaced in the last run are listed in
+`<gwf>_dry_obs.txt`. Setup results carry `dry_cell_handling` (`mode`
+`cell_bottom`, `n_sites`) and, when the last run already had dry observation
+cells, `dry_warning`. `check_parameter_sensitivity` leaves dry sites out and
+lists them in `dry_sites`. A Newton model needs none of this: MF6 then
+reports a finite head.
+
 **Calibration setup checks (R3.8):** `setup_calibration` returns
 `solver_warning` when the IMS head closure is looser than 1e-4 (the MF6
 presets close to 1e-3 / 0.01 / 0.1 m for SIMPLE / MODERATE / COMPLEX, which
