@@ -693,6 +693,109 @@ def _observation_pairs(model: str) -> tuple[list[dict], Path, list[str]]:
     return _drop_sentinels(pairs, csv_path)
 
 
+def _registered_flow_groups(model: str) -> list[dict]:
+    """Flow observation targets per package (R3.10); empty when none."""
+    flows = read_meta(model).get("flow_observations") or {}
+    return [g for g in flows.get("packages", []) if g.get("sites")]
+
+
+def _read_flow_frame(model: str, group: dict):
+    """A package's flow-obs CSV as ``(frame, {site: column})``."""
+    import pandas as pd
+
+    csv_path = resolve_workspace(model) / group["output_csv"]
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"No flow observation output CSV found at {csv_path}. "
+            "Run the simulation first with run_simulation."
+        )
+    df = pd.read_csv(csv_path)
+    lookup = {str(c).lower(): str(c) for c in df.columns}
+    columns = {
+        str(e["site"]): lookup[str(e["site"]).lower()]
+        for e in group["sites"]
+        if str(e["site"]).lower() in lookup
+    }
+    return df, columns
+
+
+def _read_simulated_flow_series(model: str) -> dict:
+    """Each flow site's simulated flow (MF6 sign) at every output time."""
+    out: dict = {}
+    for group in _registered_flow_groups(model):
+        df, columns = _read_flow_frame(model, group)
+        out.update({site: df[col].to_numpy(dtype=float) for site, col in columns.items()})
+    return out
+
+
+def _flow_observation_pairs(model: str) -> list[dict]:
+    """Observed/simulated flow pairs in the sign the flows were measured in.
+
+    Matched to output times exactly as the calibration interface does (one
+    pair per site in steady state, per site and step in a transient run).
+    """
+    pairs: list[dict] = []
+    for group in _registered_flow_groups(model):
+        df, columns = _read_flow_frame(model, group)
+        entries = list(group["sites"])
+        if len(df) > 1 and "time" in df.columns:
+            from groundwater_mcp.tools.calibration import _series_obs_plan
+
+            times = df["time"].to_numpy(dtype=float).tolist()
+            plan, _ = _series_obs_plan(model, entries, times, None)
+            for idx in sorted(plan):
+                for pos, values in plan[idx].items():
+                    entry = entries[pos]
+                    site = str(entry["site"])
+                    if site not in columns:
+                        continue
+                    sign = float(entry.get("sign", 1.0))
+                    pairs.append({
+                        "site": site,
+                        "package": group["package"],
+                        "time": float(times[idx]),
+                        "observed": sign * float(np.mean(values)),
+                        "simulated": sign * float(df[columns[site]].iloc[idx]),
+                    })
+            continue
+        for entry in entries:
+            site = str(entry["site"])
+            if site not in columns or len(df) == 0:
+                continue
+            pairs.append({
+                "site": site,
+                "package": group["package"],
+                "time": float(df["time"].iloc[-1]) if "time" in df.columns else None,
+                "observed": float(np.mean(entry["observed"])),
+                "simulated": float(entry.get("sign", 1.0)) * float(df[columns[site]].iloc[-1]),
+            })
+    return pairs
+
+
+def _flow_fit(model: str) -> dict | None:
+    """Flow residuals and per-site statistics (R3.10), or None without flow
+    targets. Kept apart from the head statistics: different units."""
+    if not _registered_flow_groups(model):
+        return None
+    pairs = _flow_observation_pairs(model)
+    for p in pairs:
+        p["residual"] = p["observed"] - p["simulated"]
+    per_site: dict = {}
+    for site in dict.fromkeys(p["site"] for p in pairs):
+        rows = [p for p in pairs if p["site"] == site]
+        res = np.array([p["residual"] for p in rows])
+        obs = np.array([p["observed"] for p in rows])
+        mean_obs = float(np.mean(np.abs(obs)))
+        per_site[site] = {
+            "package": rows[0]["package"],
+            "n": len(rows),
+            "bias": float(np.mean(res)),
+            "rmse": float(np.sqrt(np.mean(res**2))),
+            "relative_bias": float(np.mean(res)) / mean_obs if mean_obs > 0 else None,
+        }
+    return {"n": len(pairs), "per_site": per_site, "residuals": pairs[:500]}
+
+
 def _drop_sentinels(pairs: list[dict], csv_path: Path) -> tuple[list[dict], Path, list[str]]:
     kept = [p for p in pairs if abs(p["simulated"]) < _OBS_SENTINEL]
     dry = sorted({p["site"] for p in pairs if abs(p["simulated"]) >= _OBS_SENTINEL})
@@ -729,6 +832,12 @@ def _compute_obs_fit(model: str) -> dict | None:
     ss_tot = float(np.sum((observed - observed.mean()) ** 2))
     r2 = 1.0 - float(np.sum(residual**2)) / ss_tot if ss_tot > 0 else None
 
+    try:
+        flows = _flow_fit(model)
+    except FileNotFoundError:
+        flows = None
+    if flows:
+        flows = {"n": flows["n"], "per_site": flows["per_site"]}
     worst_idx = np.argsort(np.abs(residual))[::-1][:5]
     worst = [
         {"site": rows[i]["site"], "time": rows[i]["time"], "residual": float(residual[i])}
@@ -744,6 +853,7 @@ def _compute_obs_fit(model: str) -> dict | None:
         "time": last_time,
         "worst_sites": worst,
         "dry_sites": dry,
+        **({"flows": flows} if flows else {}),
     }
 
 
@@ -2305,11 +2415,18 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
     from groundwater_mcp.utils.plotting import figure, save_figure
 
     obs = _registered_observations(model)
+    try:
+        flows = _flow_fit(model)
+    except FileNotFoundError as exc:
+        return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
     if obs is None:
+        if flows is not None:
+            return {"model": model, "flows": flows}
         return _err(
             "MODEL_HAS_NO_OBSERVATIONS",
             "No observation targets are registered for this model.",
-            "Run import_obs_from_csv first to register sites.",
+            "Run import_obs_from_csv (heads) or import_flow_observations "
+            "(flows) first to register sites.",
         )
     try:
         rows, csv_path, dry = _observation_pairs(model)
@@ -2390,6 +2507,7 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
                         f"run and were left out: {dry[:10]}."}
             if dry else {}
         ),
+        **({"flows": flows} if flows is not None else {}),
     }
 
 

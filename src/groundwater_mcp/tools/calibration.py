@@ -991,12 +991,15 @@ def _series_report_summary(report: dict | None, max_skipped: int = 50) -> dict |
     """
     if report is None:
         return None
+    report = {**report, "sites": report.get("sites", {})}
     skipped = [
         {"site": site, **rec}
         for site, info in report["sites"].items()
         for rec in info["skipped"]
     ]
-    out = {k: v for k, v in report.items() if k != "sites"}
+    out = {k: v for k, v in report.items() if k not in ("sites", "flows")}
+    if report.get("flows") is not None:
+        out["flows"] = _series_report_summary(report["flows"], max_skipped)
     out["sites"] = {
         site: {
             "n_matched": len(info["matched"]),
@@ -1069,85 +1072,187 @@ def _build_model_obs_interface(
         obs_std = float(obs_std)
         if not (math.isfinite(obs_std) and obs_std > 0):
             raise ValueError(f"obs_std must be a positive number, got {obs_std}.")
-    obs = read_meta(model).get("observations")
-    if not obs or not obs.get("sites"):
+    meta = read_meta(model)
+    obs = meta.get("observations") or {}
+    heads = list(obs.get("sites") or [])
+    flow_groups = [
+        g for g in (meta.get("flow_observations") or {}).get("packages", []) if g.get("sites")
+    ]
+    if not heads and not flow_groups:
         raise ValueError(
             "obs_source='model' requires observation targets registered via "
-            "import_obs_from_csv. No 'observations' entry found in "
-            ".gwmcp_meta.json for this model."
+            "import_obs_from_csv or import_flow_observations. No 'observations' "
+            "entry found in .gwmcp_meta.json for this model."
         )
 
-    output_csv = str(obs["output_csv"])
-    entries = list(obs["sites"])
-    group = str(obs.get("type", "HEAD")).lower() + "_obs"
     times = _model_output_times(model)
-    if len(times) > 1:
-        plan, report = _series_obs_plan(model, entries, times, time_tolerance)
-        names_by_row: dict[int, dict[int, str]] = {}
-        obs_data: dict = {}
-        row_names: dict[tuple[int, int], str] = {}
-        site_groups = _site_group_names(entries)
-        for idx in sorted(plan):
-            for pos, values in plan[idx].items():
-                suffix = f"_t{idx + 1}"
-                name = str(entries[pos]["site"])[: 20 - len(suffix)] + suffix
-                if name.lower() in {n.lower() for n in obs_data}:
-                    raise ValueError(
-                        "Obs names collide after truncation to 20 characters (PEST "
-                        "obsnme limit). Use shorter, distinct site names."
-                    )
-                names_by_row.setdefault(idx, {})[pos] = name
-                row_names[(idx, pos)] = name
-                stds = [
-                    m["std"]
-                    for m in report["sites"][str(entries[pos]["site"])]["matched"]
-                    if m["row"] == idx
-                ]
-                obs_data[name] = {
-                    "obsval": float(np.mean(values)),
-                    "obgnme": site_groups[pos],
-                    **_obs_weight(stds, obs_std),
+    series = len(times) > 1
+    ins_files: list[str] = []
+    outputs: list[str] = []
+    obs_data: dict = {}
+    report: dict | None = None
+    used_groups: set[str] = set()
+
+    def _merge(data: dict) -> None:
+        taken = {n.lower() for n in obs_data}
+        clash = [n for n in data if n.lower() in taken]
+        if clash:
+            raise ValueError(
+                f"Obs names {clash[:5]} collide after truncation to 20 characters "
+                "(PEST obsnme limit). Use shorter, distinct site names."
+            )
+        obs_data.update(data)
+
+    if heads:
+        output_csv = str(obs["output_csv"])
+        if series:
+            ins, data, report = _series_obs_interface(
+                model, ws, heads, output_csv, times, time_tolerance, obs_std,
+                _site_group_names(heads, used_groups),
+            )
+        else:
+            # PEST caps observation names at 20 characters; the obs CSV
+            # columns are the (up to 40-char) OBS package names, so tokens
+            # are read positionally.
+            names = [str(entry["site"])[:20] for entry in heads]
+            if len({n.lower() for n in names}) != len(names):
+                raise ValueError(
+                    "Obs names collide after truncation to 20 characters (PEST "
+                    "obsnme limit). Use shorter, distinct site names."
+                )
+            ins = str(ws / f"{output_csv}.ins")
+            _impl_generate_ins_from_obs_csv(
+                str(ws / output_csv), ins_path=ins, obs_names=names
+            )
+            group = str(obs.get("type", "HEAD")).lower() + "_obs"
+            used_groups.add(group)
+            data = {
+                name: {
+                    "obsval": float(np.mean([float(v) for v in entry["values"]])),
+                    "obgnme": group,
+                    **_obs_weight(
+                        list(entry.get("stds") or [None] * len(entry["values"])), obs_std
+                    ),
                 }
-        for pos, entry in enumerate(entries):
-            for m in report["sites"][str(entry["site"])]["matched"]:
-                m["obs_name"] = row_names[(m["row"], pos)]
-        if balance:
-            _balance_group_weights(obs_data)
-        ins_file = ws / f"{output_csv}.ins"
-        _write_series_ins(ins_file, names_by_row)
-        report["n_observations"] = len(obs_data)
-        out = ([str(ins_file)], obs_data, [output_csv])
-        return (*out, report) if return_report else out
+                for name, entry in zip(names, heads)
+            }
+        _merge(data)
+        ins_files.append(ins)
+        outputs.append(output_csv)
 
-    # PEST caps observation names at 20 characters; the obs CSV columns are
-    # the (up to 40-char) OBS package names, so tokens are read positionally.
-    names: list[str] = []
-    for entry in entries:
-        name = str(entry["site"])[:20]
-        names.append(name)
-    if len(set(names)) != len(names):
-        raise ValueError(
-            "Obs names collide after truncation to 20 characters (PEST "
-            "obsnme limit). Use shorter, distinct site names."
-        )
+    # Flow targets (R3.10): one MF6 package OBS CSV per package, a group per
+    # site; the same date matching as heads on a transient model.
+    flow_report: dict = {"n_matched": 0, "n_skipped": 0, "sites": {}}
+    for g in flow_groups:
+        entries = list(g["sites"])
+        output_csv = str(g["output_csv"])
+        groups = _site_group_names(entries, used_groups)
+        if series:
+            ins, data, rep = _series_obs_interface(
+                model, ws, entries, output_csv, times, time_tolerance, obs_std, groups
+            )
+            flow_report["n_matched"] += rep["n_matched"]
+            flow_report["n_skipped"] += rep["n_skipped"]
+            flow_report["sites"].update(rep["sites"])
+        else:
+            flow_names = {pos: str(e["site"])[:20] for pos, e in enumerate(entries)}
+            ins = str(ws / f"{output_csv}.ins")
+            _write_series_ins(Path(ins), {0: flow_names})
+            data = {
+                flow_names[pos]: {
+                    "obsval": float(np.mean([float(v) for v in e["values"]])),
+                    "obgnme": groups[pos],
+                    **_obs_weight(list(e.get("stds") or [None] * len(e["values"])), obs_std),
+                }
+                for pos, e in enumerate(entries)
+            }
+        _merge(data)
+        ins_files.append(ins)
+        outputs.append(output_csv)
+    if flow_groups and series:
+        if report is None:
+            report = {"mode": "time_series", "n_matched": 0, "n_skipped": 0, "sites": {}}
+        report["flows"] = flow_report
 
-    ins_path = str(ws / f"{output_csv}.ins")
-    _impl_generate_ins_from_obs_csv(str(ws / output_csv), ins_path=ins_path, obs_names=names)
-
-    obs_data = {
-        name: {
-            "obsval": float(np.mean([float(v) for v in entry["values"]])),
-            "obgnme": group,
-            **_obs_weight(
-                list(entry.get("stds") or [None] * len(entry["values"])), obs_std
-            ),
-        }
-        for name, entry in zip(names, entries)
-    }
     if balance:
         _balance_group_weights(obs_data)
-    out = ([str(ins_path)], obs_data, [output_csv])
-    return (*out, None) if return_report else out
+    if report is not None:
+        report["n_observations"] = len(obs_data)
+    out = (ins_files, obs_data, outputs)
+    return (*out, report) if return_report else out
+
+
+def _series_obs_interface(
+    model: str,
+    ws: Path,
+    entries: list[dict],
+    output_csv: str,
+    times: list[float],
+    time_tolerance: float | None,
+    obs_std: float | None,
+    site_groups: list[str],
+) -> tuple[str, dict, dict]:
+    """Instruction file, obs data and matching report for one transient obs
+    CSV (R3.7): one observation per site and matched time, ``<site>_t<step>``."""
+    plan, report = _series_obs_plan(model, entries, times, time_tolerance)
+    names_by_row: dict[int, dict[int, str]] = {}
+    obs_data: dict = {}
+    row_names: dict[tuple[int, int], str] = {}
+    for idx in sorted(plan):
+        for pos, values in plan[idx].items():
+            suffix = f"_t{idx + 1}"
+            name = str(entries[pos]["site"])[: 20 - len(suffix)] + suffix
+            if name.lower() in {n.lower() for n in obs_data}:
+                raise ValueError(
+                    "Obs names collide after truncation to 20 characters (PEST "
+                    "obsnme limit). Use shorter, distinct site names."
+                )
+            names_by_row.setdefault(idx, {})[pos] = name
+            row_names[(idx, pos)] = name
+            stds = [
+                m["std"]
+                for m in report["sites"][str(entries[pos]["site"])]["matched"]
+                if m["row"] == idx
+            ]
+            obs_data[name] = {
+                "obsval": float(np.mean(values)),
+                "obgnme": site_groups[pos],
+                **_obs_weight(stds, obs_std),
+            }
+    for pos, entry in enumerate(entries):
+        for m in report["sites"][str(entry["site"])]["matched"]:
+            m["obs_name"] = row_names[(m["row"], pos)]
+    ins_file = ws / f"{output_csv}.ins"
+    _write_series_ins(ins_file, names_by_row)
+    return str(ins_file), obs_data, report
+
+
+def _set_derivative_floor(pst) -> None:
+    """Give every parameter group a nonzero derivative-increment floor
+    (derinclb) scaled to its smallest member.
+
+    pyemu's default of 0 gives a zero increment for a parameter at 0 (a zero
+    Jacobian, 7e-A2.5); a fixed 0.01 is larger than a recharge of 1e-3 m/d or
+    a specific storage of 1e-5 and pushes the perturbed value past its bound,
+    so pestpp-glm failed to compute that derivative and froze the parameter.
+    The floor is 1 % of the group's smallest nonzero |parval1| (0.01 when all
+    are zero), the same as the default relative increment at that value.
+    """
+    par = pst.parameter_data
+    floors = []
+    for grp in pst.parameter_groups.index:
+        values = par.loc[par["pargp"] == grp, "parval1"].astype(float).abs()
+        values = values[values > 0]
+        floors.append(0.01 * float(values.min()) if len(values) else 0.01)
+    pst.parameter_groups["derinclb"] = floors
+
+
+def _has_model_obs(model: str) -> bool:
+    """True when head or flow observation targets are registered."""
+    meta = read_meta(model)
+    if (meta.get("observations") or {}).get("sites"):
+        return True
+    return any(g.get("sites") for g in (meta.get("flow_observations") or {}).get("packages", []))
 
 
 def _obs_weight(stds: list, default: float | None) -> dict:
@@ -1165,11 +1270,11 @@ def _obs_weight(stds: list, default: float | None) -> dict:
     return {"weight": 1.0 / sigma, "standard_deviation": sigma, "_sigma_from": source}
 
 
-def _site_group_names(entries: list[dict]) -> list[str]:
+def _site_group_names(entries: list[dict], used: set[str] | None = None) -> list[str]:
     """One PEST observation group per site: the site name in lower case, at
     most 20 characters, not starting with PEST's reserved ``regul`` prefix,
     made distinct with a numeric suffix."""
-    used: set[str] = set()
+    used = set() if used is None else used
     out: list[str] = []
     for entry in entries:
         base = re.sub(r"[^a-z0-9_]", "_", str(entry["site"]).lower()) or "site"
@@ -1289,7 +1394,10 @@ def _impl_check_parameter_sensitivity(
     the observation sites of the largest relative change of each site's
     simulated series (its single value for a steady-state model).
     """
-    from groundwater_mcp.tools.postprocess import _read_simulated_observation_series
+    from groundwater_mcp.tools.postprocess import (
+        _read_simulated_flow_series,
+        _read_simulated_observation_series,
+    )
     from groundwater_mcp.tools.runner import _impl_run_simulation
 
     ws = resolve_workspace(model)
@@ -1347,7 +1455,11 @@ def _impl_check_parameter_sensitivity(
                 return {
                     k: np.array([v], dtype=float) for k, v in derived.items() if v is not None
                 }
-        return _read_simulated_observation_series(model)
+        series = {}
+        if (read_meta(model).get("observations") or {}).get("sites"):
+            series.update(_read_simulated_observation_series(model))
+        series.update(_read_simulated_flow_series(model))  # R3.10
+        return series
 
     base_sim = _read_sim()
     base_values = {
@@ -4998,11 +5110,10 @@ def _impl_setup_calibration_zoned(
         raise ValueError(
             f"setup_calibration supports obs_source='model', got '{obs_source}'."
         )
-    obs_meta = read_meta(model).get("observations")
-    if not obs_meta or not obs_meta.get("sites"):
+    if not _has_model_obs(model):
         raise ValueError(
             "obs_source='model' requires observation targets registered via "
-            "import_obs_from_csv. No 'observations' entry found in "
+            "import_obs_from_csv or import_flow_observations. No 'observations' entry found in "
             ".gwmcp_meta.json for this model."
         )
     ins_paths, obs_data, output_files, series = _build_model_obs_interface(
@@ -5128,11 +5239,10 @@ def _impl_setup_calibration_pilot_points(
         raise ValueError(
             f"setup_calibration supports obs_source='model', got '{obs_source}'."
         )
-    obs_meta = read_meta(model).get("observations")
-    if not obs_meta or not obs_meta.get("sites"):
+    if not _has_model_obs(model):
         raise ValueError(
             "obs_source='model' requires observation targets registered via "
-            "import_obs_from_csv. No 'observations' entry found in "
+            "import_obs_from_csv or import_flow_observations. No 'observations' entry found in "
             ".gwmcp_meta.json for this model."
         )
     ins_paths, obs_data, output_files, series = _build_model_obs_interface(
@@ -5434,11 +5544,10 @@ def _impl_setup_calibration(
     derived_report: dict | None = None
     series: dict | None = None
     if obs_source == "model":
-        obs_meta = read_meta(model).get("observations")
-        if not obs_meta or not obs_meta.get("sites"):
+        if not _has_model_obs(model):
             raise ValueError(
                 "obs_source='model' requires observation targets registered via "
-                "import_obs_from_csv. No 'observations' entry found in "
+                "import_obs_from_csv or import_flow_observations. No 'observations' entry found in "
                 ".gwmcp_meta.json for this model."
             )
         ins_paths, obs_data, output_files, series = _build_model_obs_interface(
@@ -5568,14 +5677,21 @@ def _impl_setup_calibration(
     _attach_practice_checks(model, result, all_parameters)
     steady = len(_model_output_times(model)) <= 1 or get_gwf(model).get_package("sto") is None
     k_targets = {"npf:k", "npf:k33"} & set(groups)
-    if obs_source == "model" and steady and k_targets and "rch:recharge" in groups:
+    has_flows = any(
+        g.get("sites")
+        for g in (read_meta(model).get("flow_observations") or {}).get("packages", [])
+    )
+    if (
+        obs_source == "model" and steady and k_targets and "rch:recharge" in groups
+        and not has_flows
+    ):
         result["identifiability_warning"] = (
             "K and recharge are estimated together from steady-state heads only. "
             "Heads then constrain only their ratio (recharge / K): scaling both by "
             "the same factor gives the same heads, so the estimates are "
-            "non-unique. Add a flow observation (baseflow, spring or river "
-            "exchange), fix one of the two from independent data, or use "
-            "transient data."
+            "non-unique. Add a flow observation (import_flow_observations: baseflow, "
+            "spring or river exchange), fix one of the two from independent data, "
+            "or use transient data."
         )
     return result
 
@@ -6408,7 +6524,7 @@ def _impl_setup_da_control(
     pst.control_data.noptmax = int(noptmax)
 
     pst.rectify_pgroups()
-    pst.parameter_groups["derinclb"] = 0.01
+    _set_derivative_floor(pst)
 
     pst_path = ws / f"{model}.pst"
     pst.write(str(pst_path), version=2)
@@ -6796,7 +6912,7 @@ def _impl_setup_pest_control(
     # work" bug. rectify_pgroups first so newly-added groups (e.g. a custom
     # pargp in par_data) exist, then set a nonzero increment on every group.
     pst.rectify_pgroups()
-    pst.parameter_groups["derinclb"] = 0.01
+    _set_derivative_floor(pst)
 
     pst_path = ws / f"{model}.pst"
     pst.write(str(pst_path))

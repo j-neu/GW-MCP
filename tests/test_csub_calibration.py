@@ -450,7 +450,8 @@ def test_setup_calibration_k33_pst_uses_initial_and_derinclb(tmp_path):
     assert float(par.loc["k33_1", "parlbnd"]) == pytest.approx(0.02)
     assert float(par.loc["k33_1", "parubnd"]) == pytest.approx(2.0)
     assert (pst.parameter_groups["derinclb"] > 0).all()
-    assert float(pst.parameter_groups.loc["gwmcp", "derinclb"]) == pytest.approx(0.01)
+    # 1 % of the group's smallest initial value (0.2), not a fixed 0.01
+    assert float(pst.parameter_groups.loc["gwmcp", "derinclb"]) == pytest.approx(0.002)
 
     # The external array was substituted with the initial value.
     ws = resolve_workspace(name)

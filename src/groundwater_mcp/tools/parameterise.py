@@ -71,11 +71,12 @@ def _safe_obs_name(site: str, used: set[str]) -> str:
     return name
 
 
-def _record_std(df, std_col: str | None, std: float | None):
+def _record_std(df, std_col: str | None, std: float | None, fallback=None):
     """Per-record measurement standard deviation (R3.9), or None if not given.
 
-    ``std`` fills records whose ``std_col`` cell is empty; every resulting
-    value must be a positive finite number.
+    ``std`` fills records whose ``std_col`` cell is empty, else the
+    per-record ``fallback`` series does; every resulting value must be a
+    positive finite number.
     """
     import pandas as pd
 
@@ -84,7 +85,11 @@ def _record_std(df, std_col: str | None, std: float | None):
         if not (math.isfinite(std) and std > 0):
             raise ValueError(f"std must be a positive number, got {std}.")
     if std_col is None:
-        return None if std is None else pd.Series(std, index=df.index, dtype=float)
+        if std is not None:
+            return pd.Series(std, index=df.index, dtype=float)
+        if fallback is not None:
+            _check_positive(fallback, "rel_std x |value|")
+        return fallback
     if std_col not in df.columns:
         raise ValueError(
             f"Column '{std_col}' (std_col) not found in CSV. Available: {list(df.columns)}"
@@ -96,18 +101,21 @@ def _record_std(df, std_col: str | None, std: float | None):
         bad = raw[unparsable].iloc[0]
         raise ValueError(f"std_col '{std_col}' has a non-numeric value {bad!r}.")
     if values.isna().any():
-        if std is None:
+        if std is None and fallback is None:
             raise ValueError(
                 f"{int(values.isna().sum())} record(s) have no value in std_col "
                 f"'{std_col}'; fill them or pass std= as the default."
             )
-        values = values.fillna(std)
-    if not (np.isfinite(values) & (values > 0)).all():
-        bad = values[~(np.isfinite(values) & (values > 0))].iloc[0]
-        raise ValueError(
-            f"std_col '{std_col}' must hold positive numbers, got {bad}."
-        )
+        values = values.fillna(std if std is not None else fallback)
+    _check_positive(values, f"std_col '{std_col}'")
     return values.astype(float)
+
+
+def _check_positive(values, label: str) -> None:
+    ok = np.isfinite(values) & (values > 0)
+    if not ok.all():
+        bad = values[~ok].iloc[0]
+        raise ValueError(f"{label} must give positive numbers, got {bad}.")
 
 
 def _record_provenance(model: str, key: str, source: str, tool: str, **extra) -> None:
@@ -1872,10 +1880,9 @@ def _impl_import_obs_from_csv(
         raise ValueError(
             f"Unsupported obs_type '{obs_type_str}'. MODFLOW 6 OBS continuous "
             f"types supported here are {sorted(_MF6_CONTINUOUS_OBS_TYPES)}. "
-            "Compound flux observations (e.g. total river discharge over a cell "
-            "group) are not representable by an OBS6 continuous type — evaluate "
-            "them with compute_water_balance instead of registering them as "
-            "observations."
+            "Flow observations (baseflow, river/drain exchange, spring or well "
+            "flows) are registered on their boundary package with "
+            "import_flow_observations."
         )
 
     df = pd.read_csv(csv_file)
@@ -1914,6 +1921,21 @@ def _impl_import_obs_from_csv(
         )
 
     sites = df[site_col].unique()
+    flow_sites = {
+        str(e.get("original_site", e["site"])).lower()
+        for g in (read_meta(model).get("flow_observations") or {}).get("packages", [])
+        for e in g.get("sites", [])
+    } | {
+        str(e["site"]).lower()
+        for g in (read_meta(model).get("flow_observations") or {}).get("packages", [])
+        for e in g.get("sites", [])
+    }
+    clash = [str(s) for s in sites if str(s).lower() in flow_sites]
+    if clash:
+        raise ValueError(
+            f"Site name(s) {clash[:5]} are already registered as flow observations; "
+            "flow and head sites need distinct names."
+        )
     site_to_cellid: dict[str, tuple[int, ...] | int] = {}
     outside_sites: set[str] = set()
 
@@ -2197,6 +2219,257 @@ def _impl_import_obs_from_csv(
             "and residuals for these sites are not meaningful as a fit."
         )
     return result
+
+
+_FLOW_OBS_PACKAGES = ("RIV", "DRN", "GHB", "CHD", "WEL")
+_FLOW_DIRECTIONS = {"out_of_aquifer": -1.0, "into_aquifer": 1.0}
+_UNOBSERVED_BOUNDNAME = "unobserved"
+
+
+def _cell_key(cid) -> tuple[int, ...]:
+    """A boundary cell id as a tuple of ints (FloPy's 0-based form)."""
+    if isinstance(cid, (list, tuple, np.ndarray)):
+        return tuple(int(v) for v in cid)
+    return (int(cid),)
+
+
+def _impl_import_flow_observations(
+    model: str,
+    csv_file: str,
+    package: str,
+    site_col: str = "site",
+    date_col: str = "date",
+    value_col: str = "value",
+    std_col: str | None = None,
+    std: float | None = None,
+    rel_std: float | None = None,
+    targets: dict | None = None,
+    pname: str | None = None,
+    direction: str = "out_of_aquifer",
+    append: bool = False,
+) -> dict:
+    """Register measured flows on a boundary package as observations (R3.10).
+
+    Each site is the summed flow of a set of the package's boundary cells:
+    ``targets`` maps a site to ``"all"`` or a list of 0-based cell ids (a
+    single site with no ``targets`` is the whole package). The cells are
+    given a MODFLOW 6 boundname per site (``unobserved`` for the rest) and
+    the package gets an OBS file whose CSV reports the flow per boundname.
+    MF6 counts flow into the aquifer as positive; ``direction`` says how the
+    CSV values are signed (``out_of_aquifer`` for baseflow, spring discharge
+    or a pumping rate). A measurement error is required (``std_col``,
+    ``std`` or ``rel_std`` x |value|): a weight of 1 on a flow mixed with heads
+    has no meaning. Without ``append`` this package's flow sites are replaced;
+    sites on other packages are kept.
+    """
+    import flopy.mf6  # noqa: F401  (package OBS initialisation)
+    import pandas as pd
+
+    from groundwater_mcp.tools.builder import _packages_of_type
+
+    ptype = str(package).upper()
+    if ptype not in _FLOW_OBS_PACKAGES:
+        raise ValueError(
+            f"Flow observations are supported on the {', '.join(_FLOW_OBS_PACKAGES)} "
+            f"packages, got package '{package}'."
+        )
+    if direction not in _FLOW_DIRECTIONS:
+        raise ValueError(
+            f"direction must be one of {sorted(_FLOW_DIRECTIONS)}, got '{direction}'."
+        )
+    sign = _FLOW_DIRECTIONS[direction]
+    if rel_std is not None:
+        rel_std = float(rel_std)
+        if not (math.isfinite(rel_std) and rel_std > 0):
+            raise ValueError(f"rel_std must be a positive fraction, got {rel_std}.")
+
+    gwf = get_gwf(model)
+    pkgs = _packages_of_type(gwf, ptype.lower())
+    if pname:
+        pkgs = [p for p in pkgs if str(p.package_name).lower() == pname.lower()]
+    if not pkgs:
+        raise ValueError(
+            f"No {ptype} package{f' named {pname!r}' if pname else ''} in model "
+            f"'{model}'; add it with add_boundary_package first."
+        )
+    if len(pkgs) > 1:
+        raise ValueError(
+            f"The model has {len(pkgs)} {ptype} packages "
+            f"({[p.package_name for p in pkgs]}); pass pname to choose one."
+        )
+    pkg = pkgs[0]
+    pkg_key = str(pname or ptype).lower()
+
+    df = pd.read_csv(csv_file)
+    for col in [site_col, value_col]:
+        if col not in df.columns:
+            raise ValueError(
+                f"Column '{col}' not found in CSV. Available: {list(df.columns)}"
+            )
+    if date_col in df.columns and not pd.api.types.is_numeric_dtype(df[date_col]):
+        parsed = pd.to_datetime(df[date_col], errors="coerce")
+        if not (parsed.isna() & df[date_col].notna()).any():
+            df[date_col] = parsed
+    values = pd.to_numeric(df[value_col], errors="coerce")
+    if values.isna().any():
+        raise ValueError(f"value_col '{value_col}' has empty or non-numeric values.")
+    fallback = rel_std * values.abs() if rel_std is not None else None
+    record_std = _record_std(df, std_col, std, fallback)
+    if record_std is None:
+        raise ValueError(
+            "Flow observations need a measurement error: pass std_col, std (in "
+            "the flow units) or rel_std (a fraction of the measured value)."
+        )
+
+    sites = [str(s) for s in df[site_col].unique()]
+    if targets is None:
+        if len(sites) != 1:
+            raise ValueError(
+                f"{len(sites)} flow sites in the CSV; pass targets mapping each "
+                "site to 'all' or a list of the package's cell ids."
+            )
+        targets = {sites[0]: "all"}
+    targets = {str(k): v for k, v in targets.items()}
+    if set(targets) != set(sites):
+        raise ValueError(
+            f"targets must name exactly the CSV's sites {sites}, got {sorted(targets)}."
+        )
+
+    # Names: unique against head sites and other packages' flow sites.
+    meta = read_meta(model)
+    flow_meta = meta.get("flow_observations") or {"packages": []}
+    groups = [g for g in flow_meta["packages"] if g["pname"] != pkg_key]
+    own = next((g for g in flow_meta["packages"] if g["pname"] == pkg_key), None)
+    kept = list(own["sites"]) if (own and append) else []
+    used: set[str] = set()
+    for entry in (meta.get("observations") or {}).get("sites", []):
+        used.add(str(entry["site"]).lower())
+        used.add(str(entry.get("original_site", entry["site"])).lower())
+    for g in groups:
+        used.update(str(e["site"]).lower() for e in g["sites"])
+    used.update(str(e["site"]).lower() for e in kept)
+    repeated = [s for s in sites if s.lower() in used]
+    if repeated:
+        raise ValueError(
+            f"Site name(s) {repeated[:5]} are already registered as observations; "
+            "flow and head sites need distinct names."
+        )
+
+    periods = pkg.stress_period_data.get_data() or {}
+    periods = {sp: rec for sp, rec in periods.items() if rec is not None and len(rec)}
+    if not periods:
+        raise ValueError(f"The {ptype} package has no boundary records.")
+    names0 = list(next(iter(periods.values())).dtype.names)
+    has_bname = "boundname" in names0
+    if has_bname and not (own or any(g["pname"] == pkg_key for g in groups)):
+        raise ValueError(
+            f"The {ptype} package already has boundnames of its own; registering "
+            "flow targets would overwrite them. Not supported on this package."
+        )
+    all_cells = {_cell_key(r["cellid"]) for rec in periods.values() for r in rec}
+
+    cell_site: dict[tuple[int, ...], str] = {}
+    for entry in kept:
+        for c in (all_cells if entry["cells"] == "all" else entry["cells"]):
+            cell_site[_cell_key(c)] = str(entry["site"])
+    obs_names: dict[str, str] = {}
+    new_cells: dict[str, str | list] = {}
+    for site in sites:
+        obs_names[site] = _safe_obs_name(site, used)
+        spec = targets[site]
+        if isinstance(spec, str):
+            if spec != "all":
+                raise ValueError(f"Target for site {site!r} must be 'all' or a cell list.")
+            cells = sorted(all_cells)
+        else:
+            cells = [_cell_key(c) for c in spec]
+            absent = [c for c in cells if c not in all_cells]
+            if absent:
+                raise ValueError(
+                    f"Site {site!r}: cell(s) {absent[:5]} have no {ptype} boundary "
+                    "in any stress period."
+                )
+        for c in cells:
+            if c in cell_site and cell_site[c] != obs_names[site]:
+                raise ValueError(
+                    f"Cell {c} belongs to more than one flow site "
+                    f"({cell_site[c]!r}, {site!r}); targets must not overlap."
+                )
+            cell_site[c] = obs_names[site]
+        new_cells[site] = "all" if spec == "all" else [list(c) for c in cells]
+
+    # Boundnames on every stored period (kept external file names).
+    new_periods = {}
+    for sp, rec in periods.items():
+        rows = []
+        for r in rec.tolist():
+            base = list(r[:-1]) if has_bname else list(r)
+            bname = cell_site.get(_cell_key(base[0]), _UNOBSERVED_BOUNDNAME)
+            rows.append(tuple(base) + (bname,))
+        record = pkg.stress_period_data.get_record(sp) if hasattr(
+            pkg.stress_period_data, "get_record"
+        ) else None
+        fname = record.get("filename") if isinstance(record, dict) else None
+        new_periods[sp] = {"filename": fname, "data": rows} if fname else rows
+    pkg.boundnames.set_data(True)
+    pkg.stress_period_data.set_data(new_periods)
+
+    output_csv = f"{gwf.name}_{pkg_key}_flow.obs.csv"
+    site_entries = list(kept)
+    for site in sites:
+        site_df = df[df[site_col].astype(str) == site]
+        obs_name = obs_names[site]
+        entry = {
+            "site": obs_name,
+            "cells": new_cells[site],
+            "n_cells": len(all_cells) if new_cells[site] == "all" else len(new_cells[site]),
+            "n_records": int(len(site_df)),
+            "observed": [float(v) for v in values[site_df.index]],
+            "values": [sign * float(v) for v in values[site_df.index]],
+            "stds": [float(v) for v in record_std[site_df.index]],
+            "dates": [str(d) for d in site_df[date_col].tolist()]
+            if date_col in site_df.columns
+            else [],
+            "sign": sign,
+        }
+        if obs_name != site:
+            entry["original_site"] = site
+        site_entries.append(entry)
+    continuous = {
+        output_csv: [(str(e["site"]), ptype.lower(), str(e["site"])) for e in site_entries]
+    }
+    pkg.obs.initialize(filename=f"{gwf.name}.{pkg_key}.obs", continuous=continuous)
+    written = save_sim(model, gwf.simulation)
+
+    groups.append({
+        "package": ptype,
+        "pname": pkg_key,
+        "obs_file": f"{gwf.name}.{pkg_key}.obs",
+        "output_csv": output_csv,
+        "direction": direction,
+        "sites": site_entries,
+    })
+    meta = read_meta(model)
+    meta["flow_observations"] = {"packages": groups}
+    meta.setdefault("provenance", {})[f"flow_observations:{pkg_key}"] = {
+        "source": csv_file,
+        "tool": "import_flow_observations",
+    }
+    write_meta(model, meta)
+    return {
+        "model": model,
+        "package": ptype,
+        "pname": pkg_key,
+        "site_count": len(sites),
+        "total_records": int(len(df)),
+        "direction": direction,
+        "output_csv": output_csv,
+        "targets": {
+            site: {"obs_name": obs_names[site], "n_cells": e["n_cells"]}
+            for site, e in zip(sites, site_entries[len(kept):])
+        },
+        "written": written,
+    }
 
 
 def _impl_import_subsidence_observations(
@@ -2896,6 +3169,62 @@ def register(mcp) -> None:
                 model, csv_file, obs_type, site_col, date_col, value_col, x_col,
                 y_col, layer, cellid_col, allow_sequential, append, allow_outside,
                 std_col, std,
+            )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("OBS_IMPORT_FAILED", str(exc))
+
+    @mcp.tool()
+    def import_flow_observations(
+        model: str,
+        csv_file: str,
+        package: str,
+        site_col: str = "site",
+        date_col: str = "date",
+        value_col: str = "value",
+        std_col: str | None = None,
+        std: float | None = None,
+        rel_std: float | None = None,
+        targets: dict | None = None,
+        pname: str | None = None,
+        direction: str = "out_of_aquifer",
+        append: bool = False,
+    ) -> dict:
+        """Register measured flows (baseflow, river or drain exchange, spring
+        discharge, boundary or well flows) as calibration targets.
+
+        package: RIV, DRN, GHB, CHD or WEL (pname picks one of several). Each
+        CSV site is the summed flow over a set of that package's boundary
+        cells: targets maps a site to "all" or a list of 0-based cell ids
+        ([layer, row, col] on DIS, [layer, cell] on DISV, [node] on DISU); a
+        CSV with a single site and no targets is the whole package. Targets
+        must not overlap. The cells get a MODFLOW 6 boundname per site
+        (others "unobserved") and the package an OBS file, so the run writes
+        <gwf>_<pname>_flow.obs.csv. MF6 counts flow into the aquifer as
+        positive: direction="out_of_aquifer" (default; baseflow, spring
+        discharge, pumping) or "into_aquifer" says how the CSV values are
+        signed; comparisons report flows in that sign.
+
+        A measurement error is required, in the flow units: std_col (per
+        record), std (one value, or the gap fill for std_col) or rel_std (a
+        fraction of each measured value, e.g. 0.1 for 10 %). Dates work as in
+        import_obs_from_csv: a transient model matches each record to the
+        nearest time step. setup_calibration then fits heads and flows
+        together, one observation group per flow site (balance_obs=True
+        evens the groups' shares of phi); compare_to_observed and
+        run_simulation.observation_fit report flows under "flows". Without
+        append this package's flow sites are replaced; other packages' are
+        kept. A site name may not repeat a head site.
+        """
+        try:
+            return _impl_import_flow_observations(
+                model, csv_file, package, site_col, date_col, value_col, std_col,
+                std, rel_std, targets, pname, direction, append,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

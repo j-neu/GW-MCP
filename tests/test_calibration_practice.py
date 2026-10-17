@@ -180,3 +180,34 @@ def test_site_on_an_inactive_cell_is_refused(tmp_path):
     get_gwf(name).get_package("dis").idomain.set_data([[[1, 0, 1, 1, 1]]])
     with pytest.raises(ValueError, match="inactive"):
         _register(tmp_path, name, [("A", 1, 5.0), ("B", 3, 5.0)])
+
+
+# ---------------------------------------------------------------------------
+# Derivative increments
+# ---------------------------------------------------------------------------
+
+
+def test_derivative_increment_floor_scales_with_small_parameters(tmp_path):
+    """A fixed absolute derinclb of 0.01 is larger than a recharge of 4e-4 and
+    pushes the perturbed value past its upper bound (4e-3), so pestpp-glm
+    reported 'failed to compute parameter derivative' and froze recharge."""
+    name = _build_base_model(tmp_path, "inc", recharge=4e-4)
+    _register_obs(tmp_path, name, n_obs=3)
+    res = _impl_setup_calibration(
+        name,
+        {
+            "k": {"target": "npf:k", "scope": "all", "initial": 5.0},
+            "rech": {"target": "rch:recharge", "scope": "all", "initial": 4e-4},
+        },
+    )
+    pst = pyemu.Pst(res["pst_file"])
+    par = pst.parameter_data
+    for grp, row in pst.parameter_groups.iterrows():
+        members = par[par["pargp"] == grp]
+        if members.empty:
+            continue
+        smallest = float(members["parval1"].abs().min())
+        assert float(row["derinclb"]) <= 0.01 * smallest + 1e-30, (grp, row["derinclb"])
+        # a step of that size stays inside every member's bounds
+        step = members["parval1"] + float(row["derinclb"])
+        assert (step <= members["parubnd"]).all()

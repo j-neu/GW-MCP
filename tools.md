@@ -65,6 +65,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
 | `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False`, `std_col: str \| None = None`, `std: float \| None = None` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`sequential`) |
+| `import_flow_observations` | `model: str`, `csv_file: str`, `package: str` (RIV/DRN/GHB/CHD/WEL), `site_col`, `date_col`, `value_col`, `std_col: str \| None`, `std: float \| None`, `rel_std: float \| None`, `targets: dict \| None`, `pname: str \| None`, `direction: str = "out_of_aquifer"`, `append: bool = False` | `site_count`, `total_records`, `direction`, `output_csv`, `targets` (per site: `obs_name`, `n_cells`) |
 | `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"`, `match: str = "nearest"`, `tolerance_days: float \| None`, `date_map: dict \| None` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`), `match`/`tolerance_days`/`date_map` |
 
 `import_obs_from_csv` persists the observation targets as model state
@@ -618,6 +619,38 @@ steady-state heads (only their ratio is constrained). Default bounds of the
 fraction targets are capped (`sto:sy` 0.5, porosity 0.7) and reported in
 `bounds_capped`.
 
+**Flow observations (R3.10, 2026-10-17):** `import_flow_observations`
+registers measured flows (baseflow, river or drain exchange, spring
+discharge, boundary or well flows) on a RIV/DRN/GHB/CHD/WEL package. Each
+site is the summed flow over a set of the package's boundary cells:
+`targets` maps a site to `"all"` or a list of 0-based cell ids; one site
+without `targets` is the whole package. Targets may not overlap and every
+listed cell must hold a boundary of that package. The cells get a MODFLOW 6
+boundname per site (the rest `unobserved`) and the package an OBS file, so
+the run writes `<gwf>_<pname>_flow.obs.csv` with the flow per site (checked
+against the cell-by-cell budget). MF6 counts flow into the aquifer as
+positive; `direction` (`out_of_aquifer`, the default, for baseflow, springs
+and pumping, or `into_aquifer`) gives the sign of the CSV values, the
+control file holds them in MF6's sign, and `compare_to_observed` reports
+them back in the measured sign. A measurement error is required (`std_col`,
+`std` or `rel_std` as a fraction of each value). A package that already has
+boundnames of its own is refused. `setup_calibration` (all scopes) and
+`setup_pest_control(obs_source="model")` read every flow CSV next to the
+head CSV, with one observation group per flow site and transient matching as
+for heads (`time_series.flows`). `compare_to_observed` and
+`run_simulation.observation_fit` add a `flows` block (per site: `n`, `bias`,
+`rmse`, `relative_bias`; head statistics stay heads only), and
+`check_parameter_sensitivity` measures flows too. With a flow target the
+K/recharge `identifiability_warning` is not raised. A synthetic CHD-bounded
+model recovers K and recharge exactly with pestpp-glm from three heads and
+the east boundary outflow (heads alone fix only their ratio).
+
+**Derivative increments:** every parameter group's `derinclb` (the floor on
+the finite-difference step) is 1 % of its smallest nonzero initial value.
+It was a fixed 0.01, larger than a recharge of 4e-4: the perturbed value
+passed its upper bound, pestpp-glm logged "failed to compute parameter
+derivative" and froze recharge (and any parameter below about 0.1).
+
 **Observation weights (R3.9, 2026-10-17):** give the measurement error at
 import, `std_col` (a column with each record's standard deviation) and/or
 `std` (one value for every record, or for the empty cells of `std_col`), in
@@ -824,7 +857,7 @@ targets registered by `import_obs_from_csv`); (4) writes a Python forward-run
 wrapper at a space-free path when the default MF6 command would be unsafe on
 Windows (the **MF6 binary path** contains spaces — see the Windows model
 command note below); and (5) assembles
-the `.pst` with safe numeric defaults — `derinclb > 0` on every parameter
+the `.pst` with safe numeric defaults — `derinclb > 0` (1 % of the group's smallest value) on every parameter
 group (a zero `derinclb` produces a zero Jacobian) and default bounds
 base/10–base×10.
 

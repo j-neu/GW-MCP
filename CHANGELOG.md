@@ -54,6 +54,14 @@ release.
   same series. A synthetic pumping test recovers K and Ss with pestpp-glm
   (7.996 / 1.017e-3 against 8 / 1e-3). Previously every site was collapsed
   to the mean of its records and compared with the first time step.
+- **Flow observations:** `import_flow_observations` registers baseflow,
+  river/drain exchange, spring, boundary or well flows on a RIV/DRN/GHB/CHD/WEL
+  package (whole package or chosen cells, via MF6 boundnames and package
+  OBS), with a required measurement error and an explicit sign convention.
+  The calibration setup fits heads and flows together, `compare_to_observed`
+  and the sensitivity screen read the flows. A synthetic test recovers K and
+  recharge (5.000 / 1.000e-3) with pestpp-glm from heads plus one boundary
+  outflow; heads alone fix only their ratio.
 - **Observation weights from measurement error:** `import_obs_from_csv`
   takes `std_col`/`std` and `setup_calibration` / `setup_pest_control` take
   `obs_std`; each observation's weight is 1/sigma (a mean of n records has
@@ -109,6 +117,12 @@ release.
   even for a read-only adopted source.
 
 ### Fixed — silent wrong answers now fail loudly
+
+- **pestpp-glm froze small parameters:** the derivative-increment floor
+  (`derinclb`) was a fixed 0.01 on every group, larger than a recharge of
+  4e-4, so the perturbed value passed its bound and pestpp-glm reported
+  "failed to compute parameter derivative" and held the parameter at its
+  initial value. The floor is now 1 % of the group's smallest value.
 
 - **Calibration defaults checked against modelling practice:** default
   bounds no longer let specific yield or porosity exceed 1 (Sy 0.2 used to
