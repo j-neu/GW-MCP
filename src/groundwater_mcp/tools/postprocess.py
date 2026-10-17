@@ -603,36 +603,108 @@ def _read_simulated_observations_values(model: str) -> tuple[dict[str, float], P
     return sim, csv_path, last_time
 
 
+def _read_obs_csv_frame(model: str):
+    """The registered obs CSV as ``(frame, csv_path, {site: column})``."""
+    import pandas as pd
+
+    obs = _registered_observations(model)
+    if obs is None:
+        raise FileNotFoundError(
+            "No observation targets are registered for this model. "
+            "Run import_obs_from_csv first."
+        )
+    csv_path = resolve_workspace(model) / obs["output_csv"]
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"No observation output CSV found at {csv_path}. "
+            "Run the simulation first with run_simulation."
+        )
+    df = pd.read_csv(csv_path)
+    # MODFLOW uppercases observation names in the continuous obs CSV.
+    lookup = {str(c).lower(): str(c) for c in df.columns}
+    columns = {}
+    for entry in obs["sites"]:
+        site = str(entry["site"])
+        col = site if site in df.columns else lookup.get(site.lower())
+        if col is not None:
+            columns[site] = col
+    return df, csv_path, columns
+
+
+def _read_simulated_observation_series(model: str) -> dict:
+    """Each registered site's simulated values at every output time."""
+    df, _, columns = _read_obs_csv_frame(model)
+    return {site: df[col].to_numpy(dtype=float) for site, col in columns.items()}
+
+
+def _observation_pairs(model: str) -> tuple[list[dict], Path]:
+    """Observed/simulated pairs for the registered targets.
+
+    One output time (steady state): one pair per site, the mean of its
+    records against the simulated value. Several (transient, R3.7): one pair
+    per site and matched time step, records matched by date exactly as the
+    calibration interface does, so a fit statistic and a calibration agree
+    on what is compared. Raises ``FileNotFoundError`` before a run.
+    """
+    obs = _registered_observations(model)
+    if obs is None:
+        raise FileNotFoundError(
+            "No observation targets are registered for this model. "
+            "Run import_obs_from_csv first."
+        )
+    df, csv_path, columns = _read_obs_csv_frame(model)
+    entries = list(obs["sites"])
+    pairs: list[dict] = []
+    if len(df) > 1 and "time" in df.columns:
+        from groundwater_mcp.tools.calibration import _series_obs_plan
+
+        times = df["time"].to_numpy(dtype=float).tolist()
+        plan, _ = _series_obs_plan(model, entries, times, None)
+        for idx in sorted(plan):
+            for pos, values in plan[idx].items():
+                site = str(entries[pos]["site"])
+                if site not in columns:
+                    continue
+                pairs.append({
+                    "site": site,
+                    "time": float(times[idx]),
+                    "observed": float(np.mean(values)),
+                    "simulated": float(df[columns[site]].iloc[idx]),
+                })
+        return pairs, csv_path
+    for entry in entries:
+        site = str(entry["site"])
+        values = [float(v) for v in entry.get("values", [])]
+        if not values or site not in columns or len(df) == 0:
+            continue
+        pairs.append({
+            "site": site,
+            "time": float(df["time"].iloc[-1]) if "time" in df.columns else None,
+            "observed": float(np.mean(values)),
+            "simulated": float(df[columns[site]].iloc[-1]),
+        })
+    return pairs, csv_path
+
+
 def _compute_obs_fit(model: str) -> dict | None:
     """Return observation-fit statistics, or None when no targets are
     registered or the run has not produced the obs CSV yet (7f-F1.3/F1.4).
 
-    Per site: observed = mean of the registered observed values; simulated =
-    the value in the model's obs CSV at the final output time. The comparison
-    is steady-state-appropriate; for transient models it compares each site's
-    mean observation against the final-time simulated value.
+    Steady state: per site, the mean of the registered records against the
+    simulated value. Transient: every record against the simulated value at
+    the time step its date falls on (see :func:`_observation_pairs`).
     """
     obs = _registered_observations(model)
     if obs is None:
         return None
     try:
-        sim, csv_path, last_time = _read_simulated_observations_values(model)
-    except FileNotFoundError:
+        rows, csv_path = _observation_pairs(model)
+    except (FileNotFoundError, ValueError):
         return None
-
-    rows: list[dict] = []
-    for entry in obs["sites"]:
-        site = str(entry["site"])
-        values = [float(v) for v in entry.get("values", [])]
-        if not values or site not in sim:
-            continue
-        rows.append({
-            "site": site,
-            "observed": float(np.mean(values)),
-            "simulated": sim[site],
-        })
     if not rows:
         return None
+    times = [r["time"] for r in rows if r["time"] is not None]
+    last_time = max(times) if times else None
 
     observed = np.array([r["observed"] for r in rows])
     simulated = np.array([r["simulated"] for r in rows])
@@ -646,7 +718,7 @@ def _compute_obs_fit(model: str) -> dict | None:
 
     worst_idx = np.argsort(np.abs(residual))[::-1][:5]
     worst = [
-        {"site": rows[i]["site"], "residual": float(residual[i])}
+        {"site": rows[i]["site"], "time": rows[i]["time"], "residual": float(residual[i])}
         for i in worst_idx
     ]
     return {
@@ -2212,7 +2284,8 @@ def _impl_read_simulated_observations(model: str) -> dict:
 
 def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dict:
     """Compare the registered observed values against the simulated heads,
-    with no PEST setup at all (7f-F1.3)."""
+    with no PEST setup at all (7f-F1.3). A transient model compares every
+    record with the time step its date falls on (R3.7)."""
     import pandas as pd
 
     from groundwater_mcp.utils.plotting import figure, save_figure
@@ -2225,28 +2298,17 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
             "Run import_obs_from_csv first to register sites.",
         )
     try:
-        sim, csv_path, last_time = _read_simulated_observations_values(model)
+        rows, csv_path = _observation_pairs(model)
     except FileNotFoundError as exc:
         return _err("OUTPUT_FILE_MISSING", str(exc), "Run run_simulation first.")
-    if not sim:
+    if not rows:
         raise FileNotFoundError(
             f"None of the registered sites appear in the observation CSV {csv_path}."
         )
 
     ws = resolve_workspace(model)
-    rows: list[dict] = []
-    for entry in obs["sites"]:
-        site = str(entry["site"])
-        values = [float(v) for v in entry.get("values", [])]
-        if not values or site not in sim:
-            continue
-        obs_val = float(np.mean(values))
-        rows.append({
-            "site": site,
-            "observed": obs_val,
-            "simulated": sim[site],
-            "residual": obs_val - sim[site],
-        })
+    for r in rows:
+        r["residual"] = r["observed"] - r["simulated"]
     rows.sort(key=lambda r: abs(r["residual"]), reverse=True)
 
     obs_arr = np.array([r["observed"] for r in rows])
@@ -2259,7 +2321,7 @@ def _impl_compare_to_observed(model: str, output_file: str | None = None) -> dic
     # Per-site residual table (capped; full table always written to CSV)
     cap = 500
     residuals = [
-        {"site": r["site"], "observed": r["observed"],
+        {"site": r["site"], "time": r["time"], "observed": r["observed"],
          "simulated": r["simulated"], "residual": r["residual"]}
         for r in rows
     ]

@@ -1831,12 +1831,12 @@ def _impl_import_obs_from_csv(
             "observations."
         )
 
-    df = pd.read_csv(
-        csv_file,
-        parse_dates=[date_col]
-        if date_col in pd.read_csv(csv_file, nrows=0).columns
-        else False,
-    )
+    df = pd.read_csv(csv_file)
+    # A numeric date column is elapsed model time (R3.7) and stays numeric.
+    if date_col in df.columns and not pd.api.types.is_numeric_dtype(df[date_col]):
+        parsed = pd.to_datetime(df[date_col], errors="coerce")
+        if not (parsed.isna() & df[date_col].notna()).any():
+            df[date_col] = parsed
 
     for col in [site_col, value_col]:
         if col not in df.columns:

@@ -603,6 +603,22 @@ observation names in the continuous obs CSV (`W1..W29`), while
 site names against the obs-CSV columns case-insensitively (exact match
 preferred), so a lowercase-imported CSV works without re-importing.
 
+**Transient head time series (R3.7, 2026-10-17):** on a model with more than
+one time step, a site's dated records are a time series, not one value. Each
+record is matched to the nearest time step: a calendar date through
+`set_simulation`'s `start_date_time` (required; without it the call is
+`INVALID_INPUT`), a numeric date as elapsed model time. A record further than
+`obs_time_tolerance` (model time units; default one median step length) from
+every step, or outside the simulated period, is not used. Records on the same
+step are averaged. This applies to `setup_calibration` (all scopes, including
+zones and pilot points), `setup_pest_control(obs_source="model")`,
+`compare_to_observed` and `run_simulation.observation_fit`, which compare every
+record with its own step (residuals carry `time`). The calibration result has a
+`time_series` block: `n_matched`, `n_skipped`, per-site counts and the skipped
+records with a reason. PEST observation names are `<site>_t<step>` (1-based
+time-step number). A steady-state model (one output time) keeps one
+observation per site, the mean of its records.
+
 ### CSUB subsidence (`read_compaction`, `plot_subsidence`)
 
 `read_compaction` turns MF6's CSUB observation output into per-layer compaction
@@ -641,9 +657,9 @@ Set up and run PEST++ parameter estimation via pyEMU.
 
 | Tool | Inputs | Returns |
 |---|---|---|
-| `setup_calibration` | `model: str`, `parameterisation: dict`, `obs_source: str = "model"`, `noptmax: int = 10` | The generated PEST interface: `.pst`, template, instruction file, external array, forward wrapper, parameter table |
+| `setup_calibration` | `model: str`, `parameterisation: dict`, `obs_source: str = "model"`, `noptmax: int = 10`, `obs_time_tolerance: float \| None` | The generated PEST interface: `.pst`, template, instruction file, external array, forward wrapper, parameter table; `time_series` matching report on a transient model |
 | `setup_da_control` | `model: str`, `parameterisation: dict`, `cycles: list[int]`, `obs_cycles: dict`, `obs_weights: dict \| None = None`, `par_cycles: dict \| None = None`, `num_reals: int = 50`, `noptmax: int = 1`, `use_simulated_states: bool = True`, `da_options: dict \| None = None`, `prior_ensemble: dict \| None = None`, `prior_std: float \| None = None`, `state_head_bound: float \| None = None` | The generated DA-ready v2 PEST interface: `.pst`, K template/target, IC template, cycle tables, state-parameter count, `state_bounds` (per-site bound used), model command, prior ensemble file and `prior_ensemble_n_clipped` when a prior is requested |
-| `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"`, `unlisted_obs: "error" \| "zero_weight" = "error"` | Path to generated `.pst` control file, `n_observations_matched`, `n_observations_zero_weight` |
+| `setup_pest_control` | `model: str`, `obs_data: dict`, `par_data: dict`, `template_files: list`, `instruction_files: list`, `pestpp_options: dict \| None`, `obs_source: "explicit" \| "model" = "explicit"`, `unlisted_obs: "error" \| "zero_weight" = "error"`, `obs_time_tolerance: float \| None` | Path to generated `.pst` control file, `n_observations_matched`, `n_observations_zero_weight`, `time_series` (transient `obs_source="model"`) |
 | `start_calibration` | `model: str`, `pst_file: str`, `method: "glm" \| "ies" \| "da" = "glm"`, `num_reals: int \| None = None`, `num_workers: int = 1` | `{ model, job_id, kind, pst_file, status: "running", num_workers, parallelism }` — starts PEST++ in a background thread with live phi progress (7e-A3). For `method="da"`, progress is the per-cycle post-update phi from `<case>.global.phi.actual.csv` and `num_reals` maps to `da_num_reals`; when `num_reals` is omitted the PST's own option is preserved for IES/DA. `num_workers` is advisory (echoed, not applied — PEST++ has no local worker-count option) |
 
 ### Automated calibration setup — `setup_calibration` (7e-A2)

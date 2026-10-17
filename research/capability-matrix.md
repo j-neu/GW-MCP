@@ -286,7 +286,7 @@ stall, avoided via the synchronous runner.)
 
 | Capability | Status today | Covering tool(s) | Catalog example refs | Notes |
 |---|---|---|---|---|
-| OBS (observations) | covered | `import_obs_from_csv`, `read_simulated_observations`, `compare_to_observed` | test005_advgw_tidal, test020_NevilleTonkinTransient, ex-gwf-radial, ex-gwf-advtidal, ex-gwt-keating, usgs/pestpp mf6_freyberg, neversink_workflow | Writes OBS file from CSV, persists targets to model state, reads the obs CSV back, and calibrates from registered targets (`obs_source="model"`) |
+| OBS (observations) | covered | `import_obs_from_csv`, `read_simulated_observations`, `compare_to_observed` | test005_advgw_tidal, test020_NevilleTonkinTransient, ex-gwf-radial, ex-gwf-advtidal, ex-gwt-keating, usgs/pestpp mf6_freyberg, neversink_workflow | Writes OBS file from CSV, persists targets to model state, reads the obs CSV back, and calibrates from registered targets (`obs_source="model"`); on a transient model every dated record is its own observation, matched to the nearest time step (R3.7, K+Ss recovery test) |
 
 ## Output / post-processing
 

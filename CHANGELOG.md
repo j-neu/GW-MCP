@@ -44,6 +44,16 @@ release.
   variogram's prior covariance as the PST `parcov` so pestpp-ies draws a
   spatially correlated prior. A synthetic two-zone test recovers the
   west/east K contrast (23.5 / 2.1 m/d against a 20 / 2 truth).
+- **Transient head time-series calibration:** on a model with more than one
+  time step, `setup_calibration` / `setup_pest_control(obs_source="model")`
+  (uniform, zoned and pilot-point scopes) turn every dated head record into
+  its own observation, matched to the nearest time step (calendar dates via
+  `start_date_time`, numbers as elapsed model time; `obs_time_tolerance`,
+  default one median step). Unmatched records are reported in
+  `time_series`. `compare_to_observed` and the sensitivity screen use the
+  same series. A synthetic pumping test recovers K and Ss with pestpp-glm
+  (7.996 / 1.017e-3 against 8 / 1e-3). Previously every site was collapsed
+  to the mean of its records and compared with the first time step.
 - **One MF6/PEST++ process per workspace:** runs and calibrations claim the
   workspace and a second start returns `WORKSPACE_BUSY` (a retried call after
   a client timeout used to start a second pestpp). The process PID goes in a

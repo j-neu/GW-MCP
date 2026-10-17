@@ -836,19 +836,224 @@ def _parse_ins_obs_names(ins_path: Path) -> list[str]:
     return re.findall(r"!([^!]+)!", text)
 
 
-def _build_model_obs_interface(model: str, ws: Path) -> tuple[list[str], dict, list[str]]:
+def _model_output_times(model: str) -> list[float]:
+    """Simulated time at the end of every time step, from TDIS (R3.7).
+
+    These are the rows MODFLOW 6 writes to a continuous OBS CSV, so they are
+    known without running the model. Step lengths follow MF6: ``perlen/nstp``,
+    or a geometric series ``dt1 * tsmult**i`` with
+    ``dt1 = perlen (tsmult - 1) / (tsmult**nstp - 1)``.
+    """
+    tdis = get_gwf(model).simulation.get_package("tdis")
+    if tdis is None:
+        return []
+    times: list[float] = []
+    total = 0.0
+    for rec in tdis.perioddata.get_data():
+        perlen, nstp, tsmult = float(rec[0]), int(rec[1]), float(rec[2])
+        if nstp < 1:
+            continue
+        if abs(tsmult - 1.0) < 1e-12:
+            steps = [perlen / nstp] * nstp
+        else:
+            dt1 = perlen * (tsmult - 1.0) / (tsmult**nstp - 1.0)
+            steps = [dt1 * tsmult**i for i in range(nstp)]
+        for dt in steps:
+            total += dt
+            times.append(total)
+    return times
+
+
+def _tdis_attr(model: str, attr: str):
+    tdis = get_gwf(model).simulation.get_package("tdis")
+    item = getattr(tdis, attr, None) if tdis is not None else None
+    try:
+        return item.get_data() if item is not None else None
+    except Exception:  # noqa: BLE001 — an unset TDIS option reads as absent
+        return None
+
+
+def _record_model_time(raw, start: datetime.datetime | None, days_per_unit: float):
+    """Elapsed model time of an observed record's date, or ``None``.
+
+    A number is already elapsed model time. A calendar date is converted
+    through the model start date; without one it is an error, because the
+    record cannot be placed on the model's time axis.
+    """
+    text = str(raw).strip()
+    if not text or text.lower() in ("nan", "nat", "none"):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        pass
+    else:
+        return value if np.isfinite(value) else None
+    try:
+        stamp = pd.Timestamp(text)
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(stamp):
+        return None
+    if start is None:
+        raise ValueError(
+            "The registered head observations have calendar dates, but the "
+            "model has no start date, so they cannot be placed on its time "
+            "axis. Call set_simulation(..., start_date_time='YYYY-MM-DD') or "
+            "give elapsed model times in the date column."
+        )
+    stamp_dt = stamp.to_pydatetime().replace(tzinfo=None)
+    return (stamp_dt - start).total_seconds() / 86400.0 / days_per_unit
+
+
+def _series_obs_plan(model: str, entries: list[dict], times: list[float], tolerance):
+    """Match each registered record to the nearest output time (R3.7).
+
+    Returns ``(rows, report)``: ``rows`` maps an output-row index to
+    ``{site_position: [values]}``; records further than ``tolerance`` (model
+    time units; default one median step length) from every output time, or
+    with no usable date, are skipped and reported.
+    """
+    meta = read_meta(model)
+    start = _parse_start_datetime(
+        meta.get("start_date_time") or _tdis_attr(model, "start_date_time")
+    )
+    units = str(meta.get("time_units") or _tdis_attr(model, "time_units") or "DAYS")
+    days_per_unit = _TIME_UNIT_DAYS.get(units.upper(), 1.0)
+    grid = np.asarray(times, dtype=float)
+    if tolerance is None:
+        tolerance = float(np.median(np.diff(grid))) if grid.size > 1 else 0.0
+    tolerance = float(tolerance)
+
+    rows: dict[int, dict[int, list[float]]] = {}
+    report: dict = {
+        "mode": "time_series",
+        "n_output_times": int(grid.size),
+        "tolerance": tolerance,
+        "time_units": units.upper(),
+        "start_date_time": None if start is None else start.isoformat(),
+        "sites": {},
+    }
+    n_matched = n_skipped = 0
+    for pos, entry in enumerate(entries):
+        site = str(entry["site"])
+        dates = list(entry.get("dates") or [])
+        values = [float(v) for v in entry.get("values") or []]
+        if len(dates) != len(values):
+            raise ValueError(
+                f"Site {site!r} has {len(values)} values but {len(dates)} dates; "
+                "a transient model needs a date for every head record. "
+                "Re-import the observations with date_col set."
+            )
+        matched: list[dict] = []
+        skipped: list[dict] = []
+        for date, value in zip(dates, values):
+            t = _record_model_time(date, start, days_per_unit)
+            if t is None:
+                skipped.append({"date": str(date), "value": value, "reason": "no usable date"})
+                continue
+            idx = int(np.argmin(np.abs(grid - t)))
+            gap = abs(float(grid[idx]) - t)
+            if gap > tolerance + 1e-9:
+                reason = (
+                    "before the simulated period" if t < grid[0]
+                    else "after the simulated period" if t > grid[-1]
+                    else "no output time within tolerance"
+                )
+                skipped.append({"date": str(date), "value": value, "reason": reason,
+                                "model_time": t})
+                continue
+            rows.setdefault(idx, {}).setdefault(pos, []).append(value)
+            matched.append({"date": str(date), "value": value,
+                            "model_time": float(grid[idx]), "row": idx,
+                            "offset": t - float(grid[idx])})
+        n_matched += len(matched)
+        n_skipped += len(skipped)
+        report["sites"][site] = {"matched": matched, "skipped": skipped}
+    report["n_matched"] = n_matched
+    report["n_skipped"] = n_skipped
+    if not rows:
+        raise ValueError(
+            "No registered head observation falls on a simulated output time "
+            f"(within {tolerance:g} {units.lower()}); check the observation "
+            "dates against the model's start date and stress periods."
+        )
+    return rows, report
+
+
+def _series_report_summary(report: dict | None, max_skipped: int = 50) -> dict | None:
+    """The time-series matching report as returned to the caller.
+
+    Per-site counts and every skipped record (capped), without the per-record
+    match list, so a long record stays a small result.
+    """
+    if report is None:
+        return None
+    skipped = [
+        {"site": site, **rec}
+        for site, info in report["sites"].items()
+        for rec in info["skipped"]
+    ]
+    out = {k: v for k, v in report.items() if k != "sites"}
+    out["sites"] = {
+        site: {
+            "n_matched": len(info["matched"]),
+            "n_skipped": len(info["skipped"]),
+            "n_observations": len({m["obs_name"] for m in info["matched"]}),
+            "max_offset": max((abs(m["offset"]) for m in info["matched"]), default=None),
+        }
+        for site, info in report["sites"].items()
+    }
+    out["skipped"] = skipped[:max_skipped]
+    if len(skipped) > max_skipped:
+        out["skipped_truncated"] = len(skipped) - max_skipped
+    return out
+
+
+def _write_series_ins(ins_path: Path, rows: dict[int, dict[int, str]]) -> None:
+    """Write a pif that reads selected (row, column) cells of an MF6 obs CSV.
+
+    ``rows`` maps a 0-based data-row index to ``{site_position: obsname}``.
+    Line 1 is the header, data row *i* is line *i + 2*; within a line, the
+    value of site *p* follows the (p+1)-th comma, so unread columns are
+    skipped with bare ``~,~`` markers.
+    """
+    lines = ["pif ~"]
+    line_no = 0
+    for idx in sorted(rows):
+        target = idx + 2
+        tokens = [f"l{target - line_no}"]
+        commas = 0
+        for pos in sorted(rows[idx]):
+            tokens.extend(["~,~"] * (pos - commas))
+            tokens.append(f"~,~ !{rows[idx][pos]}!")
+            commas = pos + 1
+        lines.append(" ".join(tokens))
+        line_no = target
+    ins_path.write_text("\n".join(lines) + "\n")
+
+
+def _build_model_obs_interface(
+    model: str,
+    ws: Path,
+    time_tolerance: float | None = None,
+    return_report: bool = False,
+):
     """Build the obs interface from registered observation targets (7f-F1.5).
 
     Returns ``(instruction_file_paths, obs_data, output_files)`` for use by
-    ``setup_pest_control(obs_source="model")``.  The generated instruction
-    file is a pyemu pif that reads the model's obs CSV (first data row — the
-    single row for the steady-state models this is aimed at); each site's
-    observed value is the mean of its registered records.
+    ``setup_pest_control(obs_source="model")`` (plus a matching report with
+    ``return_report=True``; ``None`` for a single output time).
+
+    With one simulated output time (steady state) the pif reads the single
+    data row and each site's observed value is the mean of its records. With
+    several (transient, R3.7) every record is matched by date to the nearest
+    output time — calendar dates through the model start date, numbers as
+    elapsed model time — within ``time_tolerance`` (model time units; default
+    one median time-step length). There is one observation per site and
+    matched time, named ``<site>_t<step>``; records on the same time are
+    averaged and unmatched records are reported, not used.
     """
-    import numpy as np
-
-    from groundwater_mcp.utils.model_store import read_meta
-
     obs = read_meta(model).get("observations")
     if not obs or not obs.get("sites"):
         raise ValueError(
@@ -859,6 +1064,37 @@ def _build_model_obs_interface(model: str, ws: Path) -> tuple[list[str], dict, l
 
     output_csv = str(obs["output_csv"])
     entries = list(obs["sites"])
+    group = str(obs.get("type", "HEAD")).lower() + "_obs"
+    times = _model_output_times(model)
+    if len(times) > 1:
+        plan, report = _series_obs_plan(model, entries, times, time_tolerance)
+        names_by_row: dict[int, dict[int, str]] = {}
+        obs_data: dict = {}
+        row_names: dict[tuple[int, int], str] = {}
+        for idx in sorted(plan):
+            for pos, values in plan[idx].items():
+                suffix = f"_t{idx + 1}"
+                name = str(entries[pos]["site"])[: 20 - len(suffix)] + suffix
+                if name.lower() in {n.lower() for n in obs_data}:
+                    raise ValueError(
+                        "Obs names collide after truncation to 20 characters (PEST "
+                        "obsnme limit). Use shorter, distinct site names."
+                    )
+                names_by_row.setdefault(idx, {})[pos] = name
+                row_names[(idx, pos)] = name
+                obs_data[name] = {
+                    "obsval": float(np.mean(values)),
+                    "weight": 1.0,
+                    "obgnme": group,
+                }
+        for pos, entry in enumerate(entries):
+            for m in report["sites"][str(entry["site"])]["matched"]:
+                m["obs_name"] = row_names[(m["row"], pos)]
+        ins_file = ws / f"{output_csv}.ins"
+        _write_series_ins(ins_file, names_by_row)
+        report["n_observations"] = len(obs_data)
+        out = ([str(ins_file)], obs_data, [output_csv])
+        return (*out, report) if return_report else out
 
     # PEST caps observation names at 20 characters; the obs CSV columns are
     # the (up to 40-char) OBS package names, so tokens are read positionally.
@@ -879,11 +1115,12 @@ def _build_model_obs_interface(model: str, ws: Path) -> tuple[list[str], dict, l
         name: {
             "obsval": float(np.mean([float(v) for v in entry["values"]])),
             "weight": 1.0,
-            "obgnme": str(obs.get("type", "HEAD")).lower() + "_obs",
+            "obgnme": group,
         }
         for name, entry in zip(names, entries)
     }
-    return [str(ins_path)], obs_data, [output_csv]
+    out = ([str(ins_path)], obs_data, [output_csv])
+    return (*out, None) if return_report else out
 
 
 # ---------------------------------------------------------------------------
@@ -967,10 +1204,11 @@ def _impl_check_parameter_sensitivity(
     template's target file must be one the model actually reads (e.g. an NPF
     ``k`` array via ``OPEN/CLOSE hk.dat`` with template ``hk.dat.tpl``). Runs the
     base model, then each parameter at ``base * (1 + delta)`` with every other
-    token at its base value, and reports per-parameter sensitivity = mean
-    relative change of the simulated observation set.
+    token at its base value, and reports per-parameter sensitivity = mean over
+    the observation sites of the largest relative change of each site's
+    simulated series (its single value for a steady-state model).
     """
-    from groundwater_mcp.tools.postprocess import _read_simulated_observations_values
+    from groundwater_mcp.tools.postprocess import _read_simulated_observation_series
     from groundwater_mcp.tools.runner import _impl_run_simulation
 
     ws = resolve_workspace(model)
@@ -1019,15 +1257,21 @@ def _impl_check_parameter_sensitivity(
     use_derived = bool(read_meta(model).get("derived_observations"))
 
     def _read_sim() -> dict:
+        """Simulated series per target: every output time of a transient
+        model, so a storage parameter that shows only before equilibrium is
+        not screened as insensitive at the final time (R3.7)."""
         if use_derived:
             derived = _read_derived_simulated_values(model)
             if derived:
-                return derived
-        sim_values, _, _ = _read_simulated_observations_values(model)
-        return sim_values
+                return {
+                    k: np.array([v], dtype=float) for k, v in derived.items() if v is not None
+                }
+        return _read_simulated_observation_series(model)
 
     base_sim = _read_sim()
-    base_values = {k: v for k, v in base_sim.items() if v is not None and abs(v) > 1e-12}
+    base_values = {
+        k: v for k, v in base_sim.items() if v.size and np.all(np.abs(v) > 1e-12)
+    }
     if not base_values:
         return _err(
             "MODEL_HAS_NO_OBSERVATIONS",
@@ -1064,10 +1308,12 @@ def _impl_check_parameter_sensitivity(
             results[name] = {"sensitivity": None, "run_succeeded": False}
             continue
         sim = _read_sim()
+        # Per target: the largest relative change over its series (one value
+        # for a steady model); sensitivity is the mean over targets.
         rel = [
-            abs(sim[site] - base) / abs(base)
+            float(np.max(np.abs(sim[site] - base) / np.abs(base)))
             for site, base in base_values.items()
-            if site in sim and sim[site] is not None
+            if site in sim and sim[site].shape == base.shape
         ]
         results[name] = {
             "sensitivity": float(np.mean(rel)) if rel else None,
@@ -4648,6 +4894,7 @@ def _impl_setup_calibration_zoned(
     parameterisation: dict,
     obs_source: str = "model",
     noptmax: int = 10,
+    obs_time_tolerance: float | None = None,
 ) -> dict:
     """Emit a zoned/multiplier PEST interface for NPF k (scope="zones").
 
@@ -4675,6 +4922,9 @@ def _impl_setup_calibration_zoned(
             "import_obs_from_csv. No 'observations' entry found in "
             ".gwmcp_meta.json for this model."
         )
+    ins_paths, obs_data, output_files, series = _build_model_obs_interface(
+        model, ws, obs_time_tolerance, return_report=True
+    )
 
     base_name = f"{gwf_name}_k_base.dat"
     zone_name = f"{gwf_name}_k_zone.dat"
@@ -4687,8 +4937,6 @@ def _impl_setup_calibration_zoned(
 
     tpl = _impl_generate_zone_mult_tpl(model, norm["zones"], mult_name)
     tpl_path = Path(tpl["tpl_path"])
-
-    ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
 
     wrapper = _generate_forward_wrapper(model, multiply_k=True)
     model_command = wrapper["model_command"]
@@ -4756,6 +5004,8 @@ def _impl_setup_calibration_zoned(
             "many parameters), then summarise_calibration."
         ),
     }
+    if series is not None:
+        result["time_series"] = _series_report_summary(series)
     if any(z["initial"] != 1.0 for z in norm["zones"]):
         result["warning"] = (
             "One or more zone multipliers have initial != 1.0, so the initial "
@@ -4769,6 +5019,7 @@ def _impl_setup_calibration_pilot_points(
     parameterisation: dict,
     obs_source: str = "model",
     noptmax: int = 10,
+    obs_time_tolerance: float | None = None,
 ) -> dict:
     """Emit a pilot-point PEST interface for NPF k (scope="pilot_points", R3.5).
 
@@ -4796,6 +5047,9 @@ def _impl_setup_calibration_pilot_points(
             "import_obs_from_csv. No 'observations' entry found in "
             ".gwmcp_meta.json for this model."
         )
+    ins_paths, obs_data, output_files, series = _build_model_obs_interface(
+        model, ws, obs_time_tolerance, return_report=True
+    )
 
     base_name = f"{gwf_name}_k_base.dat"
     factors_name = f"{gwf_name}_k_pp_factors.dat"
@@ -4809,7 +5063,6 @@ def _impl_setup_calibration_pilot_points(
     tpl = _impl_generate_zone_mult_tpl(model, norm["points"], pp_name)
     tpl_path = Path(tpl["tpl_path"])
 
-    ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
     wrapper = _generate_forward_wrapper(model, pilot_points=True)
     norm["covariance"].to_binary(str(ws / cov_name))
 
@@ -4872,6 +5125,8 @@ def _impl_setup_calibration_pilot_points(
             "pestpp-glm; then summarise_calibration and apply_calibration_result."
         ),
     }
+    if series is not None:
+        result["time_series"] = _series_report_summary(series)
     if len(norm["parameters"]) > len(obs_data):
         result["note"] = (
             f"{len(norm['parameters'])} pilot points vs {len(obs_data)} observations: "
@@ -4887,6 +5142,7 @@ def _impl_setup_calibration(
     parameterisation: dict,
     obs_source: str = "model",
     noptmax: int = 10,
+    obs_time_tolerance: float | None = None,
 ) -> dict:
     """Automated calibration setup (7e-A2): emit the whole PEST interface.
 
@@ -4972,7 +5228,9 @@ def _impl_setup_calibration(
                 "Zoned parameterisation cannot be combined with scope "
                 "'all'/'layer'/'cells'; use scope='zones' for every parameter."
             )
-        return _impl_setup_calibration_zoned(model, parameterisation, obs_source, noptmax)
+        return _impl_setup_calibration_zoned(
+            model, parameterisation, obs_source, noptmax, obs_time_tolerance
+        )
     pp_specs = [
         n
         for n, s in parameterisation.items()
@@ -4985,7 +5243,7 @@ def _impl_setup_calibration(
                 "scopes; use scope='pilot_points' for every parameter."
             )
         return _impl_setup_calibration_pilot_points(
-            model, parameterisation, obs_source, noptmax
+            model, parameterisation, obs_source, noptmax, obs_time_tolerance
         )
     if not parameterisation:
         raise ValueError("parameterisation must name at least one parameter.")
@@ -5013,6 +5271,7 @@ def _impl_setup_calibration(
     # model's obs CSV; ``"derived"`` reads the wrapper-derived subsidence CSV
     # built from the targets registered by ``import_subsidence_observations``.
     derived_report: dict | None = None
+    series: dict | None = None
     if obs_source == "model":
         obs_meta = read_meta(model).get("observations")
         if not obs_meta or not obs_meta.get("sites"):
@@ -5021,7 +5280,9 @@ def _impl_setup_calibration(
                 "import_obs_from_csv. No 'observations' entry found in "
                 ".gwmcp_meta.json for this model."
             )
-        ins_paths, obs_data, output_files = _build_model_obs_interface(model, ws)
+        ins_paths, obs_data, output_files, series = _build_model_obs_interface(
+            model, ws, obs_time_tolerance, return_report=True
+        )
     elif obs_source == "derived":
         ins_paths, obs_data, output_files = _build_derived_obs_interface(model, ws)
         derived_report = {
@@ -5137,6 +5398,8 @@ def _impl_setup_calibration(
     }
     if derived_report is not None:
         result["derived_observations"] = derived_report
+    if series is not None:
+        result["time_series"] = _series_report_summary(series)
     return result
 
 
@@ -5975,6 +6238,7 @@ def _impl_setup_pest_control(
     obs_source: str = "explicit",
     _suppress_command_warning: bool = False,
     unlisted_obs: str = "error",
+    obs_time_tolerance: float | None = None,
 ) -> dict:
     """Build and write a PEST++ control file (.pst) for the model.
 
@@ -6019,8 +6283,16 @@ def _impl_setup_pest_control(
         ``"explicit"`` (default) requires ``obs_data`` + ``instruction_files``
         to be supplied.  ``"model"`` builds both from the observation targets
         registered by ``import_obs_from_csv`` (7f-F1.5): an instruction file
-        is generated that reads the model's obs CSV (first output row), and
-        each site's observed value is the mean of its registered records.
+        is generated that reads the model's obs CSV. For a steady-state model
+        (one output time) each site's observed value is the mean of its
+        records; for a transient model every record is matched by date to the
+        nearest time step, one observation per site and time (R3.7, see
+        ``obs_time_tolerance``).
+    obs_time_tolerance:
+        Transient ``obs_source="model"`` only: the largest gap, in model time
+        units, between a record's date and the time step it is matched to.
+        Default: one median time-step length. Unmatched records are reported
+        under ``time_series.skipped``.
         ``"derived"`` is accepted as an alias for the explicit branch (the
         caller builds the interface from registered derived subsidence
         targets, Task 8).
@@ -6060,8 +6332,11 @@ def _impl_setup_pest_control(
     # reads the on-disk input set (7f-E1.2).
     flush_model(model)
 
+    series: dict | None = None
     if obs_source == "model":
-        instruction_files, obs_data, output_files = _build_model_obs_interface(model, ws)
+        instruction_files, obs_data, output_files, series = _build_model_obs_interface(
+            model, ws, obs_time_tolerance, return_report=True
+        )
         if output_files:
             pestpp_options["output_files"] = output_files
     elif obs_source not in ("explicit", "derived"):
@@ -6302,6 +6577,8 @@ def _impl_setup_pest_control(
         "n_total_parameters": len(par_df),
         "model_command": list(pst.model_command),
     }
+    if series is not None:
+        result["time_series"] = _series_report_summary(series)
 
     # Warn on insensitive parameters when a sensitivity screen has run (7f-H3.2).
     sens_meta = read_meta(model).get("sensitivity")
@@ -7467,6 +7744,7 @@ def register(mcp: FastMCP) -> None:
         parameterisation: dict,
         obs_source: str = "model",
         noptmax: int = 10,
+        obs_time_tolerance: float | None = None,
     ) -> dict:
         """Automated calibration setup (7e-A2): generate the whole PEST interface
         with zero hand-written files.
@@ -7534,14 +7812,26 @@ def register(mcp: FastMCP) -> None:
 
         obs_source must be "model" or "derived". "model": observation targets
         registered via import_obs_from_csv provide the observed values and the
-        instruction file reads the model's obs CSV. "derived": subsidence
+        instruction file reads the model's obs CSV. For a transient model
+        (more than one time step) this is a head time series: every record is
+        matched by date to the nearest time step - calendar dates through
+        set_simulation's start_date_time (required for them), numeric dates
+        as elapsed model time - giving one observation per site and time,
+        named <site>_t<step>. Records more than obs_time_tolerance (model time
+        units; default one median step length) from every step, or outside
+        the simulated period, are not used and are listed in
+        result.time_series.skipped; records on the same step are averaged.
+        A steady-state model keeps one observation per site (the mean of its
+        records). "derived": subsidence
         targets registered via import_subsidence_observations are matched to
         the simulated CSUB time series, the forward wrapper writes
         <gwf>_<name>.csv, and the instruction file reads its rows (Task 8).
         Run the calibration afterwards with run_pestpp_glm / run_pestpp_ies
         (or calibrate), then summarise_calibration."""
         try:
-            return _impl_setup_calibration(model, parameterisation, obs_source, noptmax)
+            return _impl_setup_calibration(
+                model, parameterisation, obs_source, noptmax, obs_time_tolerance
+            )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ValueError as exc:
@@ -7665,6 +7955,7 @@ def register(mcp: FastMCP) -> None:
         pestpp_options: dict | None = None,
         obs_source: str = "explicit",
         unlisted_obs: str = "error",
+        obs_time_tolerance: float | None = None,
     ) -> dict:
         """Generate a PEST++ control file (.pst) for the model.
 
@@ -7687,9 +7978,11 @@ def register(mcp: FastMCP) -> None:
         obs_source: "explicit" (default) requires obs_data + instruction_files.
         "model" builds both from the observation targets registered by
         import_obs_from_csv (7f-F1.5): an instruction file is generated that
-        reads the model's obs CSV (first output row — the single row for the
-        steady-state models this targets) and each site's observed value is
-        the mean of its registered records. "derived" is accepted as an alias
+        reads the model's obs CSV. Steady state: one observation per site, the
+        mean of its records. Transient: every record is matched by date to the
+        nearest time step (one observation per site and time, as in
+        setup_calibration; obs_time_tolerance sets the largest gap in model
+        time units, default one median step). "derived" is accepted as an alias
         for the explicit branch (setup_calibration builds the interface from
         registered derived subsidence targets, Task 8). With
         obs_source="model" you still supply par_data and template_files but
@@ -7723,6 +8016,7 @@ def register(mcp: FastMCP) -> None:
                 pestpp_options,
                 obs_source,
                 unlisted_obs=unlisted_obs,
+                obs_time_tolerance=obs_time_tolerance,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
