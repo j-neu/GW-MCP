@@ -54,6 +54,15 @@ release.
   same series. A synthetic pumping test recovers K and Ss with pestpp-glm
   (7.996 / 1.017e-3 against 8 / 1e-3). Previously every site was collapsed
   to the mean of its records and compared with the first time step.
+- **Observation weights from measurement error:** `import_obs_from_csv`
+  takes `std_col`/`std` and `setup_calibration` / `setup_pest_control` take
+  `obs_std`; each observation's weight is 1/sigma (a mean of n records has
+  sigma/sqrt(n)) and sigma is written as the PEST++ `standard_deviation`, so
+  pestpp-ies noise follows the data (checked: a 300-member noise ensemble has
+  sigma 0.05 / 0.5 for records with 0.05 / 0.5). A transient series gets one
+  observation group per site and `balance_obs=True` gives every site the same
+  expected share of phi. Previously every weight was 1, which pestpp-ies reads
+  as a 1 m error. Without any sigma, `weights_warning` says so.
 - **One MF6/PEST++ process per workspace:** runs and calibrations claim the
   workspace and a second start returns `WORKSPACE_BUSY` (a retried call after
   a client timeout used to start a second pestpp). The process PID goes in a

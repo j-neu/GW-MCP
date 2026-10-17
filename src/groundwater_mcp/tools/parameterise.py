@@ -7,6 +7,7 @@ geodata-mcp server.
 
 from __future__ import annotations
 
+import math
 import re
 
 import numpy as np
@@ -68,6 +69,45 @@ def _safe_obs_name(site: str, used: set[str]) -> str:
         i += 1
     used.add(name.lower())
     return name
+
+
+def _record_std(df, std_col: str | None, std: float | None):
+    """Per-record measurement standard deviation (R3.9), or None if not given.
+
+    ``std`` fills records whose ``std_col`` cell is empty; every resulting
+    value must be a positive finite number.
+    """
+    import pandas as pd
+
+    if std is not None:
+        std = float(std)
+        if not (math.isfinite(std) and std > 0):
+            raise ValueError(f"std must be a positive number, got {std}.")
+    if std_col is None:
+        return None if std is None else pd.Series(std, index=df.index, dtype=float)
+    if std_col not in df.columns:
+        raise ValueError(
+            f"Column '{std_col}' (std_col) not found in CSV. Available: {list(df.columns)}"
+        )
+    raw = df[std_col]
+    values = pd.to_numeric(raw, errors="coerce")
+    unparsable = values.isna() & raw.notna() & (raw.astype(str).str.strip() != "")
+    if unparsable.any():
+        bad = raw[unparsable].iloc[0]
+        raise ValueError(f"std_col '{std_col}' has a non-numeric value {bad!r}.")
+    if values.isna().any():
+        if std is None:
+            raise ValueError(
+                f"{int(values.isna().sum())} record(s) have no value in std_col "
+                f"'{std_col}'; fill them or pass std= as the default."
+            )
+        values = values.fillna(std)
+    if not (np.isfinite(values) & (values > 0)).all():
+        bad = values[~(np.isfinite(values) & (values > 0))].iloc[0]
+        raise ValueError(
+            f"std_col '{std_col}' must hold positive numbers, got {bad}."
+        )
+    return values.astype(float)
 
 
 def _record_provenance(model: str, key: str, source: str, tool: str, **extra) -> None:
@@ -1803,6 +1843,8 @@ def _impl_import_obs_from_csv(
     allow_sequential: bool = False,
     append: bool = False,
     allow_outside: bool = False,
+    std_col: str | None = None,
+    std: float | None = None,
 ) -> dict:
     """Read head/flow observations from CSV and write a MODFLOW 6 OBS file.
 
@@ -1810,6 +1852,11 @@ def _impl_import_obs_from_csv(
     the sites of this call are added to the sites already registered (same
     ``obs_type``, no repeated site names), so a multi-layer observation set
     can be registered one layer per call.
+
+    ``std_col`` (a per-record column) and ``std`` (one value, also filling
+    empty cells of ``std_col``) give each record's measurement standard
+    deviation in the observation's units (R3.9); the calibration setup turns it
+    into the weight 1/sigma.
     """
     from pathlib import Path
 
@@ -1843,6 +1890,7 @@ def _impl_import_obs_from_csv(
             raise ValueError(
                 f"Column '{col}' not found in CSV. Available: {list(df.columns)}"
             )
+    record_std = _record_std(df, std_col, std)
 
     # A site-mapping column that was asked for but is absent must not fall
     # through to a different mapping mode — that registers every site on the
@@ -2092,6 +2140,8 @@ def _impl_import_obs_from_csv(
             if date_col in site_df.columns
             else [],
         }
+        if record_std is not None:
+            entry["stds"] = [float(v) for v in record_std[site_df.index].tolist()]
         if obsname != str(site):
             entry["original_site"] = str(site)
         site_entries.append(entry)
@@ -2124,6 +2174,8 @@ def _impl_import_obs_from_csv(
         "obs_file": str(obs_file),
         "summary_file": str(summary_path),
         "site_mapping": site_mapping,
+        "measurement_std": "none" if record_std is None
+        else ("column" if std_col else "scalar"),
         "site_cellid_map": {s: _cellid_as_json(cid) for s, cid in site_to_cellid.items()},
         "obs_names": dict(site_obs_name),
         "written": written,
@@ -2799,6 +2851,8 @@ def register(mcp) -> None:
         allow_sequential: bool = False,
         append: bool = False,
         allow_outside: bool = False,
+        std_col: str | None = None,
+        std: float | None = None,
     ) -> dict:
         """Import head or flow observations from a CSV file.
 
@@ -2828,11 +2882,20 @@ def register(mcp) -> None:
         DIS grids (cell ids are ``(layer, row, col)``), DISV (``(layer, node)``)
         and DISU (scalar node). Writes a MODFLOW 6 OBS file and a summary CSV of
         site-to-cell mappings.
+
+        Measurement error: ``std_col`` names a column with each record's
+        standard deviation and ``std`` gives one value for every record (or
+        for the empty cells of ``std_col``), in the observation's units (m for
+        heads). setup_calibration weights each observation 1/sigma and writes
+        sigma as the PEST++ ``standard_deviation`` (the pestpp-ies noise).
+        Without either, observations get weight 1 unless setup_calibration is
+        given ``obs_std``.
         """
         try:
             return _impl_import_obs_from_csv(
                 model, csv_file, obs_type, site_col, date_col, value_col, x_col,
                 y_col, layer, cellid_col, allow_sequential, append, allow_outside,
+                std_col, std,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

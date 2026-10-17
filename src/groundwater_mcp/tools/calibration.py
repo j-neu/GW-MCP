@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import os
 import platform
 import re
@@ -945,9 +946,10 @@ def _series_obs_plan(model: str, entries: list[dict], times: list[float], tolera
                 "a transient model needs a date for every head record. "
                 "Re-import the observations with date_col set."
             )
+        stds = list(entry.get("stds") or [None] * len(values))
         matched: list[dict] = []
         skipped: list[dict] = []
-        for date, value in zip(dates, values):
+        for date, value, std in zip(dates, values, stds):
             t = _record_model_time(date, start, days_per_unit)
             if t is None:
                 skipped.append({"date": str(date), "value": value, "reason": "no usable date"})
@@ -966,7 +968,7 @@ def _series_obs_plan(model: str, entries: list[dict], times: list[float], tolera
             rows.setdefault(idx, {}).setdefault(pos, []).append(value)
             matched.append({"date": str(date), "value": value,
                             "model_time": float(grid[idx]), "row": idx,
-                            "offset": t - float(grid[idx])})
+                            "offset": t - float(grid[idx]), "std": std})
         n_matched += len(matched)
         n_skipped += len(skipped)
         report["sites"][site] = {"matched": matched, "skipped": skipped}
@@ -1038,6 +1040,8 @@ def _build_model_obs_interface(
     ws: Path,
     time_tolerance: float | None = None,
     return_report: bool = False,
+    obs_std: float | None = None,
+    balance: bool = False,
 ):
     """Build the obs interface from registered observation targets (7f-F1.5).
 
@@ -1053,7 +1057,18 @@ def _build_model_obs_interface(
     one median time-step length). There is one observation per site and
     matched time, named ``<site>_t<step>``; records on the same time are
     averaged and unmatched records are reported, not used.
+
+    Weights (R3.9): an observation's sigma is the standard error of the
+    records it averages (each record's import-time ``std``, else ``obs_std``);
+    its weight is 1/sigma and sigma is passed on as ``standard_deviation``.
+    Without any sigma the weight is 1. A transient series has one group per
+    site; ``balance`` scales each site's weights by sqrt(N / (n_sites * n)) so
+    every site contributes the same expected phi (the total stays N).
     """
+    if obs_std is not None:
+        obs_std = float(obs_std)
+        if not (math.isfinite(obs_std) and obs_std > 0):
+            raise ValueError(f"obs_std must be a positive number, got {obs_std}.")
     obs = read_meta(model).get("observations")
     if not obs or not obs.get("sites"):
         raise ValueError(
@@ -1071,6 +1086,7 @@ def _build_model_obs_interface(
         names_by_row: dict[int, dict[int, str]] = {}
         obs_data: dict = {}
         row_names: dict[tuple[int, int], str] = {}
+        site_groups = _site_group_names(entries)
         for idx in sorted(plan):
             for pos, values in plan[idx].items():
                 suffix = f"_t{idx + 1}"
@@ -1082,14 +1098,21 @@ def _build_model_obs_interface(
                     )
                 names_by_row.setdefault(idx, {})[pos] = name
                 row_names[(idx, pos)] = name
+                stds = [
+                    m["std"]
+                    for m in report["sites"][str(entries[pos]["site"])]["matched"]
+                    if m["row"] == idx
+                ]
                 obs_data[name] = {
                     "obsval": float(np.mean(values)),
-                    "weight": 1.0,
-                    "obgnme": group,
+                    "obgnme": site_groups[pos],
+                    **_obs_weight(stds, obs_std),
                 }
         for pos, entry in enumerate(entries):
             for m in report["sites"][str(entry["site"])]["matched"]:
                 m["obs_name"] = row_names[(m["row"], pos)]
+        if balance:
+            _balance_group_weights(obs_data)
         ins_file = ws / f"{output_csv}.ins"
         _write_series_ins(ins_file, names_by_row)
         report["n_observations"] = len(obs_data)
@@ -1114,13 +1137,71 @@ def _build_model_obs_interface(
     obs_data = {
         name: {
             "obsval": float(np.mean([float(v) for v in entry["values"]])),
-            "weight": 1.0,
             "obgnme": group,
+            **_obs_weight(
+                list(entry.get("stds") or [None] * len(entry["values"])), obs_std
+            ),
         }
         for name, entry in zip(names, entries)
     }
+    if balance:
+        _balance_group_weights(obs_data)
     out = ([str(ins_path)], obs_data, [output_csv])
     return (*out, None) if return_report else out
+
+
+def _obs_weight(stds: list, default: float | None) -> dict:
+    """Weight attributes of one observation averaging records with *stds*.
+
+    A record without a sigma takes *default*; the mean of n independent
+    records has sigma sqrt(sum sigma_i^2) / n. With no sigma at all the weight
+    is 1 (``_sigma_from`` "none").
+    """
+    if not stds or (default is None and any(s is None for s in stds)):
+        return {"weight": 1.0, "_sigma_from": "none"}
+    filled = [float(s) if s is not None else float(default or 0.0) for s in stds]
+    sigma = math.sqrt(sum(s * s for s in filled)) / len(filled)
+    source = "obs_std" if all(s is None for s in stds) else "measurement"
+    return {"weight": 1.0 / sigma, "standard_deviation": sigma, "_sigma_from": source}
+
+
+def _site_group_names(entries: list[dict]) -> list[str]:
+    """One PEST observation group per site: the site name in lower case, at
+    most 20 characters, not starting with PEST's reserved ``regul`` prefix,
+    made distinct with a numeric suffix."""
+    used: set[str] = set()
+    out: list[str] = []
+    for entry in entries:
+        base = re.sub(r"[^a-z0-9_]", "_", str(entry["site"]).lower()) or "site"
+        if base.startswith("regul"):
+            base = "s_" + base
+        base = base[:20]
+        name, i = base, 1
+        while name in used:
+            suffix = f"_{i}"
+            name = base[: 20 - len(suffix)] + suffix
+            i += 1
+        used.add(name)
+        out.append(name)
+    return out
+
+
+def _balance_group_weights(obs_data: dict) -> None:
+    """Scale weights so every observation group has the same expected phi.
+
+    With weights 1/sigma each observation contributes about 1 to phi, so a
+    group of n contributes n. Multiplying a group's weights by
+    sqrt(N / (n_groups * n)) gives every group N / n_groups and keeps the
+    total at N. ``standard_deviation`` (the IES noise) is unchanged.
+    """
+    counts: dict[str, int] = {}
+    for attrs in obs_data.values():
+        counts[attrs["obgnme"]] = counts.get(attrs["obgnme"], 0) + 1
+    total = sum(counts.values())
+    for attrs in obs_data.values():
+        factor = math.sqrt(total / (len(counts) * counts[attrs["obgnme"]]))
+        attrs["weight"] = float(attrs["weight"]) * factor
+        attrs["_balance_factor"] = factor
 
 
 # ---------------------------------------------------------------------------
@@ -4895,6 +4976,8 @@ def _impl_setup_calibration_zoned(
     obs_source: str = "model",
     noptmax: int = 10,
     obs_time_tolerance: float | None = None,
+    obs_std: float | None = None,
+    balance_obs: bool = False,
 ) -> dict:
     """Emit a zoned/multiplier PEST interface for NPF k (scope="zones").
 
@@ -4923,7 +5006,8 @@ def _impl_setup_calibration_zoned(
             ".gwmcp_meta.json for this model."
         )
     ins_paths, obs_data, output_files, series = _build_model_obs_interface(
-        model, ws, obs_time_tolerance, return_report=True
+        model, ws, obs_time_tolerance, return_report=True,
+            obs_std=obs_std, balance=balance_obs,
     )
 
     base_name = f"{gwf_name}_k_base.dat"
@@ -5006,6 +5090,7 @@ def _impl_setup_calibration_zoned(
     }
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_weight_summary(result, obs_data)
     _attach_practice_checks(model, result, norm["parameters"])
     if any(z["initial"] != 1.0 for z in norm["zones"]):
         result["warning"] = (
@@ -5021,6 +5106,8 @@ def _impl_setup_calibration_pilot_points(
     obs_source: str = "model",
     noptmax: int = 10,
     obs_time_tolerance: float | None = None,
+    obs_std: float | None = None,
+    balance_obs: bool = False,
 ) -> dict:
     """Emit a pilot-point PEST interface for NPF k (scope="pilot_points", R3.5).
 
@@ -5049,7 +5136,8 @@ def _impl_setup_calibration_pilot_points(
             ".gwmcp_meta.json for this model."
         )
     ins_paths, obs_data, output_files, series = _build_model_obs_interface(
-        model, ws, obs_time_tolerance, return_report=True
+        model, ws, obs_time_tolerance, return_report=True,
+            obs_std=obs_std, balance=balance_obs,
     )
 
     base_name = f"{gwf_name}_k_base.dat"
@@ -5128,6 +5216,7 @@ def _impl_setup_calibration_pilot_points(
     }
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_weight_summary(result, obs_data)
     _attach_practice_checks(model, result, norm["parameters"])
     if len(norm["parameters"]) > len(obs_data):
         result["note"] = (
@@ -5211,6 +5300,8 @@ def _impl_setup_calibration(
     obs_source: str = "model",
     noptmax: int = 10,
     obs_time_tolerance: float | None = None,
+    obs_std: float | None = None,
+    balance_obs: bool = False,
 ) -> dict:
     """Automated calibration setup (7e-A2): emit the whole PEST interface.
 
@@ -5297,7 +5388,8 @@ def _impl_setup_calibration(
                 "'all'/'layer'/'cells'; use scope='zones' for every parameter."
             )
         return _impl_setup_calibration_zoned(
-            model, parameterisation, obs_source, noptmax, obs_time_tolerance
+            model, parameterisation, obs_source, noptmax, obs_time_tolerance,
+            obs_std, balance_obs,
         )
     pp_specs = [
         n
@@ -5311,7 +5403,8 @@ def _impl_setup_calibration(
                 "scopes; use scope='pilot_points' for every parameter."
             )
         return _impl_setup_calibration_pilot_points(
-            model, parameterisation, obs_source, noptmax, obs_time_tolerance
+            model, parameterisation, obs_source, noptmax, obs_time_tolerance,
+            obs_std, balance_obs,
         )
     if not parameterisation:
         raise ValueError("parameterisation must name at least one parameter.")
@@ -5349,7 +5442,8 @@ def _impl_setup_calibration(
                 ".gwmcp_meta.json for this model."
             )
         ins_paths, obs_data, output_files, series = _build_model_obs_interface(
-            model, ws, obs_time_tolerance, return_report=True
+            model, ws, obs_time_tolerance, return_report=True,
+            obs_std=obs_std, balance=balance_obs,
         )
     elif obs_source == "derived":
         ins_paths, obs_data, output_files = _build_derived_obs_interface(model, ws)
@@ -5470,6 +5564,7 @@ def _impl_setup_calibration(
         result["derived_observations"] = derived_report
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_weight_summary(result, obs_data)
     _attach_practice_checks(model, result, all_parameters)
     steady = len(_model_output_times(model)) <= 1 or get_gwf(model).get_package("sto") is None
     k_targets = {"npf:k", "npf:k33"} & set(groups)
@@ -5483,6 +5578,40 @@ def _impl_setup_calibration(
             "transient data."
         )
     return result
+
+
+def _attach_weight_summary(result: dict, obs_data: dict) -> None:
+    """Report how the registered observations were weighted (R3.9), and warn
+    when they carry no measurement error (weight 1 = sigma of 1 unit)."""
+    sources = [a["_sigma_from"] for a in obs_data.values() if "_sigma_from" in a]
+    if not sources:
+        return
+    kinds = set(sources)
+    if kinds == {"none"}:
+        source = "none"
+    elif "none" in kinds:
+        source = "partial"
+    elif kinds == {"obs_std"}:
+        source = "obs_std"
+    else:
+        source = "measurement"
+    weights = [float(a["weight"]) for a in obs_data.values()]
+    result["observation_weights"] = {
+        "sigma_source": source,
+        "n_groups": len({a.get("obgnme") for a in obs_data.values()}),
+        "balanced": any("_balance_factor" in a for a in obs_data.values()),
+        "weight_min": min(weights),
+        "weight_max": max(weights),
+    }
+    if source in ("none", "partial"):
+        n = sources.count("none")
+        result["weights_warning"] = (
+            f"{n} of {len(sources)} observation(s) have no measurement error and "
+            "get weight 1, i.e. a standard deviation of 1 in the observation's "
+            "units (1 m for heads); pestpp-ies also draws noise of that size. "
+            "Give std_col/std to import_obs_from_csv, or obs_std to "
+            "setup_calibration."
+        )
 
 
 def _attach_practice_checks(model: str, result: dict, parameters: list[dict]) -> None:
@@ -6331,6 +6460,8 @@ def _impl_setup_pest_control(
     _suppress_command_warning: bool = False,
     unlisted_obs: str = "error",
     obs_time_tolerance: float | None = None,
+    obs_std: float | None = None,
+    balance_obs: bool = False,
 ) -> dict:
     """Build and write a PEST++ control file (.pst) for the model.
 
@@ -6427,7 +6558,8 @@ def _impl_setup_pest_control(
     series: dict | None = None
     if obs_source == "model":
         instruction_files, obs_data, output_files, series = _build_model_obs_interface(
-            model, ws, obs_time_tolerance, return_report=True
+            model, ws, obs_time_tolerance, return_report=True,
+            obs_std=obs_std, balance=balance_obs,
         )
         if output_files:
             pestpp_options["output_files"] = output_files
@@ -6564,6 +6696,8 @@ def _impl_setup_pest_control(
         obs_df.loc[canonical, "weight"] = float(attrs.get("weight", 1.0))
         if "obgnme" in attrs:
             obs_df.loc[canonical, "obgnme"] = str(attrs["obgnme"])
+        if attrs.get("standard_deviation") is not None:
+            obs_df.loc[canonical, "standard_deviation"] = float(attrs["standard_deviation"])
     if unmatched:
         available = sorted({str(n) for n in obs_df.index})
         raise ValueError(
@@ -6589,6 +6723,16 @@ def _impl_setup_pest_control(
     if unlisted:
         obs_df.loc[unlisted, "obsval"] = 0.0
         obs_df.loc[unlisted, "weight"] = 0.0
+    if "standard_deviation" in obs_df.columns:
+        # PEST++ (control file version 2) uses this column instead of the
+        # weights for the pestpp-ies/-da observation noise (R3.9); an
+        # observation without one gets the sigma its weight implies.
+        missing = obs_df["standard_deviation"].isna()
+        positive = obs_df["weight"].astype(float) > 0
+        obs_df.loc[missing & positive, "standard_deviation"] = (
+            1.0 / obs_df.loc[missing & positive, "weight"].astype(float)
+        )
+        obs_df.loc[missing & ~positive, "standard_deviation"] = 1.0
 
     # Populate parameter bounds and initial values — validate alignment.
     par_df = pst.parameter_data
@@ -6671,6 +6815,7 @@ def _impl_setup_pest_control(
     }
     if series is not None:
         result["time_series"] = _series_report_summary(series)
+    _attach_weight_summary(result, obs_data)
 
     # Warn on insensitive parameters when a sensitivity screen has run (7f-H3.2).
     sens_meta = read_meta(model).get("sensitivity")
@@ -7837,6 +7982,8 @@ def register(mcp: FastMCP) -> None:
         obs_source: str = "model",
         noptmax: int = 10,
         obs_time_tolerance: float | None = None,
+        obs_std: float | None = None,
+        balance_obs: bool = False,
     ) -> dict:
         """Automated calibration setup (7e-A2): generate the whole PEST interface
         with zero hand-written files.
@@ -7918,11 +8065,23 @@ def register(mcp: FastMCP) -> None:
         targets registered via import_subsidence_observations are matched to
         the simulated CSUB time series, the forward wrapper writes
         <gwf>_<name>.csv, and the instruction file reads its rows (Task 8).
+
+        Weights ("model" source): each observation's sigma is the measurement
+        standard deviation given to import_obs_from_csv (std_col/std), else
+        obs_std (observation units, e.g. m); a mean of n records has sigma /
+        sqrt(n). The weight is 1/sigma and sigma is written as the PEST++
+        standard_deviation, which pestpp-ies uses for the observation noise.
+        Without any sigma the weight is 1 and result.weights_warning says so.
+        A transient series has one observation group per site; balance_obs=True
+        scales each site's weights so every site contributes the same expected
+        phi (a site with 500 records no longer outweighs one with 2; the noise
+        stays sigma). result.observation_weights summarises the weighting.
         Run the calibration afterwards with run_pestpp_glm / run_pestpp_ies
         (or calibrate), then summarise_calibration."""
         try:
             return _impl_setup_calibration(
-                model, parameterisation, obs_source, noptmax, obs_time_tolerance
+                model, parameterisation, obs_source, noptmax, obs_time_tolerance,
+                obs_std, balance_obs,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
@@ -8048,6 +8207,8 @@ def register(mcp: FastMCP) -> None:
         obs_source: str = "explicit",
         unlisted_obs: str = "error",
         obs_time_tolerance: float | None = None,
+        obs_std: float | None = None,
+        balance_obs: bool = False,
     ) -> dict:
         """Generate a PEST++ control file (.pst) for the model.
 
@@ -8078,7 +8239,10 @@ def register(mcp: FastMCP) -> None:
         for the explicit branch (setup_calibration builds the interface from
         registered derived subsidence targets, Task 8). With
         obs_source="model" you still supply par_data and template_files but
-        may omit instruction_files and obs_data.
+        may omit instruction_files and obs_data; weights then follow the
+        measurement error as in setup_calibration (obs_std, balance_obs).
+        An obs_data entry may also carry standard_deviation (written as the
+        PEST++ column pestpp-ies uses for the observation noise).
 
         Template files must start with a `ptf`/`jtf` header.  The model input
         file a template writes is the .tpl filename with the suffix stripped
@@ -8109,6 +8273,8 @@ def register(mcp: FastMCP) -> None:
                 obs_source,
                 unlisted_obs=unlisted_obs,
                 obs_time_tolerance=obs_time_tolerance,
+                obs_std=obs_std,
+                balance_obs=balance_obs,
             )
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")

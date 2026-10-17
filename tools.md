@@ -64,7 +64,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 **No-data fill is explicit (7e-B11.3):** `fill` controls cells without raster coverage. Default `"error"` fails when more than `coverage_tolerance` (default 0.1) of cells are uncovered and otherwise median-fills with a `warning` field; `"median"` always median-fills; `"nearest"` fills from the nearest covered cell. `cells_no_coverage` is always reported.
 
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
-| `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`sequential`) |
+| `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False`, `std_col: str \| None = None`, `std: float \| None = None` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`sequential`) |
 | `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"`, `match: str = "nearest"`, `tolerance_days: float \| None`, `date_map: dict \| None` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`), `match`/`tolerance_days`/`date_map` |
 
 `import_obs_from_csv` persists the observation targets as model state
@@ -617,6 +617,23 @@ is coarser than the head change a 1 % derivative perturbation produces), and
 steady-state heads (only their ratio is constrained). Default bounds of the
 fraction targets are capped (`sto:sy` 0.5, porosity 0.7) and reported in
 `bounds_capped`.
+
+**Observation weights (R3.9, 2026-10-17):** give the measurement error at
+import, `std_col` (a column with each record's standard deviation) and/or
+`std` (one value for every record, or for the empty cells of `std_col`), in
+the observation's units; a non-positive or non-numeric value is
+`INVALID_INPUT`. `setup_calibration` / `setup_pest_control(obs_source="model")`
+take `obs_std` as the default for records without one. An observation that
+averages n records has sigma = sqrt(sum sigma_i^2) / n; its weight is 1/sigma
+and sigma is written as the PEST++ `standard_deviation` column (control file
+version 2), which pestpp-ies uses for the observation noise instead of the
+weight. A transient series has one observation group per site;
+`balance_obs=True` multiplies a site's weights by sqrt(N / (n_sites * n)) so
+each site contributes the same expected phi (total N; the noise stays sigma).
+Without any sigma every weight is 1 (a sigma of 1 unit, also for the IES
+noise) and the result has `weights_warning`. `observation_weights` reports
+`sigma_source` (`measurement`/`obs_std`/`partial`/`none`), `n_groups`,
+`balanced` and the weight range.
 
 **Transient head time series (R3.7, 2026-10-17):** on a model with more than
 one time step, a site's dated records are a time series, not one value. Each
