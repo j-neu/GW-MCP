@@ -907,6 +907,17 @@ def _record_model_time(raw, start: datetime.datetime | None, days_per_unit: floa
     return (stamp_dt - start).total_seconds() / 86400.0 / days_per_unit
 
 
+def _model_time_of(model: str, raw) -> float | None:
+    """Elapsed model time of *raw* (a number, or a date through the model
+    start date)."""
+    meta = read_meta(model)
+    start = _parse_start_datetime(
+        meta.get("start_date_time") or _tdis_attr(model, "start_date_time")
+    )
+    units = str(meta.get("time_units") or _tdis_attr(model, "time_units") or "DAYS")
+    return _record_model_time(raw, start, _TIME_UNIT_DAYS.get(units.upper(), 1.0))
+
+
 def _series_obs_plan(model: str, entries: list[dict], times: list[float], tolerance):
     """Match each registered record to the nearest output time (R3.7).
 
@@ -1178,6 +1189,11 @@ def _build_model_obs_interface(
         _balance_group_weights(obs_data)
     if report is not None:
         report["n_observations"] = len(obs_data)
+    fc_ins, fc_data, fc_out = _forecast_obs_interface(model, ws)
+    if fc_ins and fc_out:
+        _merge(fc_data)
+        ins_files.append(fc_ins)
+        outputs.append(fc_out)
     out = (ins_files, obs_data, outputs)
     return (*out, report) if return_report else out
 
@@ -1225,6 +1241,24 @@ def _series_obs_interface(
     ins_file = ws / f"{output_csv}.ins"
     _write_series_ins(ins_file, names_by_row)
     return str(ins_file), obs_data, report
+
+
+def _forecast_obs_interface(model: str, ws: Path) -> tuple[str | None, dict, str | None]:
+    """Instruction file and zero-weight obs data of the registered forecasts
+    (R3.13), read from the one-row ``<gwf>_forecasts.csv`` the forward
+    wrapper writes."""
+    fc = read_meta(model).get("forecasts") or {}
+    items = list(fc.get("items") or [])
+    if not items:
+        return None, {}, None
+    out = str(fc["output_csv"])
+    ins = ws / f"{out}.ins"
+    _write_series_ins(ins, {0: {i: str(f["name"]) for i, f in enumerate(items)}})
+    data = {
+        str(f["name"]): {"obsval": 0.0, "weight": 0.0, "obgnme": "forecast", "_forecast": True}
+        for f in items
+    }
+    return str(ins), data, out
 
 
 def _set_derivative_floor(pst) -> None:
@@ -3570,8 +3604,18 @@ def _dry_obs_fill_plan(model: str) -> dict[str, dict[str, float]]:
     reports a finite head, no sentinel) or when no observation cell is
     convertible (NPF icelltype 0 never dries).
     """
-    obs = read_meta(model).get("observations") or {}
-    if not obs.get("sites") or str(obs.get("type", "HEAD")).upper() != "HEAD":
+    meta = read_meta(model)
+    obs = meta.get("observations") or {}
+    fc = meta.get("forecasts") or {}
+    sources: list[tuple[str, list[tuple[str, object]]]] = []
+    if obs.get("sites") and str(obs.get("type", "HEAD")).upper() == "HEAD":
+        sources.append(
+            (str(obs["output_csv"]), [(str(e["site"]), e["cellid"]) for e in obs["sites"]])
+        )
+    fc_heads = [f for f in fc.get("items") or [] if f.get("kind") == "head"]
+    if fc_heads and fc.get("head_csv"):
+        sources.append((str(fc["head_csv"]), [(str(f["name"]), f["cellid"]) for f in fc_heads]))
+    if not sources:
         return {}
     gwf = get_gwf(model)
     npf = gwf.get_package("npf")
@@ -3581,12 +3625,16 @@ def _dry_obs_fill_plan(model: str) -> dict[str, dict[str, float]]:
     icell = np.asarray(npf.icelltype.array).reshape(-1)
     if icell.size != botm.size:  # one value per layer
         icell = np.repeat(icell, botm.size // max(icell.size, 1))
-    cols: dict[str, float] = {}
-    for entry in obs["sites"]:
-        flat = _obs_cell_flat_index(gwf, entry["cellid"])
-        if flat is not None and int(icell[flat]) != 0:
-            cols[str(entry["site"]).upper()] = float(botm[flat])
-    return {str(obs["output_csv"]): cols} if cols else {}
+    plan: dict[str, dict[str, float]] = {}
+    for csv_name, cells in sources:
+        cols: dict[str, float] = {}
+        for site, cid in cells:
+            flat = _obs_cell_flat_index(gwf, cid)
+            if flat is not None and int(icell[flat]) != 0:
+                cols[site.upper()] = float(botm[flat])
+        if cols:
+            plan[csv_name] = cols
+    return plan
 
 
 # Stdlib-only step run by the forward wrapper after a successful MF6 run: in
@@ -3624,6 +3672,56 @@ _DRY_FILL_BODY = (
     "with open(DRY_LOG, 'w') as fh:\n"
     "    fh.write(' '.join(sorted(set(replaced))) + '\\n')\n"
 )
+
+
+# Stdlib-only step run by the forward wrapper after the dry fill (R3.13): each
+# forecast is read from its source CSV at the row nearest its model time (a
+# head column, or sign * (IN - OUT) of a budget-CSV package) and all are
+# written as one row to FC_OUT for the forecast instruction file.
+_FORECAST_BODY = (
+    "def _fc_table(path):\n"
+    "    with open(path) as fh:\n"
+    "        lines = [ln for ln in fh.read().splitlines() if ln.strip()]\n"
+    "    head = [h.strip().strip('\"').upper() for h in lines[0].split(',')]\n"
+    "    return head, [[float(v) for v in ln.split(',')] for ln in lines[1:]]\n"
+    "fc_tables = {}\n"
+    "fc_values = []\n"
+    "for fc_name, fc_kind, fc_file, fc_cols, fc_time, fc_sign in FORECASTS:\n"
+    "    if fc_file not in fc_tables:\n"
+    "        fc_tables[fc_file] = _fc_table(os.path.join(WS, fc_file))\n"
+    "    fc_head, fc_rows = fc_tables[fc_file]\n"
+    "    fc_row = min(fc_rows, key=lambda r: abs(r[0] - fc_time))\n"
+    "    if fc_kind == 'head':\n"
+    "        fc_values.append(fc_row[fc_head.index(fc_cols[0])])\n"
+    "    else:\n"
+    "        fc_in = fc_row[fc_head.index(fc_cols[0])]\n"
+    "        fc_out = fc_row[fc_head.index(fc_cols[1])]\n"
+    "        fc_values.append(fc_sign * (fc_in - fc_out))\n"
+    "with open(FC_OUT, 'w') as fh:\n"
+    "    fh.write('label,' + ','.join(f[0] for f in FORECASTS) + '\\n')\n"
+    "    fh.write('forecast,' + ','.join(repr(v) for v in fc_values) + '\\n')\n"
+)
+
+
+def _forecast_wrapper_source(model: str) -> str:
+    fc = read_meta(model).get("forecasts") or {}
+    items = list(fc.get("items") or [])
+    if not items:
+        return ""
+    specs = []
+    for f in items:
+        if f["kind"] == "head":
+            specs.append((str(f["name"]), "head", str(fc["head_csv"]),
+                          [str(f["name"]).upper()], float(f["model_time"]), 1.0))
+        else:
+            specs.append((str(f["name"]), "flow", str(fc["budget_csv"]),
+                          [str(c).upper() for c in f["columns"]], float(f["model_time"]),
+                          float(f["sign"])))
+    return (
+        f"FORECASTS = {specs!r}\n"
+        f"FC_OUT = os.path.join(WS, {str(fc['output_csv'])!r})\n"
+        + _FORECAST_BODY
+    )
 
 
 def _dry_fill_wrapper_source(model: str) -> str:
@@ -3730,7 +3828,9 @@ def _generate_forward_wrapper(
     derived_imports, derived_step = _derived_wrapper_source(model)
     # The dry-cell fill (R3.11) runs first: the derived step reads heads only
     # through CSUB output, never the head obs CSV.
-    post_steps = _dry_fill_wrapper_source(model) + derived_step
+    post_steps = (
+        _dry_fill_wrapper_source(model) + _forecast_wrapper_source(model) + derived_step
+    )
 
     def _tail(rc_expr: str) -> str:
         # Run the post-MF6 steps (dry-cell fill, derived series) only after a
@@ -3924,6 +4024,8 @@ def _needs_forward_wrapper(model: str) -> bool:
     try:
         if _dry_obs_fill_plan(model):
             return True  # R3.11: the wrapper replaces the dry-cell sentinel
+        if (read_meta(model).get("forecasts") or {}).get("items"):
+            return True  # R3.13: the wrapper writes the forecast CSV
         return bool(read_meta(model).get("derived_observations"))
     except Exception:
         return False
@@ -5814,7 +5916,13 @@ def _impl_setup_calibration(
 
 def _attach_weight_summary(result: dict, obs_data: dict) -> None:
     """Report how the registered observations were weighted (R3.9), and warn
-    when they carry no measurement error (weight 1 = sigma of 1 unit)."""
+    when they carry no measurement error (weight 1 = sigma of 1 unit).
+    Forecasts (weight 0) are listed under ``forecasts``, not weighed."""
+    forecasts = [n for n, a in obs_data.items() if a.get("_forecast")]
+    if forecasts:
+        result["forecasts"] = forecasts
+        result["n_forecasts"] = len(forecasts)
+    obs_data = {n: a for n, a in obs_data.items() if not a.get("_forecast")}
     sources = [a["_sigma_from"] for a in obs_data.values() if "_sigma_from" in a]
     if not sources:
         return
@@ -7056,6 +7164,9 @@ def _impl_setup_pest_control(
     # pargp in par_data) exist, then set a nonzero increment on every group.
     pst.rectify_pgroups()
     _set_derivative_floor(pst)
+    forecast_names = [str(n) for n, a in obs_data.items() if a.get("_forecast")]
+    if forecast_names and "forecasts" not in pst.pestpp_options:
+        pst.pestpp_options["forecasts"] = ",".join(forecast_names)
 
     pst_path = ws / f"{model}.pst"
     pst.write(str(pst_path))
@@ -8032,6 +8143,16 @@ def _impl_summarise_calibration(
         meta.setdefault("calibration", {})["last_phi"] = final_phi
         write_meta(model, meta)
 
+    # Forecasts (R3.13) are predictions, not residuals: they leave the
+    # residual table and get their own block with the predictive spread.
+    fc_names = set(_pst_forecast_names(pst_path))
+    simulated_fc = {
+        str(r["obs_name"]).lower(): r["modelled"]
+        for r in residuals
+        if str(r["obs_name"]).lower() in fc_names
+    }
+    residuals = [r for r in residuals if str(r["obs_name"]).lower() not in fc_names]
+
     # Residuals are capped in the response; the full table goes to a CSV and
     # residual_statistics is always computed over all observations (7e-A1.6).
     residuals_csv = ws / f"{model}_residuals.csv"
@@ -8039,7 +8160,7 @@ def _impl_summarise_calibration(
         pd.DataFrame(residuals).to_csv(residuals_csv, index=False)
     capped_residuals = residuals[:max_residuals]
 
-    return {
+    result = {
         "model": model,
         "pst_file": str(pst_path),
         "engine": engine,
@@ -8051,6 +8172,65 @@ def _impl_summarise_calibration(
         "n_residuals_total": len(residuals),
         "verdict": verdict,
     }
+    if fc_names:
+        result["forecasts"] = _forecast_summary(ws, base_name, engine, fc_names, simulated_fc)
+    return result
+
+
+def _forecast_summary(
+    ws: Path, base_name: str, engine: str, names: set[str], simulated: dict
+) -> dict:
+    """Predictive spread of each forecast after a PEST++ run (R3.13).
+
+    GLM: the FOSM prior/posterior mean and standard deviation pestpp-glm
+    writes to ``{case}.pred.usum.csv`` (linear; the bounds are +-2 sigma).
+    IES: the spread of the last and the prior (iteration 0) observation
+    ensembles.
+    """
+    out: dict = {n: {"simulated": simulated.get(n)} for n in sorted(names)}
+    if engine == "ies":
+        ensembles = _ies_obs_ensembles(ws, base_name)
+        frames = {}
+        for key, it in (("posterior", max(ensembles, default=None)), ("prior", 0)):
+            if it is not None and it in ensembles:
+                df = pd.read_csv(ensembles[it], index_col=0)
+                df.columns = [str(col).lower() for col in df.columns]
+                frames[key] = df
+        for n in names:
+            for key, df in frames.items():
+                if n in df.columns:
+                    col = df[n].dropna().astype(float)
+                    out[n][f"{key}_mean"] = float(col.mean())
+                    out[n][f"{key}_std"] = float(col.std())
+            if "posterior" in frames and n in frames["posterior"].columns:
+                col = frames["posterior"][n].dropna().astype(float)
+                out[n]["posterior_p5"], out[n]["posterior_p95"] = (
+                    float(v) for v in np.percentile(col, [5, 95])
+                )
+                out[n]["method"] = "ensemble"
+        return out
+    usum = ws / f"{base_name}.pred.usum.csv"
+    if not usum.exists():
+        for n in out:
+            out[n]["note"] = f"{usum.name} not found (pestpp-glm writes it after the run)."
+        return out
+    df = pd.read_csv(usum, index_col=0)
+    df.index = [str(i).strip().lower() for i in df.index]
+    df.columns = [str(col).strip().lower() for col in df.columns]
+    for n in names:
+        if n not in df.index:
+            continue
+        row = df.loc[n]
+        out[n].update({
+            "method": "fosm",
+            "prior_mean": float(row["prior_mean"]),
+            "prior_std": float(row["prior_stdev"]),
+            "posterior_mean": float(row["post_mean"]),
+            "posterior_std": float(row["post_stdev"]),
+            "posterior_lower": float(row["post_lower_bound"]),
+            "posterior_upper": float(row["post_upper_bound"]),
+        })
+    return out
 
 
 def _impl_summarise_da(
@@ -8160,15 +8340,38 @@ def _impl_summarise_da(
     }
 
 
+def _ies_obs_ensembles(ws: Path, base_name: str) -> dict[int, Path]:
+    """pestpp-ies observation ensembles ``{base}.{N}.obs.csv`` by iteration N."""
+    out: dict[int, Path] = {}
+    for path in ws.glob(f"{base_name}.*.obs.csv"):
+        token = path.name[len(base_name) + 1 : -len(".obs.csv")]
+        if token.isdigit():
+            out[int(token)] = path
+    return out
+
+
+def _pst_forecast_names(pst_path: Path) -> list[str]:
+    """Names in the PEST++ ``forecasts`` option of a control file."""
+    try:
+        pst = pyemu.Pst(str(pst_path))
+    except Exception:  # noqa: BLE001 - unreadable control file: no forecasts
+        return []
+    raw = pst.pestpp_options.get("forecasts") or ""
+    return [n.strip().lower() for n in str(raw).split(",") if n.strip()]
+
+
 def _impl_run_ies_uncertainty(
     model: str,
     pst_file: str,
-    forecast_names: list[str],
+    forecast_names: list[str] | None = None,
 ) -> dict:
     """Compute predictive uncertainty from the PESTPP-IES posterior ensemble.
 
-    Reads the latest observation ensemble CSV produced by pestpp-ies, extracts
-    the columns listed in ``forecast_names``, and returns percentile statistics.
+    Reads the last-iteration observation ensemble CSV produced by pestpp-ies
+    (iterations ordered numerically), extracts the columns listed in
+    ``forecast_names`` (default: the control file's ``forecasts`` option, set
+    by register_forecasts + setup_calibration), and returns percentile
+    statistics, with the prior (iteration 0) mean and spread alongside.
 
     Parameters
     ----------
@@ -8186,15 +8389,28 @@ def _impl_run_ies_uncertainty(
     pst_path = _resolve_pst_path(model, pst_file)
     base_name = pst_path.stem
 
-    # Find the latest iteration observation ensemble: {base}.{N}.obs.csv
-    obs_csvs = sorted(ws.glob(f"{base_name}.*.obs.csv"))
-    if not obs_csvs:
+    ensembles = _ies_obs_ensembles(ws, base_name)
+    if not ensembles:
         raise FileNotFoundError(
             f"No ensemble observation files ({base_name}.*.obs.csv) found in {ws}. "
             "Run pestpp-ies first with forecast observations defined in the PST."
         )
-
-    latest_obs = pd.read_csv(obs_csvs[-1], index_col=0)
+    if not forecast_names:
+        forecast_names = _pst_forecast_names(pst_path)
+        if not forecast_names:
+            raise ValueError(
+                "No forecast_names given and the control file has no forecasts "
+                "option. Register them with register_forecasts before "
+                "setup_calibration, or pass forecast_names."
+            )
+    last = max(ensembles)
+    latest_obs = pd.read_csv(ensembles[last], index_col=0)
+    latest_obs.columns = [str(c).lower() for c in latest_obs.columns]
+    forecast_names = [str(f).lower() for f in forecast_names]
+    prior_obs = None
+    if 0 in ensembles and last != 0:
+        prior_obs = pd.read_csv(ensembles[0], index_col=0)
+        prior_obs.columns = [str(c).lower() for c in prior_obs.columns]
 
     missing = [f for f in forecast_names if f not in latest_obs.columns]
     if missing:
@@ -8215,11 +8431,16 @@ def _impl_run_ies_uncertainty(
             "p95": float(p95),
             "n_realizations": int(len(col)),
         }
+        if prior_obs is not None and fc_name in prior_obs.columns:
+            prior = prior_obs[fc_name].dropna().astype(float)
+            forecasts[fc_name]["prior_mean"] = float(prior.mean())
+            forecasts[fc_name]["prior_std"] = float(prior.std())
 
     return {
         "model": model,
         "pst_file": str(pst_path),
-        "ensemble_file": str(obs_csvs[-1]),
+        "ensemble_file": str(ensembles[last]),
+        "iteration": last,
         "forecasts": forecasts,
     }
 
@@ -8987,9 +9208,16 @@ def register(mcp: FastMCP) -> None:
     def run_ies_uncertainty(
         model: str,
         pst_file: str,
-        forecast_names: list[str],
+        forecast_names: list[str] | None = None,
     ) -> dict:
-        """Compute predictive uncertainty bounds from the PESTPP-IES posterior ensemble."""
+        """Compute predictive uncertainty bounds from the PESTPP-IES posterior ensemble.
+
+        Reads the last iteration's observation ensemble and returns each
+        forecast's mean, std and 5th/95th percentiles, with the prior
+        (iteration 0) mean and std. ``forecast_names`` defaults to the control
+        file's PEST++ ``forecasts`` option (register_forecasts before
+        setup_calibration sets it).
+        """
         try:
             return _impl_run_ies_uncertainty(model, pst_file, forecast_names)
         except KeyError as exc:

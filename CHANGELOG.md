@@ -54,6 +54,12 @@ release.
   same series. A synthetic pumping test recovers K and Ss with pestpp-glm
   (7.996 / 1.017e-3 against 8 / 1e-3). Previously every site was collapsed
   to the mean of its records and compared with the first time step.
+- **Forecasts in the control file:** `register_forecasts` declares head
+  forecasts (a cell at a time) and whole-package flow forecasts (from the
+  MF6 budget CSV); the calibration setup adds them with weight 0 and the
+  PEST++ `forecasts` option, so pestpp-glm reports their FOSM uncertainty
+  (now in `summarise_calibration`) and pestpp-ies carries them through every
+  realisation (`run_ies_uncertainty` defaults to them).
 - **Well-screen layer assignment:** `import_obs_from_csv` takes
   `screen_top_col`/`screen_bot_col` (screen elevations) and puts each site in
   the layer its screen draws the most transmissivity from (K x screened
@@ -123,6 +129,10 @@ release.
   even for a read-only adopted source.
 
 ### Fixed — silent wrong answers now fail loudly
+
+- **`run_ies_uncertainty` read the wrong iteration:** the observation
+  ensembles were sorted as text, so after 10 or more iterations it reported
+  iteration 9 (or 2) instead of the last one. Now ordered numerically.
 
 - **Dry observation cells in a PEST++ run:** MF6's -1e30 for a dry cell went
   straight into phi (~1e60). On a non-Newton model with head observations on

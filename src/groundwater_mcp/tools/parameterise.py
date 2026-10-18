@@ -2220,6 +2220,10 @@ def _impl_import_obs_from_csv(
         site_obs_name[str(site)] = obsname
         records.append((obsname, obs_type_str, cid))
     obsdata[obs_filename] = records
+    # Head forecasts (R3.13) share the one model-level OBS6 package.
+    for fc_csv, fc_records in _forecast_obs_block(read_meta(model)).items():
+        if fc_csv != obs_filename:
+            obsdata[fc_csv] = fc_records
 
     # Replace the model's existing OBS package. A shipped model can carry
     # several continuous OBS6 files (e.g. a head-observation package plus an
@@ -2593,6 +2597,288 @@ def _impl_import_flow_observations(
             for site, e in zip(sites, site_entries[len(kept):])
         },
         "written": written,
+    }
+
+
+_FORECAST_KINDS = ("head", "flow")
+_FORECAST_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+
+def _forecast_time(model: str, raw) -> tuple[float, float]:
+    """(requested, snapped) model time of a forecast: the nearest output time,
+    the end of the simulation when *raw* is None."""
+    from groundwater_mcp.tools.calibration import _model_output_times, _model_time_of
+
+    times = np.asarray(_model_output_times(model), dtype=float)
+    if times.size == 0:
+        raise ValueError("The model has no TDIS time steps; call set_simulation first.")
+    if raw is None:
+        return float(times[-1]), float(times[-1])
+    t = _model_time_of(model, raw)
+    if t is None:
+        raise ValueError(f"Forecast time {raw!r} is not a number or a date.")
+    tol = float(np.median(np.diff(times))) if times.size > 1 else float(times[0])
+    if t > times[-1] + tol + 1e-9:
+        raise ValueError(
+            f"Forecast time {raw!r} (model time {t:g}) is after the simulated "
+            f"period (ends at {times[-1]:g}); the calibration model must simulate "
+            "the forecast period."
+        )
+    if t < times[0] - tol - 1e-9:
+        raise ValueError(f"Forecast time {raw!r} (model time {t:g}) is before the simulation.")
+    return float(t), float(times[int(np.argmin(np.abs(times - t)))])
+
+
+def _forecast_head_cell(gwf, spec: dict):
+    """OBS cell id (FloPy form) of a head forecast."""
+    mg = gwf.modelgrid
+    disu = get_disu(gwf)
+    name = spec["name"]
+    if spec.get("cellid") is not None:
+        raw = spec["cellid"]
+        parts = [int(v) for v in (raw if isinstance(raw, (list, tuple)) else [raw])]
+        if disu is not None:
+            if len(parts) != 1 or not 0 <= parts[0] < int(disu.nodes.data):
+                raise ValueError(f"Forecast {name!r}: cellid {raw!r} is not a 0-based node.")
+            return parts[0] + 1
+        return tuple(parts)
+    if spec.get("x") is None or spec.get("y") is None:
+        raise ValueError(f"Forecast {name!r}: a head forecast needs x and y, or cellid.")
+    from groundwater_mcp.utils.spatial import grid_centroids
+
+    xc_all, yc_all = grid_centroids(mg)
+    if disu is None:
+        n = int(mg.ncpl) if hasattr(mg, "ncpl") else int(mg.nrow) * int(mg.ncol)
+        xc, yc = np.asarray(xc_all)[:n], np.asarray(yc_all)[:n]
+    else:
+        xc, yc = np.asarray(xc_all), np.asarray(yc_all)
+    dist = np.hypot(xc - float(spec["x"]), yc - float(spec["y"]))
+    node = int(np.argmin(dist))
+    if float(dist[node]) > _site_snap_tolerance(mg, xc, yc):
+        raise ValueError(
+            f"Forecast {name!r} at ({spec['x']}, {spec['y']}) lies outside the model grid."
+        )
+    if disu is not None:
+        return node + 1
+    if spec.get("screen_top") is not None or spec.get("screen_bottom") is not None:
+        if spec.get("screen_top") is None or spec.get("screen_bottom") is None:
+            raise ValueError(f"Forecast {name!r}: give screen_top and screen_bottom together.")
+        top, bot = float(spec["screen_top"]), float(spec["screen_bottom"])
+        if not top > bot:
+            raise ValueError(f"Forecast {name!r}: screen_top must be above screen_bottom.")
+        layers, _ = _screen_layers(gwf, {name: node}, {name: (top, bot)})
+        lyr = layers[name]
+    else:
+        lyr = int(spec.get("layer", 0))
+        if not 0 <= lyr < int(mg.nlay):
+            raise ValueError(f"Forecast {name!r}: layer {lyr} out of range.")
+    dis = get_dis(gwf)
+    if dis is not None and get_disv(gwf) is None:
+        ncol = int(dis.ncol.data)
+        return (lyr, node // ncol, node % ncol)
+    return (lyr, node)
+
+
+def _forecast_head_records(heads: list[dict]) -> list[tuple]:
+    return [
+        (f["name"], "HEAD", f["cellid"] if isinstance(f["cellid"], int) else tuple(f["cellid"]))
+        for f in heads
+    ]
+
+
+def _registered_obs_block(meta: dict) -> dict:
+    """The continuous block of the registered head observations, from meta."""
+    obs = meta.get("observations") or {}
+    if not obs.get("sites"):
+        return {}
+    otype = str(obs.get("type", "HEAD")).upper()
+    return {
+        str(obs["output_csv"]): [
+            (str(e["site"]), otype,
+             e["cellid"] if isinstance(e["cellid"], int) else tuple(e["cellid"]))
+            for e in obs["sites"]
+        ]
+    }
+
+
+def _forecast_obs_block(meta: dict) -> dict:
+    """The continuous block of the registered head forecasts, from meta."""
+    fc = meta.get("forecasts") or {}
+    heads = [f for f in fc.get("items") or [] if f.get("kind") == "head"]
+    return {str(fc["head_csv"]): _forecast_head_records(heads)} if heads else {}
+
+
+def _replace_model_obs_package(gwf, continuous: dict) -> None:
+    """Rewrite ``<gwf>.obs`` with *continuous* (removed when empty). Other
+    OBS files (e.g. an SFR gage package's) are left alone."""
+    from pathlib import Path
+
+    import flopy.mf6 as mf6
+
+    obs_pkg_file = f"{gwf.name}.obs"
+    existing = gwf.get_package("obs")
+    for pkg in existing if isinstance(existing, list) else [existing]:
+        if pkg is not None and Path(str(getattr(pkg, "filename", "") or "")).name.lower() == (
+            obs_pkg_file.lower()
+        ):
+            gwf.remove_package(pkg)
+    if continuous:
+        mf6.ModflowUtlobs(gwf, filename=obs_pkg_file, continuous=continuous)
+
+
+def _obs_flat_index(gwf, cid) -> int:
+    """Flat (layer-major) index of an OBS cell id (DISU: 1-based node)."""
+    mg = gwf.modelgrid
+    if isinstance(cid, int):
+        return cid - 1
+    if len(cid) == 3:
+        return (cid[0] * int(mg.nrow) + cid[1]) * int(mg.ncol) + cid[2]
+    return cid[0] * int(mg.ncpl) + cid[1]
+
+
+def _impl_register_forecasts(model: str, forecasts: list[dict], append: bool = False) -> dict:
+    """Register forecasts (predictions) for the calibration control file (R3.13).
+
+    A head forecast is a cell (x/y + layer or screen, or cellid) at a time; a
+    flow forecast is the net flow of one boundary package at a time, read from
+    the MF6 budget CSV (OUT - IN for ``out_of_aquifer``, IN - OUT for
+    ``into_aquifer``). ``time`` is elapsed model time or a date (through the
+    model start date), snapped to the nearest output time; the default is the
+    end of the simulation. Head forecasts get their own OBS package
+    (``<gwf>.fc.obs``), which ``import_obs_from_csv`` never replaces; flow
+    forecasts switch on the OC budget CSV when it is off. The calibration
+    setup adds every forecast with weight 0 (group ``forecast``) and lists
+    them in the PEST++ ``forecasts`` option.
+    """
+
+
+    from groundwater_mcp.tools.builder import _packages_of_type
+
+    if not isinstance(forecasts, list) or not forecasts:
+        raise ValueError("forecasts must be a non-empty list of forecast specs.")
+    gwf = get_gwf(model)
+    meta = read_meta(model)
+    previous = list((meta.get("forecasts") or {}).get("items", [])) if append else []
+
+    used: set[str] = {str(f["name"]).lower() for f in previous}
+    for entry in (meta.get("observations") or {}).get("sites", []):
+        used.add(str(entry["site"]).lower()[:20])
+        used.add(str(entry.get("original_site", entry["site"])).lower()[:20])
+    for g in (meta.get("flow_observations") or {}).get("packages", []):
+        used.update(str(e["site"]).lower()[:20] for e in g.get("sites", []))
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for spec in forecasts:
+        if not isinstance(spec, dict) or "name" not in spec:
+            raise ValueError("Each forecast needs a 'name' (and a 'kind': head or flow).")
+        name = str(spec["name"]).lower()
+        if len(name) > 20 or not _FORECAST_NAME_RE.match(name):
+            raise ValueError(
+                f"Forecast name {spec['name']!r} must start with a letter, use letters, "
+                "digits, '_', '.' or '-', and have at most 20 characters (PEST limit)."
+            )
+        if name in seen:
+            raise ValueError(f"Forecast name {name!r} is repeated.")
+        if name in used:
+            raise ValueError(
+                f"Forecast name {name!r} is already used by an observation or forecast."
+            )
+        seen.add(name)
+        kind = str(spec.get("kind", "")).lower()
+        if kind not in _FORECAST_KINDS:
+            raise ValueError(
+                f"Forecast {name!r}: kind must be 'head' or 'flow', got {spec.get('kind')!r}."
+            )
+        requested, model_time = _forecast_time(model, spec.get("time"))
+        item: dict = {
+            "name": name, "kind": kind, "time": spec.get("time"),
+            "requested_time": requested, "model_time": model_time,
+        }
+        if kind == "head":
+            cid = _forecast_head_cell(gwf, {**spec, "name": name})
+            flat = _obs_flat_index(gwf, cid)
+            idomain = getattr(gwf.modelgrid, "idomain", None)
+            if idomain is not None and np.asarray(idomain).reshape(-1)[flat] <= 0:
+                raise ValueError(f"Forecast {name!r} falls on an inactive cell.")
+            item["cellid"] = _cellid_as_json(cid)
+        else:
+            ptype = str(spec.get("package", "")).upper()
+            if ptype not in _FLOW_OBS_PACKAGES:
+                raise ValueError(
+                    f"Forecast {name!r}: flow forecasts are supported on the "
+                    f"{', '.join(_FLOW_OBS_PACKAGES)} packages, got {spec.get('package')!r}."
+                )
+            pkgs = _packages_of_type(gwf, ptype.lower())
+            pname = spec.get("pname")
+            if pname:
+                pkgs = [p for p in pkgs if str(p.package_name).lower() == str(pname).lower()]
+            if len(pkgs) != 1:
+                raise ValueError(
+                    f"Forecast {name!r}: the model has {len(pkgs)} {ptype} package(s)"
+                    f"{f' named {pname!r}' if pname else ''}; "
+                    + ("add it first." if not pkgs else "pass pname to choose one.")
+                )
+            direction = str(spec.get("direction", "out_of_aquifer"))
+            if direction not in _FLOW_DIRECTIONS:
+                raise ValueError(
+                    f"Forecast {name!r}: direction must be one of "
+                    f"{sorted(_FLOW_DIRECTIONS)}, got {direction!r}."
+                )
+            label = f"{ptype}({str(pkgs[0].package_name).upper()})"
+            item.update({
+                "package": ptype, "pname": str(pkgs[0].package_name).lower(),
+                "direction": direction, "columns": [f"{label}_IN", f"{label}_OUT"],
+                # value = sign * (IN - OUT)
+                "sign": _FLOW_DIRECTIONS[direction],
+            })
+        items.append(item)
+
+    all_items = previous + items
+    head_csv = f"{gwf.name}_fc_head.obs.csv"
+    heads = [f for f in all_items if f["kind"] == "head"]
+    # MF6 takes one model-level OBS6 package: the forecast heads are a second
+    # continuous output of <gwf>.obs, next to the registered observations.
+    continuous = _registered_obs_block(meta)
+    if heads:
+        continuous[head_csv] = _forecast_head_records(heads)
+    _replace_model_obs_package(gwf, continuous)
+
+    budget_csv = None
+    if any(f["kind"] == "flow" for f in all_items):
+        oc = gwf.get_package("oc")
+        if oc is None:
+            raise ValueError("Flow forecasts read the MF6 budget CSV; add the OC package first.")
+        current = oc.budgetcsv_filerecord.get_data()
+        if current is not None and len(current):
+            budget_csv = str(current[0][0])
+        else:
+            budget_csv = f"{gwf.name}.bud.csv"
+            oc.budgetcsv_filerecord.set_data(budget_csv)
+    written = save_sim(model, gwf.simulation)
+
+    meta = read_meta(model)
+    meta["forecasts"] = {
+        "obs_file": f"{gwf.name}.obs" if heads else None,
+        "head_csv": head_csv if heads else None,
+        "budget_csv": budget_csv,
+        "output_csv": f"{gwf.name}_forecasts.csv",
+        "items": all_items,
+    }
+    write_meta(model, meta)
+    return {
+        "model": model,
+        "forecasts": all_items,
+        "n_forecasts": len(all_items),
+        "output_csv": f"{gwf.name}_forecasts.csv",
+        "budget_csv": budget_csv,
+        "written": written,
+        "next_steps": (
+            "setup_calibration adds these with weight 0 and lists them in the "
+            "PEST++ forecasts option; after pestpp-glm, summarise_calibration "
+            "reports their FOSM prior/posterior spread, after pestpp-ies "
+            "run_ies_uncertainty reports the ensemble spread."
+        ),
     }
 
 
@@ -3361,6 +3647,47 @@ def register(mcp) -> None:
                 model, csv_file, package, site_col, date_col, value_col, std_col,
                 std, rel_std, targets, pname, direction, append,
             )
+        except KeyError as exc:
+            return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
+        except ModelReadOnlyError as exc:
+            return _err("MODEL_ADOPTED_READONLY", str(exc))
+        except ValueError as exc:
+            return _err("INVALID_INPUT", str(exc))
+        except Exception as exc:
+            return _err("OBS_IMPORT_FAILED", str(exc))
+
+    @mcp.tool()
+    def register_forecasts(model: str, forecasts: list[dict], append: bool = False) -> dict:
+        """Register forecasts (predictions) for the calibration control file.
+
+        A forecast is a model output the calibration is meant to predict, not
+        a measurement. Each entry is a dict:
+
+        - head: ``{"name", "kind": "head", "x", "y"}`` plus ``layer`` (0-based,
+          default 0), or ``screen_top``/``screen_bottom`` (elevations; the
+          layer with the largest transmissivity share), or ``cellid`` instead
+          of x/y.
+        - flow: ``{"name", "kind": "flow", "package"}`` (RIV, DRN, GHB, CHD or
+          WEL; ``pname`` when there are several) with ``direction``
+          ``out_of_aquifer`` (default: baseflow, spring flow, pumping) or
+          ``into_aquifer``; the net flow of the whole package from the MF6
+          budget CSV (switched on in OC when off).
+
+        ``time`` (optional) is elapsed model time or a date (through the model
+        start date), snapped to the nearest output time; the default is the end
+        of the simulation. The calibration model must simulate the forecast
+        period. Names: at most 20 characters, distinct from observation sites.
+        Without ``append`` the registered forecasts are replaced.
+
+        setup_calibration / setup_pest_control(obs_source="model") then add the
+        forecasts with weight 0 in group ``forecast`` and list them in the
+        PEST++ ``forecasts`` option. After pestpp-glm, summarise_calibration
+        reports each forecast's FOSM prior and posterior standard deviation;
+        after pestpp-ies, run_ies_uncertainty (and summarise_calibration) the
+        ensemble spread.
+        """
+        try:
+            return _impl_register_forecasts(model, forecasts, append)
         except KeyError as exc:
             return _err("MODEL_NOT_FOUND", str(exc), "Run create_model first.")
         except ModelReadOnlyError as exc:

@@ -177,7 +177,7 @@ def register(mcp: FastMCP) -> None:
         )
         if use_ensemble:
             steps.append(
-                "6. run_ies_uncertainty(model, pst_file, forecast_names) "
+                "6. run_ies_uncertainty(model, pst_file) "
                 "— forecast ensemble percentiles from the calibrated "
                 "realizations."
             )

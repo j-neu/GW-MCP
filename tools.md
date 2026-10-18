@@ -66,6 +66,7 @@ NOTE: with no stage attribute/raster, river stage defaults to 0.0 m and the rive
 **`layer_surfaces` on the DISV branch (7e-B6):** rejected with `INVALID_INPUT` — build flat layers and assign surfaces afterwards with `assign_top_from_raster`.
 | `import_obs_from_csv` | `model: str`, `csv_file: str`, `obs_type: str` (HEAD/DRAWDOWN/DEPTH/CONCENTRATION/TEMPERATURE), `site_col: str`, `date_col: str`, `value_col: str`, `x_col: str \| None`, `y_col: str \| None`, `layer: int = 0`, `cellid_col: str \| None = None`, `allow_sequential: bool = False`, `append: bool = False`, `allow_outside: bool = False`, `std_col: str \| None = None`, `std: float \| None = None`, `screen_top_col: str \| None = None`, `screen_bot_col: str \| None = None` | Observation summary: site count, record count, date range, written observation file path, `site_mapping` (`cellid`/`coordinates`/`coordinates+screen`/`sequential`), `multi_layer_screens` + `screen_warning` when a screen spans layers |
 | `import_flow_observations` | `model: str`, `csv_file: str`, `package: str` (RIV/DRN/GHB/CHD/WEL), `site_col`, `date_col`, `value_col`, `std_col: str \| None`, `std: float \| None`, `rel_std: float \| None`, `targets: dict \| None`, `pname: str \| None`, `direction: str = "out_of_aquifer"`, `append: bool = False` | `site_count`, `total_records`, `direction`, `output_csv`, `targets` (per site: `obs_name`, `n_cells`) |
+| `register_forecasts` | `model: str`, `forecasts: list[dict]` (head: `name`, `kind: "head"`, `x`/`y` + `layer` or `screen_top`/`screen_bottom`, or `cellid`; flow: `name`, `kind: "flow"`, `package` RIV/DRN/GHB/CHD/WEL, `pname`, `direction`; both: optional `time`), `append: bool = False` | `forecasts` (per forecast: `model_time`, `cellid` or budget `columns`), `n_forecasts`, `output_csv`, `budget_csv` |
 | `import_subsidence_observations` | `model: str`, `observed_csv: str`, `time_col: str = "datetime"`, `value_col: str = "Subsidence_ft"`, `sim_source: dict \| None`, `name: str = "subsidence"`, `match: str = "nearest"`, `tolerance_days: float \| None`, `date_map: dict \| None` | Registered derived target: observation count, resolved time/value columns, `sim_source` (`csv`/`sum_cols`/`time_col`), `match`/`tolerance_days`/`date_map` |
 
 `import_obs_from_csv` persists the observation targets as model state
@@ -626,6 +627,32 @@ head (fixed weights, as MODFLOW-2005 HOB), and clipping the screen to the
 saturated thickness of a convertible layer (the geometric layer thickness
 is used).
 
+**Forecasts in the control file (R3.13, 2026-10-18):** `register_forecasts`
+stores the predictions a calibration is meant to support: a head at a cell
+(x/y with `layer` or a screen, or `cellid`) or the net flow of a whole
+RIV/DRN/GHB/CHD/WEL package, each at a `time` (model time or date, snapped
+to the nearest output time; default the end of the simulation). The
+calibration model must simulate the forecast period. Head forecasts are a
+second continuous output (`<gwf>_fc_head.obs.csv`) of the one model OBS6
+package (MF6 refuses a second one); `import_obs_from_csv` keeps that block.
+Flow forecasts read OUT - IN (or IN - OUT for `into_aquifer`) of the
+package's columns in the MF6 budget CSV, which is switched on in OC when
+off. Every setup (`setup_calibration` in all three parameterisations,
+`setup_pest_control(obs_source="model")`) then adds the forecasts with
+weight 0 in group `forecast`, lists them in `++forecasts`, and forces the
+forward wrapper, whose stdlib step writes the one-row
+`<gwf>_forecasts.csv` they are read from (after the dry fill, so a dry
+forecast cell reports its bottom). Forecasts are left out of the weight
+summary and the group balancing; the result lists them in `forecasts`.
+After pestpp-glm, `summarise_calibration` reports each forecast's FOSM
+prior and posterior standard deviation; after pestpp-ies,
+`run_ies_uncertainty` (forecast names now default to the PST option) and
+`summarise_calibration` report the ensemble spread. `run_ies_uncertainty`
+previously sorted the iteration files as text and so read iteration 2 after
+iteration 10; it now orders them numerically. Not covered: flow forecasts
+on part of a package or on SFR/LAK/MAW, and forecasts under a stress
+scenario the calibration model does not simulate.
+
 **Dry cells during a calibration run (R3.11, 2026-10-17):** without Newton,
 MF6 writes -1e30 for a dry cell's head, and PEST++ read it straight from the
 obs CSV (phi ~1e60, broken derivatives). When a head observation sits on a
@@ -971,9 +998,9 @@ Each `l1` reads one line of the model output; `!dum!` reads-and-discards a token
 | `run_pestpp_sweep` | `model: str`, `pst_file: str`, `num_samples: int = 20`, `seed: int = 1`, `parameter_csv: str | None` | Runs PESTPP-SWP over parameter vectors. Default: a Latin-hypercube sample of `num_samples` vectors inside the adjustable parameters' bounds (log space for log-transformed parameters, reproducible via `seed`); with `parameter_csv` (columns = parameter names, one row per run) exactly those vectors. Returns `runs` (`parameters`, `phi`, `observations`, `failed`), `n_failed`, `phi_range`, `parameter_file`, `output_file`. Failed runs are flagged, not dropped. The control file is copied to `<case>_swp.pst` |
 | `run_pestpp_opt` | `model: str`, `pst_file: str`, `objective: str | dict`, `decision_parameters: list[str]`, `constraints: dict`, `direction: "max" | "min" = "max"` | Constrained management optimisation with PESTPP-OPT (sequential linear programming), e.g. the largest pumping or drainage that keeps heads above a target. `decision_parameters` become decision variables (the other parameters are held fixed); `objective` is a parameter name or `{parameter: coefficient}`; `constraints` is `{observation: {"type": "less_than" | "greater_than", "value": rhs}}`. Returns `optimal_decisions`, `objective_value` and per-constraint `simulated`, `slack`, `active`. Constraints are linearised at the control file's initial values, so an infeasible start is reported as `INVALID_INPUT` (infeasible) and the optimum should be verified with a forward run. The control file is copied to `<case>_opt.pst` |
 | `apply_calibration_result` | `model: str`, `pst_file: str` | Writes the best estimate of a finished GLM/IES run back into the model: `engine`, `source`, applied `parameters`, `files_written`. Regenerates every input file from its PEST template (zoned setups rebuild K as base × multiplier), drops the cached model so the next access reloads the calibrated arrays, and records `calibration_applied` in the model metadata. Follow with `run_simulation` to get calibrated heads. pestpp-da runs are rejected (`INVALID_INPUT`); `OUTPUT_FILE_MISSING` when the run left no estimate |
-| `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict` |
+| `summarise_calibration` | `model: str`, `pst_file: str`, `measurement_error: float \| None = None`, `max_residuals: int = 500` | Phi progress table, parameter estimates vs priors, residual statistics (RMSE, bias, R²; `residuals` capped at `max_residuals`, full table to CSV), an `engine` field, and a `verdict`; with PEST++ `forecasts`, a `forecasts` block (GLM: FOSM `prior_std`/`posterior_std` and bounds from `<case>.pred.usum.csv`; IES: ensemble spread) and the forecasts left out of `residuals` |
 | `summarise_da` | `model: str`, `pst_file: str`, `max_residuals: int = 500` | Per-cycle phi table (post-update ensemble mean from `<case>.global.phi.actual.csv`), final-cycle phi mean/std, posterior parameter statistics (`mean`/`std`/`min`/`max` from the **current run's** final `<case>.global.<cycle>.pe.csv`, excluding the `base` row), and residuals from that run's per-cycle base `.rei` (`residuals` capped at `max_residuals`, full table to CSV) |
-| `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str]` | Forecast ensemble statistics: mean, std, 5th/95th percentiles |
+| `run_ies_uncertainty` | `model: str`, `pst_file: str`, `forecast_names: list[str] \| None = None` (default: the PST `forecasts` option) | Forecast ensemble statistics of the last iteration (ordered numerically): mean, std, 5th/95th percentiles, plus `prior_mean`/`prior_std` from iteration 0; `iteration` |
 | `check_parameter_sensitivity` | `model: str`, `parameters: dict[str, float]`, `template_files: list[str]`, `delta: float = 0.1` | Per-parameter sensitivity (mean relative change of the simulated observations) over n+1 forward runs (7f-H3.1) |
 | `calibrate` | `model: str`, `par_data: dict`, `template_files: list[str]`, `time_budget_minutes: float = 30.0`, `noptmax: int = 10`, `num_reals: int = 50` | Chosen method + rationale + the run result (7f-H4.1) |
 
